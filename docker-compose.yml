@@ -1,0 +1,29 @@
+services:
+  coding-agent:
+    build: .
+    ports:
+      - "127.0.0.1:8000:8000"
+    environment:
+      - MODEL_ID=${MODEL_ID:-}
+      - CODING_AGENT_PROVIDER=${CODING_AGENT_PROVIDER:-}
+      - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY:-}
+      - OPENAI_API_KEY=${OPENAI_API_KEY:-}
+      - DEEPSEEK_API_KEY=${DEEPSEEK_API_KEY:-}
+      - ANTHROPIC_BASE_URL=${ANTHROPIC_BASE_URL:-}
+      - OPENAI_BASE_URL=${OPENAI_BASE_URL:-}
+      - MAX_TOKENS=${MAX_TOKENS:-}
+    volumes:
+      - ./config.yaml:/app/config.yaml:ro
+      - coding_agent_tasks:/app/.tasks
+      - coding_agent_memory:/app/.memory
+      - coding_agent_transcripts:/app/.transcripts
+      - coding_agent_team:/app/.team
+      - coding_agent_outputs:/app/.task_outputs
+    restart: unless-stopped
+
+volumes:
+  coding_agent_tasks:
+  coding_agent_memory:
+  coding_agent_transcripts:
+  coding_agent_team:
+  coding_agent_outputs:

@@ -1,0 +1,84 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <meta name="color-scheme" content="dark">
+  <title>Coding Agent · 工作台</title>
+  <link rel="icon" href="data:,">
+  <link rel="stylesheet" href="/static/dashboard.css">
+  <script type="module" src="/static/dashboard.js"></script>
+</head>
+<body data-view="board">
+  <div class="app-shell">
+    <aside class="sidebar" aria-label="主导航">
+      <a class="brand" href="#board" aria-label="Coding Agent 首页">
+        <span class="brand-mark"><i data-icon="code-xml"></i></span>
+        <span class="brand-text">coding<span class="brand-light">agent</span><small>你的 AI 开发工作空间</small></span>
+      </a>
+      <div class="workspace-switch"><span class="project-avatar">CA</span><div><strong id="sidebar-project">当前项目</strong><small>本地工作空间</small></div><i data-icon="folder-open"></i></div>
+      <div class="nav-label">工作空间</div>
+      <nav class="nav-list">
+        <button class="nav-item active" data-nav="board" aria-current="page" title="任务看板"><i data-icon="layout-dashboard"></i><span>任务看板</span><span class="nav-count" id="nav-task-count">0</span></button>
+        <button class="nav-item" data-nav="chat" title="AI 对话"><i data-icon="messages-square"></i><span>AI 对话</span><span class="nav-dot" id="chat-nav-dot" hidden></span></button>
+        <button class="nav-item" data-nav="memory" title="记忆空间"><i data-icon="brain"></i><span>记忆空间</span></button>
+        <button class="nav-item" data-nav="team" title="智能体团队"><i data-icon="users"></i><span>智能体团队</span></button>
+      </nav>
+      <div class="sidebar-bottom">
+        <div class="workspace-note"><i data-icon="git-branch"></i><span>想法、任务、执行<br>在这里连接起来。</span></div>
+        <button class="workspace-info" id="workspace-info"><i data-icon="folder-code"></i><span>工作目录</span><i data-icon="chevron-right"></i></button>
+        <div class="local-profile"><span class="profile-avatar">我</span><div><strong>本地开发者</strong><small>个人工作空间</small></div><span class="local-label">LOCAL</span></div>
+      </div>
+    </aside>
+
+    <header class="topbar">
+      <div class="breadcrumb"><i data-icon="panel-left"></i><span id="top-project">当前项目</span><span class="slash">/</span><strong id="breadcrumb-page">任务看板</strong></div>
+      <div class="topbar-actions"><span class="connection-pill" id="connection-status" role="status"><span class="status-dot"></span><span>连接中</span></span><button class="icon-button" id="refresh-btn" title="刷新工作空间" aria-label="刷新工作空间"><i data-icon="refresh-cw"></i></button><span class="top-divider"></span><button class="assistant-toggle" id="assistant-toggle" aria-label="打开 AI 助手"><i data-icon="sparkles"></i><span>AI 助手</span></button></div>
+    </header>
+
+    <main class="workspace" id="workspace">
+      <section class="view" id="board-view" aria-labelledby="board-title">
+        <div class="page-heading"><div><div class="eyebrow">把想法变成下一步</div><h1 id="board-title">任务看板</h1><p>拆解目标，协同执行，让每一步进展清晰可见。</p></div><button class="button primary" id="new-task-btn"><i data-icon="plus"></i>新建任务</button></div>
+        <div class="board-overview"><div class="overview-label"><span class="status-dot purple"></span>项目进展</div><span class="overview-number" id="overview-total">0 <small>个任务</small></span><div class="progress-track" role="progressbar" aria-label="任务完成进度" aria-valuemin="0" aria-valuemax="100" aria-valuenow="0"><span id="project-progress"></span></div><span class="progress-label" id="progress-label">等待开始</span></div>
+        <div class="board-toolbar"><div class="filter-tabs" role="group" aria-label="任务筛选"><button data-filter="all" class="selected" aria-pressed="true">全部任务 <span id="filter-count">0</span></button><button data-filter="mine" aria-pressed="false">我认领的</button><button data-filter="blocked" aria-pressed="false">有依赖</button></div><label class="search-field"><i data-icon="search"></i><input id="task-search" type="search" placeholder="搜索任务…" aria-label="搜索任务"></label></div>
+        <div id="data-error" class="data-error" role="alert" hidden>暂时无法同步工作空间，正在等待重新连接。</div>
+        <div class="kanban" id="task-list" aria-label="任务看板" aria-busy="true">
+          <section class="kanban-column" data-status="pending"><div class="column-heading"><div><span class="column-dot pending"></span><h2>待处理</h2><span class="column-count" id="count-pending">0</span></div><button class="icon-button add-task" aria-label="添加待处理任务"><i data-icon="plus"></i></button></div><div class="column-body" id="tasks-pending"><p class="loading-label">正在同步任务…</p></div><button class="column-add add-task"><i data-icon="plus"></i>添加任务</button></section>
+          <section class="kanban-column" data-status="in_progress"><div class="column-heading"><div><span class="column-dot in_progress"></span><h2>进行中</h2><span class="column-count" id="count-in_progress">0</span></div><i data-icon="activity" class="column-symbol"></i></div><div class="column-body" id="tasks-in_progress"></div></section>
+          <section class="kanban-column" data-status="completed"><div class="column-heading"><div><span class="column-dot completed"></span><h2>已完成</h2><span class="column-count" id="count-completed">0</span></div><i data-icon="circle-check" class="column-symbol"></i></div><div class="column-body" id="tasks-completed"></div></section>
+        </div>
+        <div class="board-footnote"><i data-icon="workflow"></i><span>与 AI 共享任务进展，执行结果会自动同步到看板。</span><span class="sync-time" id="sync-time">等待同步</span></div>
+      </section>
+
+      <section class="view" id="memory-view" aria-labelledby="memory-title" hidden>
+        <div class="page-heading"><div><div class="eyebrow">让每次协作更了解你</div><h1 id="memory-title">记忆空间</h1><p>由对话沉淀的偏好与项目知识，保存在当前工作目录。</p></div><span class="subtle-badge" id="memory-count">0 条记忆</span></div>
+        <label class="search-field memory-search"><i data-icon="search"></i><input id="memory-search" type="search" placeholder="搜索记忆内容…" aria-label="搜索记忆"></label><div class="memory-list" id="memory-list"></div>
+      </section>
+
+      <section class="view" id="team-view" aria-labelledby="team-title" hidden>
+        <div class="page-heading"><div><div class="eyebrow">一个目标，多位协作者</div><h1 id="team-title">智能体团队</h1><p>查看当前会话中的主智能体与活跃队友。</p></div><button class="button secondary" id="team-ask-btn"><i data-icon="message-square-plus"></i>安排协作</button></div><div class="team-list" id="team-list"></div><div class="info-note"><i data-icon="info"></i><p>在 AI 对话中说明目标，即可让主智能体创建队友并分配任务。团队状态按当前页面会话展示。</p></div>
+      </section>
+    </main>
+
+    <button class="chat-backdrop" id="chat-backdrop" aria-label="关闭 AI 助手" hidden></button>
+    <aside class="assistant-panel" aria-label="AI 助手" id="assistant-panel">
+      <div class="assistant-header"><div class="assistant-identity"><span class="assistant-avatar"><i data-icon="sparkles"></i></span><div><strong>AI 开发助手</strong><span id="agent-state"><span class="status-dot"></span>准备就绪</span></div></div><button class="icon-button mobile-close" id="close-chat" aria-label="关闭 AI 助手"><i data-icon="x"></i></button><span class="session-tag" id="session-tag">当前会话</span></div>
+      <div class="assistant-tabs" role="tablist" aria-label="助手内容"><button id="conversation-tab" role="tab" aria-controls="conversation-panel" aria-selected="true">对话</button><button id="activity-tab" role="tab" aria-controls="activity-panel" aria-selected="false">执行记录 <span id="activity-count">0</span></button></div>
+      <div class="conversation-panel" id="conversation-panel" role="tabpanel" aria-labelledby="conversation-tab">
+        <div class="chat-area" id="chat-area" aria-label="对话消息" aria-live="polite" aria-relevant="additions">
+          <div class="chat-welcome" id="chat-welcome"><span class="welcome-mark"><i data-icon="terminal"></i></span><span class="welcome-eyebrow">从一个想法开始</span><h2>今天，想构建什么？</h2><p>描述你的目标，剩下的交给我。<br>从理解代码，到一步步完成任务。</p><div class="prompt-suggestions"><button data-prompt="请梳理这个项目的目录结构，说明主要模块和启动入口。"><i data-icon="folder-tree"></i><span>帮我梳理项目结构</span><i data-icon="arrow-up-right"></i></button><button data-prompt="请结合当前项目，帮我制定开发计划，并将可执行的步骤创建为任务。"><i data-icon="list-todo"></i><span>把目标拆解为任务</span><i data-icon="arrow-up-right"></i></button><button data-prompt="请检查项目中的潜在问题，按影响程度列出需要修复的内容。"><i data-icon="scan-search"></i><span>检查代码中的潜在问题</span><i data-icon="arrow-up-right"></i></button></div></div>
+        </div>
+      </div>
+      <div class="activity-panel" id="activity-panel" role="tabpanel" aria-labelledby="activity-tab" hidden><div class="panel-caption"><span>工具执行时间线</span><span>当前页面</span></div><div id="activity-list"><div class="simple-empty" id="activity-empty"><i data-icon="workflow"></i><h3>每一步，都有迹可循</h3><p>助手调用工具后，执行过程会显示在这里。</p></div></div></div>
+      <div class="approval-tray" id="approval-tray" aria-label="待审批操作" aria-live="polite" hidden></div>
+      <div class="composer-wrap"><div class="composer"><label class="sr-only" for="prompt-input">向 AI 描述你的任务</label><textarea id="prompt-input" rows="3" placeholder="描述任务，或问我任何项目问题…"></textarea><div class="composer-bottom"><span class="composer-context"><i data-icon="folder-code"></i>当前项目</span><div class="composer-buttons"><button class="icon-button stop-button" id="stop-btn" aria-label="停止生成" title="停止生成" hidden><i data-icon="square"></i></button><button id="send-btn" class="send-button" aria-label="发送" title="发送"><i data-icon="arrow-up"></i></button></div></div></div><div class="composer-hint"><span>Enter 发送 · Shift + Enter 换行</span><span id="usage-label" title="包含记忆提取与上下文摘要的用量">上下文就绪</span></div></div>
+      <div class="model-footer"><span class="status-dot purple"></span><span id="model-name">读取模型配置…</span><span class="model-local">本地工作空间</span></div>
+    </aside>
+  </div>
+
+  <dialog id="task-dialog" class="modal"><form id="task-form"><div class="modal-header"><div><span class="eyebrow">让下一步更清晰</span><h2>新建任务</h2></div><button type="button" class="icon-button" data-close-dialog aria-label="关闭新建任务"><i data-icon="x"></i></button></div><label class="form-label" for="task-subject">任务名称 <span>必填</span></label><input class="form-input" id="task-subject" name="subject" placeholder="例如：为登录接口补充测试" required maxlength="200"><label class="form-label" for="task-description">任务描述</label><textarea class="form-input" id="task-description" name="description" rows="4" placeholder="补充目标、背景或验收标准…" maxlength="10000"></textarea><label class="form-label" for="task-dependency">前置任务 <span>可选</span></label><select class="form-input" id="task-dependency"><option value="">无前置依赖</option></select><p class="form-help">前置任务完成后，当前任务才能被认领。</p><p class="form-error" id="task-form-error" role="alert" hidden></p><div class="modal-footer"><button type="button" class="button secondary" data-close-dialog>取消</button><button type="submit" class="button primary" id="create-task-btn">创建任务</button></div></form></dialog>
+  <dialog id="detail-dialog" class="modal detail-modal" aria-labelledby="task-detail-title"><div id="task-detail"></div></dialog>
+  <dialog id="workspace-dialog" class="modal"><div class="modal-header"><h2>工作空间</h2><button class="icon-button" data-close-dialog aria-label="关闭工作空间信息"><i data-icon="x"></i></button></div><p class="form-help">任务和记忆与 CLI 共用同一工作目录。</p><pre class="workspace-path" id="workspace-path"></pre><div class="modal-footer"><button class="button secondary" data-close-dialog>关闭</button></div></dialog>
+  <div class="toast" id="toast" role="status" hidden></div>
+</body>
+</html>

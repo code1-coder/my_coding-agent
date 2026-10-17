@@ -1,0 +1,16 @@
+# 需要 Python 3.11 或更高版本。
+# 在项目根目录执行：python -m pip install -r requirements.txt
+# 运行依赖及其版本范围应与 pyproject.toml 保持一致。
+anthropic>=0.40
+openai>=1.60
+click>=8.1
+pyyaml>=6.0
+python-dotenv>=1.0
+httpx>=0.28
+fastapi>=0.115
+uvicorn>=0.30
+websockets>=12
+tiktoken>=0.7
+
+# 安装 src 目录下的项目包，并注册 coding-agent 命令行入口。
+-e .

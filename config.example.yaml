@@ -1,0 +1,43 @@
+# 复制为 config.yaml 后使用；已有本地配置时不要覆盖。
+# 密钥填入 .env 或进程环境变量，避免写入 YAML。
+# 配置优先级：代码默认值 < config.yaml < .env < 已设置的进程环境变量。
+
+# 模型接口：必填模型标识，地址和模型必须属于同一服务商。
+# OpenAI 兼容服务：provider 为 openai_compat，替换 base_url 和 model_id。
+# Anthropic 官方服务：provider 为 anthropic，base_url 改为 null。
+# auto 只按 base_url 是否含 anthropic 判断后端，建议显式指定 provider。
+model_id: your-model-id
+provider: openai_compat
+base_url: https://api.openai.com/v1
+api_key: null
+
+# 输出与恢复：上限必须在所选模型支持的范围内。
+max_tokens: 8000
+escalated_max_tokens: 64000  # 输出截断后重试使用的上限
+fallback_model: null        # 同一服务商的备用模型；null 表示不启用
+
+# 上下文管理：令牌数为估算值，大输出文件写入 .task_outputs/。
+context_limit: 50000        # 超过此令牌数时调用模型生成摘要
+max_messages: 50            # 历史裁剪阈值，至少为 5
+keep_recent: 3              # 保留完整内容的最新工具结果数量
+persist_threshold: 30000    # 工具输出持久化的字符阈值
+
+# 任务与协作。
+max_iterations: 50         # 每轮任务最多调用模型的次数
+team_idle_timeout: 60      # 队友空闲退出时间，单位为秒
+skills_dir: skills
+mcp_servers: []            # 仅加载代码中已注册的服务，如 [docs]
+
+# 默认使用启动目录；本机和容器中的路径不同，按需启用。
+# workdir: .
+# system_prompt: "You are a coding agent. Use tools to solve tasks."
+
+# bash 工具禁止的命令子串；显式配置会替换整个默认列表。
+deny_list:
+  - "rm -rf /"
+  - "sudo"
+  - "shutdown"
+  - "reboot"
+  - "mkfs"
+  - "dd if="
+  - "> /dev/sda"
