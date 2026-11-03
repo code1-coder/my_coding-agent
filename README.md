@@ -90,19 +90,19 @@ export OPENAI_API_KEY="你的 API 密钥"
 **Windows PowerShell：**
 
 ```powershell
-.\.venv\Scripts\python.exe -m uvicorn coding_agent.server.app:app --host 127.0.0.1 --port 8000 --reload
+.\.venv\Scripts\python.exe -m uvicorn coding_agent.server.app:app --host 127.0.0.1 --port 8080 --reload
 ```
 
 **macOS / Linux：**
 
 ```bash
-.venv/bin/python -m uvicorn coding_agent.server.app:app --host 127.0.0.1 --port 8000 --reload
+.venv/bin/python -m uvicorn coding_agent.server.app:app --host 127.0.0.1 --port 8080 --reload
 ```
 
-看到 `Uvicorn running on http://127.0.0.1:8000` 后，打开 [网页控制台](http://127.0.0.1:8000)。
+看到 `Uvicorn running on http://127.0.0.1:8080` 后，打开 [网页控制台](http://127.0.0.1:8080)。Windows 上的 8000 端口可能被 Hyper-V、WSL 或其他系统组件列入排除范围；本项目默认使用 8080，避免 `WinError 10013`。
 
-- [健康检查](http://127.0.0.1:8000/health)：正常返回 `{"status":"ok"}`，仅确认服务存活，不验证模型配置。
-- [接口文档](http://127.0.0.1:8000/docs)：查看 HTTP 接口定义。
+- [健康检查](http://127.0.0.1:8080/health)：正常返回 `{"status":"ok"}`，仅确认服务存活，不验证模型配置。
+- [接口文档](http://127.0.0.1:8080/docs)：查看 HTTP 接口定义。
 
 保持终端运行，按 `Ctrl+C` 停止服务。`--reload` 用于开发时自动重载代码。以后启动时，进入项目目录、设置所需环境变量，再执行本节命令即可，无需重新创建虚拟环境。
 
@@ -200,7 +200,7 @@ async def main():
 
 | 用途 | 模块名称 | 运行参数 |
 |------|----------|----------|
-| 网页控制台 | `uvicorn` | `coding_agent.server.app:app --host 127.0.0.1 --port 8000 --reload` |
+| 网页控制台 | `uvicorn` | `coding_agent.server.app:app --host 127.0.0.1 --port 8080 --reload` |
 | 命令行对话 | `coding_agent_cli.main` | `chat` |
 | 单次任务 | `coding_agent_cli.main` | `run "列出项目中的 Python 文件"` |
 
@@ -261,8 +261,8 @@ deny_list:                 # bash 命令的硬阻止子串，可按需补充
 |------|------------|
 | 显示 `Usage: ... COMMAND [ARGS]...` 后退出 | CLI 缺少子命令，补充 `chat` 或 `run`；网页启动使用 `uvicorn` |
 | 找不到 `coding_agent` 或 `uvicorn` | 在项目根目录使用同一个虚拟环境解释器重新运行 `-m pip install -r requirements.txt` |
-| 提示端口被占用 | 检查是否已有服务运行，或将 `--port 8000` 改为 `--port 8001`，并访问对应端口 |
-| Windows 启动报 `WinError 10013` | 先运行 `netstat -ano -p tcp \| findstr :8000` 检查端口；已有服务监听时，确认进程归属并停止旧服务，或改用 `--port 8001`。若没有监听进程，可运行 `netsh interface ipv4 show excludedportrange protocol=tcp` 检查是否为系统保留端口，并改用未被保留的空闲端口 |
+| 提示端口被占用 | 检查是否已有服务运行，或将 `--port 8080` 改为其他未被占用的端口，并访问对应端口 |
+| Windows 启动报 `WinError 10013` | 运行 `netsh interface ipv4 show excludedportrange protocol=tcp` 检查系统保留端口；本机的 8000 位于排除范围内，请使用项目默认的 8080，并访问对应端口 |
 | 网页打开正常，但对话失败 | 检查模型标识、接口类型、地址和密钥；修改进程环境变量后重新启动服务 |
 | 启动后找不到网页或配置 | 确认从完整项目目录运行，保留 `web/`，并将工作目录设为项目根目录 |
 | 首次运行相关功能或测试时下载分词数据 | `tiktoken` 首次加载分词表需要联网，下载后使用本地缓存 |
