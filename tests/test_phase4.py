@@ -41,6 +41,54 @@ class TestIsPromptTooLong:
 
 class TestWithRetry:
     @pytest.mark.asyncio
+    @pytest.mark.parametrize("kind", ["openai", "anthropic", "httpx", "timeout", "incomplete"])
+    async def test_retries_transport_errors(self, monkeypatch, kind):
+        import anthropic
+        import httpx
+        import openai
+        from coding_agent.providers.base import IncompleteStreamError
+
+        request = httpx.Request("POST", "https://example.invalid/v1/chat/completions")
+        errors = {
+            "openai": openai.APIConnectionError(request=request),
+            "anthropic": anthropic.APIConnectionError(request=request),
+            "httpx": httpx.RemoteProtocolError("incomplete chunked read"),
+            "timeout": TimeoutError("timed out"),
+            "incomplete": IncompleteStreamError("missing finish_reason"),
+        }
+        sleep = AsyncMock()
+        monkeypatch.setattr("coding_agent.context.recovery.asyncio.sleep", sleep)
+        call = AsyncMock(side_effect=[errors[kind], "ok"])
+        assert await with_retry(call, RecoveryState()) == "ok"
+        assert call.await_count == 2
+        sleep.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_transport_retries_are_bounded(self, monkeypatch):
+        import httpx
+        import openai
+        from coding_agent.providers.base import ModelRequestError
+
+        sleep = AsyncMock()
+        monkeypatch.setattr("coding_agent.context.recovery.asyncio.sleep", sleep)
+        error = openai.APIConnectionError(request=httpx.Request("POST", "https://example.invalid"))
+        call = AsyncMock(side_effect=error)
+        with pytest.raises(ModelRequestError, match="3 次尝试") as failure:
+            await with_retry(call, RecoveryState())
+        assert failure.value.__cause__ is error
+        assert call.await_count == 3 and sleep.await_count == 2
+
+    @pytest.mark.asyncio
+    async def test_cancellation_is_not_retried(self, monkeypatch):
+        sleep = AsyncMock()
+        monkeypatch.setattr("coding_agent.context.recovery.asyncio.sleep", sleep)
+        call = AsyncMock(side_effect=asyncio.CancelledError())
+        with pytest.raises(asyncio.CancelledError):
+            await with_retry(call, RecoveryState())
+        assert call.await_count == 1
+        sleep.assert_not_called()
+
+    @pytest.mark.asyncio
     async def test_success_first_try(self, monkeypatch):
         monkeypatch.setattr("asyncio.sleep", AsyncMock())
         state = RecoveryState(current_model="test-model")

@@ -321,6 +321,38 @@ async def test_stream_failure_after_text_is_not_replayed(tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_connection_retry_discards_partial_tool_call_and_executes_once(tmp_path, monkeypatch):
+    import httpx
+    import openai
+
+    monkeypatch.setattr("coding_agent.context.recovery.asyncio.sleep", AsyncMock())
+
+    class InterruptedProvider(ScriptedProvider):
+        attempts = 0
+
+        async def stream_message(self, *args, **kwargs):
+            self.attempts += 1
+            if self.attempts == 1:
+                yield StreamEvent(type="tool_use_start", tool_name="write_file", tool_id="incomplete")
+                yield StreamEvent(type="tool_input", tool_id="incomplete", text='{"path":')
+                raise openai.APIConnectionError(request=httpx.Request("POST", "https://example.invalid"))
+            async for event in super().stream_message(*args, **kwargs):
+                yield event
+
+    provider = InterruptedProvider([
+        tool_response("write_file", {"path": "result.txt", "content": "complete"}, "complete"),
+        text_response(),
+    ])
+    async with AgentRuntime(Config(workdir=str(tmp_path)), provider=provider) as runtime:
+        events = await collect(runtime)
+        assert sum(event.type == "tool_start" for event in events) == 1
+        assert sum(event.type == "tool_done" for event in events) == 1
+        assert "incomplete" not in str(runtime.messages)
+        assert provider.attempts == 3
+        assert (tmp_path / "result.txt").read_text() == "complete"
+
+
+@pytest.mark.asyncio
 async def test_compaction_persists_outputs_at_documented_threshold(tmp_path):
     from coding_agent.context.compaction import CompactionPipeline
 

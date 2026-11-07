@@ -105,6 +105,51 @@ def test_chat_closes_provider_on_request_failure(provider):
     assert provider.owner_loop.is_closed()
 
 
+def test_chat_survives_exhausted_connection_failure(provider, monkeypatch):
+    import httpx
+    import openai
+    from unittest.mock import AsyncMock
+
+    monkeypatch.setattr("coding_agent.context.recovery.asyncio.sleep", AsyncMock())
+    original = provider.stream_message
+    attempts = []
+
+    async def interrupted(*args, **kwargs):
+        attempts.append(1)
+        if len(attempts) <= 3:
+            raise openai.APIConnectionError(request=httpx.Request("POST", "https://example.invalid"))
+        async for event in original(*args, **kwargs):
+            yield event
+
+    monkeypatch.setattr(provider, "stream_message", interrupted)
+    result = CliRunner().invoke(main.cli, ["chat"], input="你好\n再试一次\nexit\n")
+    assert result.exit_code == 0, result.exception
+    assert "3 次尝试" in result.output and "会话已保留" in result.output
+    assert "我叫李华。" in result.output
+    assert len(attempts) == 4 and provider.closed
+
+
+@pytest.mark.parametrize("command", ["chat", "run"])
+def test_cli_reports_partial_stream_failure_without_replay(provider, monkeypatch, command):
+    import httpx
+    import openai
+
+    attempts = []
+
+    async def interrupted(*args, **kwargs):
+        attempts.append(1)
+        yield StreamEvent(type="text_delta", text="已输出部分回复")
+        raise openai.APIConnectionError(request=httpx.Request("POST", "https://example.invalid"))
+
+    monkeypatch.setattr(provider, "stream_message", interrupted)
+    arguments = ["chat"] if command == "chat" else ["run", "你好"]
+    result = CliRunner().invoke(main.cli, arguments, input="你好\nexit\n")
+    assert result.exit_code == (0 if command == "chat" else 1)
+    assert result.output.count("已输出部分回复") == 1
+    assert "未自动重放" in result.output and "Traceback" not in result.output
+    assert len(attempts) == 1 and provider.closed
+
+
 def test_chat_closes_provider_on_keyboard_interrupt(provider, monkeypatch):
     def interrupt(*args, **kwargs):
         raise KeyboardInterrupt

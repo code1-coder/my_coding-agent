@@ -6,13 +6,21 @@ import asyncio
 import threading
 from contextlib import aclosing
 
+import anthropic
 import click
+import httpx
+import openai
 
 from coding_agent.config import Config, load_config
 from coding_agent.loop import LoopEvent
-from coding_agent.providers.base import LLMProvider
+from coding_agent.providers.base import LLMProvider, ModelRequestError
 from coding_agent.runtime import AgentRuntime, build_provider
 from coding_agent.security.permission import create_terminal_pipeline
+
+
+REQUEST_ERRORS = (ModelRequestError, openai.APIError, anthropic.APIError,
+                  httpx.TransportError, ConnectionError, TimeoutError)
+
 
 def _build_provider(cfg: Config) -> LLMProvider:
     """通过公共工厂创建客户端，避免两端的模型配置逐渐产生差异。"""
@@ -134,9 +142,12 @@ async def _chat_session(cfg: Config) -> None:
             if query.strip().lower() in ("q", "exit", ""):
                 break
             click.echo()
-            async with aclosing(runtime.run_turn(query)) as events:
-                async for event in events:
-                    _print_event(event)
+            try:
+                async with aclosing(runtime.run_turn(query)) as events:
+                    async for event in events:
+                        _print_event(event)
+            except REQUEST_ERRORS as exc:
+                click.echo(f"\n[请求失败] {exc}\n会话已保留，可继续输入或重试。", err=True)
             click.echo("\n")
 
 
@@ -145,7 +156,10 @@ async def _chat_session(cfg: Config) -> None:
 @click.pass_context
 def run(ctx, prompt):
     """执行单次提示词任务后退出。"""
-    final = asyncio.run(_run_agent_loop(prompt, ctx.obj["cfg"], stream=True))
+    try:
+        final = asyncio.run(_run_agent_loop(prompt, ctx.obj["cfg"], stream=True))
+    except REQUEST_ERRORS as exc:
+        raise click.ClickException(f"模型请求失败：{exc}") from exc
     if not final.endswith("\n"):
         click.echo()
 

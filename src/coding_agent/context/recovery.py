@@ -16,11 +16,12 @@
     1. 触发 ``reactive_compact``（紧急摘要）。
     2. 重试一次。仍然失败则追加错误消息并返回。
 
-**路径 3 — 429/529（瞬时错误）**
+**路径 3 — 429/529 和连接中断（瞬时错误）**
     1. 指数退避：``500ms × 2^attempt``（最大 32s）+ 0–25% 随机抖动。
     2. 529 过载：跟踪连续 529 次数。连续 3 次后切换
        fallback 模型（若已配置）。最多 10 次总重试。
-    3. 非瞬时错误立即向上抛出。
+    3. 连接中断、超时和不完整流最多尝试 3 次；调用方阻止已显示文本的重放。
+    4. 非瞬时错误立即向上抛出。
 
 ``RecoveryState`` 追踪所有恢复计数器（has_escalated、
 recovery_count、consecutive_529、has_attempted_reactive_compact、
@@ -37,6 +38,12 @@ import time
 from dataclasses import dataclass, field
 from typing import Any, Callable, Awaitable
 
+import anthropic
+import httpx
+import openai
+
+from coding_agent.providers.base import IncompleteStreamError, ModelRequestError
+
 logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
@@ -47,6 +54,7 @@ DEFAULT_MAX_TOKENS = 8000
 ESCALATED_MAX_TOKENS = 64000
 MAX_RECOVERY_RETRIES = 3           # 续写提示词的最大次数（路径 1）
 MAX_RETRIES = 10                   # 退避重试的最大次数（路径 3）
+MAX_CONNECTION_ATTEMPTS = 3
 BASE_DELAY_MS = 500                # 退避起始延迟
 MAX_CONSECUTIVE_529 = 3            # 连续 529 超过此次数后切换模型
 
@@ -134,13 +142,19 @@ def is_max_tokens_error(exc: Exception) -> bool:
 LLMCall = Callable[[], Awaitable[Any]]
 
 
+def is_connection_error(exc: Exception) -> bool:
+    """识别 SDK 连接错误和超时，避免依赖异常文案进行重试。"""
+    return isinstance(exc, (openai.APIConnectionError, anthropic.APIConnectionError,
+                            httpx.TransportError, ConnectionError, TimeoutError, IncompleteStreamError))
+
+
 async def with_retry(
     fn: LLMCall,
     state: RecoveryState,
     *,
     fallback_model: str | None = None,
 ) -> Any:
-    """对瞬时错误（429 限流、529 过载）做指数退避。
+    """对限流、过载、连接中断和超时做有界指数退避。
 
     非瞬时错误 **向上抛出**，由外层处理器应用路径 1 或路径 2。
 
@@ -157,12 +171,25 @@ async def with_retry(
         如果不是 429/529 错误，或 ``MAX_RETRIES`` 用尽后，
         抛出原始异常。
     """
+    connection_attempts = 0
     for attempt in range(MAX_RETRIES):
         try:
             result = await fn()
             state.reset_transient()
             return result
         except Exception as exc:
+            if is_connection_error(exc):
+                connection_attempts += 1
+                if connection_attempts >= MAX_CONNECTION_ATTEMPTS:
+                    raise ModelRequestError(
+                        f"模型连接中断或超时，重试后仍失败（{connection_attempts} 次尝试）。"
+                        "请检查网络和模型接口后重试。"
+                    ) from exc
+                delay = _retry_delay(connection_attempts - 1)
+                logger.warning("[连接中断] 重试 %d/%d，等待 %.1fs",
+                               connection_attempts, MAX_CONNECTION_ATTEMPTS - 1, delay)
+                await asyncio.sleep(delay)
+                continue
             ename = type(exc).__name__.lower()
             emsg = str(exc).lower()
             status = getattr(exc, "status_code", None)
