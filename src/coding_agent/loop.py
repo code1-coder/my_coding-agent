@@ -200,7 +200,7 @@ class AgentLoop:
             for block, result, execution_id in zip(blocks, results, execution_ids):
                 yield LoopEvent(type="tool_done", tool_name=block["name"],
                                 tool_id=block["id"], tool_output=str(result["content"]),
-                                data={"is_error": result.get("is_error", False),
+                                data={"input": block.get("input", {}), "is_error": result.get("is_error", False),
                                       "execution_id": execution_id, "agent": self.agent_name})
 
         await self.emit(EventType.STOP, stop_reason="max_iterations")
