@@ -84,6 +84,9 @@ def _tool_summary(name: str, parameters: Any) -> list[str]:
     """只从已知工具参数提取摘要，避免打印文件正文。"""
     if not isinstance(parameters, dict):
         return []
+    if name == "bash":
+        command = parameters.get("command")
+        return [_terminal_text(command)] if isinstance(command, str) else []
     if name == "apply_patch":
         try:
             operations = parse_patch(parameters.get("patch", ""))

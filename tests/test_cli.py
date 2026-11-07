@@ -28,6 +28,13 @@ from coding_agent_cli import main
     ("search_code", {"path": "src", "pattern": "run", "file_glob": "*.py"},
      '> search_code src  pattern="run"  files="*.py"'),
     ("git_status", {}, "> git_status"),
+    ("bash", {"command": "git status --short"}, "> bash git status --short"),
+    ("bash", {"command": 'python "中文 空格/script.py"'}, '> bash python "中文 空格/script.py"'),
+    ("bash", {"command": "echo first\necho second\r\t\x1b[31m"},
+     r"> bash echo first\necho second\r\t\u001b[31m"),
+    ("bash", {}, "> bash"),
+    ("bash", {"command": None}, "> bash"),
+    ("bash", {"command": 123}, "> bash"),
     ("unknown", {"token": "PRIVATE_BODY"}, "> unknown"),
     ("read_file", None, "> read_file"),
 ])
@@ -71,6 +78,14 @@ def test_tool_failure_shows_path_and_escapes_error(capsys, is_error):
     main._print_event(main.LoopEvent(type="tool_done", tool_name="read_file", tool_output="Error: missing\nfile",
                                    data={"input": {"path": "missing.py"}, "is_error": is_error}))
     assert capsys.readouterr().err == "[工具失败] read_file missing.py: Error: missing\\nfile\n"
+
+
+@pytest.mark.parametrize("is_error", [True, False])
+def test_bash_failure_shows_command_and_escapes_error(capsys, is_error):
+    command = 'python "中文 空格/script.py"'
+    main._print_event(main.LoopEvent(type="tool_done", tool_name="bash", tool_output="Error: failed\ncommand",
+                                   data={"input": {"command": command}, "is_error": is_error}), color=False)
+    assert capsys.readouterr().err == f"[工具失败] bash {command}: Error: failed\\ncommand\n"
 
 
 def test_tool_success_does_not_print_file_content(capsys):
