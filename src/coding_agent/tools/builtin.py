@@ -24,7 +24,7 @@ from coding_agent.tools.base import Tool
 def _safe_path(workdir: Path, rel: str) -> Path:
     """将 *rel* 相对路径基于 *workdir* 解析，并验证路径未越界。"""
     path = (workdir / rel).resolve()
-    if not path.is_relative_to(workdir):
+    if not path.is_relative_to(workdir.resolve()):
         raise ValueError(f"路径逃逸工作区: {rel}")
     return path
 
@@ -83,12 +83,15 @@ class BashTool(Tool):
 
 class ReadFileTool(Tool):
     name = "read_file"
-    description = "读取文件内容。可选限制返回的行数。"
+    description = "读取 UTF-8 文件；start_line/end_line 为从 1 开始的闭区间。分段读取默认展示行号，limit 可限制行数。"
     input_schema = {
         "type": "object",
         "properties": {
             "path": {"type": "string", "description": "文件的相对路径。"},
             "limit": {"type": "integer", "description": "最大返回行数（可选）。"},
+            "start_line": {"type": "integer", "minimum": 1},
+            "end_line": {"type": "integer", "minimum": 1},
+            "show_line_numbers": {"type": "boolean"},
         },
         "required": ["path"],
     }
@@ -96,16 +99,32 @@ class ReadFileTool(Tool):
     def __init__(self, workdir: Path | str | None = None) -> None:
         self._workdir = Path(workdir) if workdir else Path.cwd()
 
-    def execute(self, path: str, limit: int | None = None) -> str:
+    def execute(self, path: str, limit: int | None = None, start_line: int | None = None,
+                end_line: int | None = None, show_line_numbers: bool | None = None) -> str:
         """读取工作区内的 UTF-8 文件，按 limit 截取行数并注明省略的行数。
 
         路径越界或读取失败时返回错误文本；不修改原文件。
         """
         try:
+            for name, value in (("limit", limit), ("start_line", start_line), ("end_line", end_line)):
+                if value is not None and (type(value) is not int or value < 1):
+                    raise ValueError(f"{name} must be a positive integer")
+            first = start_line or 1
+            if end_line is not None and end_line < first:
+                raise ValueError("end_line must be >= start_line")
             lines = _safe_path(self._workdir, path).read_text(encoding="utf-8", errors="replace").splitlines()
-            if limit is not None and limit < len(lines):
-                lines = lines[:limit] + [f"... ({len(lines) - limit} more lines)"]
-            return "\n".join(lines)
+            if first > len(lines) and first != 1:
+                raise ValueError(f"start_line exceeds file length ({len(lines)} lines)")
+            last = min(len(lines), end_line if end_line is not None else len(lines))
+            if limit is not None:
+                last = min(last, first + limit - 1)
+            numbered = show_line_numbers if show_line_numbers is not None else (
+                start_line is not None or end_line is not None)
+            selected = [f"{index + 1}: {lines[index]}" if numbered else lines[index]
+                        for index in range(first - 1, last)]
+            if last < len(lines):
+                selected.append(f"... ({len(lines) - last} more lines; next start_line={last + 1})")
+            return "\n".join(selected)
         except Exception as exc:
             return f"Error: {exc}"
 

@@ -57,6 +57,33 @@ async def collect(runtime, prompt="开始", **kwargs):
 
 
 @pytest.mark.asyncio
+async def test_code_tools_runtime_round_trip(tmp_path):
+    (tmp_path / "example.py").write_text("def value():\n    return 1\n", encoding="utf-8")
+    patch = ("*** Begin Patch\n*** Update File: example.py\n@@\n def value():\n"
+             "-    return 1\n+    return 2\n*** End Patch")
+    provider = ScriptedProvider([
+        tool_response("code_outline", {"path": "example.py"}, "outline"),
+        tool_response("read_file", {"path": "example.py", "start_line": 1, "end_line": 2}, "read"),
+        tool_response("apply_patch", {"patch": patch}, "patch"),
+        text_response(),
+    ])
+    observed = []
+
+    async def record(event):
+        observed.append(event.data["tool_name"])
+
+    async with AgentRuntime(Config(workdir=str(tmp_path)), provider=provider) as runtime:
+        runtime.bus.subscribe(EventType.POST_TOOL_USE, record)
+        await collect(runtime)
+        assert observed == ["code_outline", "read_file", "apply_patch"]
+        assert "1: def value():" in str(runtime.messages)
+        assert "Applied patch:" in str(runtime.messages)
+        assert "Coding workflow:" in next(call["system"] for call in provider.calls if call["tools"])
+        assert {"search_code", "apply_patch", "git_status", "git_diff", "code_outline"} <= set(runtime.registry)
+    assert (tmp_path / "example.py").read_text() == "def value():\n    return 2\n"
+
+
+@pytest.mark.asyncio
 async def test_runtime_hooks_registry_skills_tasks_and_dynamic_mcp(tmp_path):
     skill = tmp_path / "skills" / "review"
     skill.mkdir(parents=True)
