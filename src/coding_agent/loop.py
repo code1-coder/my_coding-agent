@@ -41,7 +41,7 @@ from coding_agent.hooks.bus import Event, EventBus, EventType
 from coding_agent.security.permission import PermissionPipeline, Verdict
 from coding_agent.context.compaction import CompactionPipeline
 from coding_agent.context.recovery import RecoveryManager, RecoveryState
-from coding_agent.providers.base import StreamEvent
+from coding_agent.providers.base import ModelRequestError, StreamEvent
 
 logger = logging.getLogger(__name__)
 
@@ -200,7 +200,7 @@ class AgentLoop:
             for block, result, execution_id in zip(blocks, results, execution_ids):
                 yield LoopEvent(type="tool_done", tool_name=block["name"],
                                 tool_id=block["id"], tool_output=str(result["content"]),
-                                data={"is_error": result.get("is_error", False),
+                                data={"input": block.get("input", {}), "is_error": result.get("is_error", False),
                                       "execution_id": execution_id, "agent": self.agent_name})
 
         await self.emit(EventType.STOP, stop_reason="max_iterations")
@@ -252,7 +252,7 @@ class AgentLoop:
                 await self.emit(EventType.ERROR, error=str(exc), purpose="agent")
                 if sent_text:
                     # 已显示的增量无法安全重放，避免重试后产生重复文本。
-                    raise RuntimeError("流式响应中断，请重试本轮请求。") from exc
+                    raise ModelRequestError("流式响应中断，已显示部分内容，未自动重放。请重试本轮请求。") from exc
                 raise
 
         async def request():

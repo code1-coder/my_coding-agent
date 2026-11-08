@@ -20,6 +20,7 @@ from typing import Any, AsyncIterator
 from openai import AsyncOpenAI
 
 from coding_agent.providers.base import (
+    IncompleteStreamError,
     LLMProvider,
     ProviderResponse,
     StreamEvent,
@@ -157,6 +158,9 @@ class OpenAICompatProvider(LLMProvider):
                                     tool_id=buf["id"] or f"call_{idx}",
                                     text=tc.function.arguments,
                                 )
+
+        if finish_reason is None:
+            raise IncompleteStreamError("模型响应流提前结束，未收到 finish_reason。")
 
         # ── 组装最终 ProviderResponse ──────────────────────────
         content: list[dict[str, Any]] = []

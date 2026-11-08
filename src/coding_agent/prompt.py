@@ -68,6 +68,17 @@ def assemble_system_prompt(context: dict[str, Any]) -> str:
     if tools:
         names = ", ".join(tools)
         sections.append(f"Available tools: {names}.")
+        if "search_code" in tools:
+            sections.append(
+                "Coding workflow: inspect git_status/git_diff before editing. Locate code with search_code "
+                "(literal by default; regex=true opts in). Use code_outline for Python symbols, then "
+                "read_file(start_line=..., end_line=...) to inspect exact numbered lines. "
+                "Use apply_patch when available for contextual edits and preserve existing user changes. "
+                "If patch context is missing or ambiguous, read the file again; do not guess. "
+                "Run relevant existing tests through bash after editing and inspect git_diff. "
+                "Only issue independent reads in the same tool batch; issue dependent edits and checks "
+                "in separate batches. Truncated search results require a narrower path or pattern."
+            )
 
     # 动态：工作目录
     workspace = context.get("workspace", "")

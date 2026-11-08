@@ -12,6 +12,14 @@ from dataclasses import dataclass, field
 from typing import Any, AsyncIterator, Literal
 
 
+class ModelRequestError(RuntimeError):
+    """可向用户展示的模型请求失败。"""
+
+
+class IncompleteStreamError(ModelRequestError):
+    """模型流未提供完整结束标记。"""
+
+
 # ═══════════════════════════════════════════════════════════════
 #  响应类型（跨 Provider 统一格式）
 # ═══════════════════════════════════════════════════════════════

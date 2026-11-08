@@ -27,6 +27,29 @@ class FakeStream:
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("with_tool", [False, True])
+async def test_openai_rejects_silently_truncated_stream(with_tool):
+    from openai.types.chat import ChatCompletionChunk
+    from coding_agent.providers.base import IncompleteStreamError
+
+    delta = {"tool_calls": [{"index": 0, "id": "call-1", "type": "function",
+                             "function": {"name": "write_file", "arguments": '{"path":'}}]} if with_tool else {"content": "partial"}
+    chunk = ChatCompletionChunk(id="reply", created=0, object="chat.completion.chunk", model="mock",
+                                choices=[{"index": 0, "delta": delta, "finish_reason": None}])
+    stream = FakeStream([chunk])
+    provider = OpenAICompatProvider(api_key="test-key")
+    await provider.aclose()
+    provider._client = SimpleNamespace(chat=SimpleNamespace(completions=SimpleNamespace(
+        create=AsyncMock(return_value=stream))))
+    events = []
+    with pytest.raises(IncompleteStreamError):
+        async for event in provider.stream_message([{"role": "user", "content": "hello"}]):
+            events.append(event)
+    assert all(event.type != "done" for event in events)
+    assert stream.closed
+
+
+@pytest.mark.asyncio
 async def test_anthropic_stream_uses_raw_sdk_deltas_and_awaits_final_message():
     from anthropic.types import RawContentBlockStartEvent, RawContentBlockDeltaEvent
 

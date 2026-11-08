@@ -13,6 +13,87 @@ from coding_agent.providers.base import LLMProvider, ProviderResponse, StreamEve
 from coding_agent_cli import main
 
 
+@pytest.mark.parametrize(("name", "parameters", "expected"), [
+    ("read_file", {"path": "src/main.py"}, "> read_file src/main.py"),
+    ("read_file", {"path": "中文 空格.py", "start_line": 12, "end_line": 20}, "> read_file 中文 空格.py:12-20"),
+    ("read_file", {"path": "a.py", "start_line": 12, "limit": 2}, "> read_file a.py:12-13"),
+    ("read_file", {"path": "a.py", "start_line": 12}, "> read_file a.py:12-"),
+    ("write_file", {"path": "a.py", "content": "PRIVATE_BODY"}, "> write_file a.py"),
+    ("edit_file", {"path": "a.py", "old_text": "PRIVATE_BODY", "new_text": "new"}, "> edit_file a.py"),
+    ("code_outline", {"path": "a.py"}, "> code_outline a.py"),
+    ("git_diff", {"path": "a.py", "staged": True}, "> git_diff a.py [暂存区]"),
+    ("git_diff", {}, "> git_diff ."),
+    ("git_diff", {"staged": True}, "> git_diff . [暂存区]"),
+    ("glob", {"pattern": "**/*.py"}, "> glob **/*.py"),
+    ("search_code", {"path": "src", "pattern": "run", "file_glob": "*.py"},
+     '> search_code src  pattern="run"  files="*.py"'),
+    ("git_status", {}, "> git_status"),
+    ("bash", {"command": "git status --short"}, "> bash git status --short"),
+    ("bash", {"command": 'python "中文 空格/script.py"'}, '> bash python "中文 空格/script.py"'),
+    ("bash", {"command": "echo first\necho second\r\t\x1b[31m"},
+     r"> bash echo first\necho second\r\t\u001b[31m"),
+    ("bash", {}, "> bash"),
+    ("bash", {"command": None}, "> bash"),
+    ("bash", {"command": 123}, "> bash"),
+    ("unknown", {"token": "PRIVATE_BODY"}, "> unknown"),
+    ("read_file", None, "> read_file"),
+])
+def test_tool_start_shows_target_without_file_content(capsys, name, parameters, expected):
+    main._print_event(main.LoopEvent(type="tool_start", tool_name=name, data={"input": parameters}), color=False)
+    output = capsys.readouterr().out
+    assert output == "\n" + expected + "\n"
+    assert "PRIVATE_BODY" not in output
+
+
+def test_patch_display_lists_all_operations_without_body(capsys):
+    patch = ("*** Begin Patch\n*** Add File: added.py\n+PRIVATE_BODY\n"
+             "*** Update File: source.py\n@@\n-old\n+new\n"
+             "*** Update File: old.py\n*** Move to: moved.py\n@@\n-old\n+new\n"
+             "*** Delete File: deleted.py\n*** End Patch")
+    main._print_event(main.LoopEvent(type="tool_start", tool_name="apply_patch", data={"input": {"patch": patch}}))
+    output = capsys.readouterr().out
+    assert output == ("\n> apply_patch\n  新增 added.py\n  修改 source.py\n"
+                      "  移动 old.py → moved.py\n  删除 deleted.py\n")
+    assert "PRIVATE_BODY" not in output
+
+
+@pytest.mark.parametrize("patch", [None, 5, {}, "invalid", "*** Begin Patch\n*** Update File: file\n*** Move to: x\n*** End Patch"])
+def test_invalid_patch_display_does_not_raise(capsys, patch):
+    main._print_event(main.LoopEvent(type="tool_start", tool_name="apply_patch", data={"input": {"patch": patch}}))
+    assert "补丁格式无效，无法提取文件列表" in capsys.readouterr().out
+
+
+def test_tool_display_escapes_control_characters_and_preserves_path(capsys):
+    path = "C:" + chr(92) + "项目" + chr(92) + "file\n\x1b[31m\r\t.txt"
+    main._print_event(main.LoopEvent(type="tool_start", tool_name="read_file", data={"input": {"path": path}}), color=False)
+    output = capsys.readouterr().out
+    assert "C:" + chr(92) + "项目" + chr(92) + "file" in output
+    assert r"\n\u001b[31m\r\t.txt" in output
+    assert output.count("\n") == 2
+    assert "\x1b" not in output
+
+
+@pytest.mark.parametrize("is_error", [True, False])
+def test_tool_failure_shows_path_and_escapes_error(capsys, is_error):
+    main._print_event(main.LoopEvent(type="tool_done", tool_name="read_file", tool_output="Error: missing\nfile",
+                                   data={"input": {"path": "missing.py"}, "is_error": is_error}))
+    assert capsys.readouterr().err == "[工具失败] read_file missing.py: Error: missing\\nfile\n"
+
+
+@pytest.mark.parametrize("is_error", [True, False])
+def test_bash_failure_shows_command_and_escapes_error(capsys, is_error):
+    command = 'python "中文 空格/script.py"'
+    main._print_event(main.LoopEvent(type="tool_done", tool_name="bash", tool_output="Error: failed\ncommand",
+                                   data={"input": {"command": command}, "is_error": is_error}), color=False)
+    assert capsys.readouterr().err == f"[工具失败] bash {command}: Error: failed\\ncommand\n"
+
+
+def test_tool_success_does_not_print_file_content(capsys):
+    main._print_event(main.LoopEvent(type="tool_done", tool_name="read_file", tool_output="PRIVATE_BODY"))
+    captured = capsys.readouterr()
+    assert not captured.out and not captured.err
+
+
 class LoopBoundProvider(LLMProvider):
     """模拟持有连接池的客户端，要求所有请求和关闭操作使用同一事件循环。"""
 
@@ -103,6 +184,51 @@ def test_chat_closes_provider_on_request_failure(provider):
     assert str(result.exception) == "模拟请求失败"
     assert provider.closed
     assert provider.owner_loop.is_closed()
+
+
+def test_chat_survives_exhausted_connection_failure(provider, monkeypatch):
+    import httpx
+    import openai
+    from unittest.mock import AsyncMock
+
+    monkeypatch.setattr("coding_agent.context.recovery.asyncio.sleep", AsyncMock())
+    original = provider.stream_message
+    attempts = []
+
+    async def interrupted(*args, **kwargs):
+        attempts.append(1)
+        if len(attempts) <= 3:
+            raise openai.APIConnectionError(request=httpx.Request("POST", "https://example.invalid"))
+        async for event in original(*args, **kwargs):
+            yield event
+
+    monkeypatch.setattr(provider, "stream_message", interrupted)
+    result = CliRunner().invoke(main.cli, ["chat"], input="你好\n再试一次\nexit\n")
+    assert result.exit_code == 0, result.exception
+    assert "3 次尝试" in result.output and "会话已保留" in result.output
+    assert "我叫李华。" in result.output
+    assert len(attempts) == 4 and provider.closed
+
+
+@pytest.mark.parametrize("command", ["chat", "run"])
+def test_cli_reports_partial_stream_failure_without_replay(provider, monkeypatch, command):
+    import httpx
+    import openai
+
+    attempts = []
+
+    async def interrupted(*args, **kwargs):
+        attempts.append(1)
+        yield StreamEvent(type="text_delta", text="已输出部分回复")
+        raise openai.APIConnectionError(request=httpx.Request("POST", "https://example.invalid"))
+
+    monkeypatch.setattr(provider, "stream_message", interrupted)
+    arguments = ["chat"] if command == "chat" else ["run", "你好"]
+    result = CliRunner().invoke(main.cli, arguments, input="你好\nexit\n")
+    assert result.exit_code == (0 if command == "chat" else 1)
+    assert result.output.count("已输出部分回复") == 1
+    assert "未自动重放" in result.output and "Traceback" not in result.output
+    assert len(attempts) == 1 and provider.closed
 
 
 def test_chat_closes_provider_on_keyboard_interrupt(provider, monkeypatch):

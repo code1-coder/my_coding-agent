@@ -3,16 +3,27 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import threading
 from contextlib import aclosing
+from typing import Any
 
+import anthropic
 import click
+import httpx
+import openai
 
 from coding_agent.config import Config, load_config
 from coding_agent.loop import LoopEvent
-from coding_agent.providers.base import LLMProvider
+from coding_agent.providers.base import LLMProvider, ModelRequestError
 from coding_agent.runtime import AgentRuntime, build_provider
 from coding_agent.security.permission import create_terminal_pipeline
+from coding_agent.tools.patch import parse_patch
+
+
+REQUEST_ERRORS = (ModelRequestError, openai.APIError, anthropic.APIError,
+                  httpx.TransportError, ConnectionError, TimeoutError)
+
 
 def _build_provider(cfg: Config) -> LLMProvider:
     """通过公共工厂创建客户端，避免两端的模型配置逐渐产生差异。"""
@@ -63,6 +74,60 @@ def _create_runtime(cfg: Config) -> tuple[AgentRuntime, asyncio.Lock]:
     return AgentRuntime(cfg, provider_factory=_build_provider, permissions=permissions), read_lock
 
 
+def _terminal_text(value: Any) -> str:
+    """转义换行和控制字符，保留中文、空格及正常路径分隔符。"""
+    return "".join(character if character.isprintable() else
+                   json.dumps(character, ensure_ascii=True)[1:-1] for character in str(value))
+
+
+def _tool_summary(name: str, parameters: Any) -> list[str]:
+    """只从已知工具参数提取摘要，避免打印文件正文。"""
+    if not isinstance(parameters, dict):
+        return []
+    if name == "bash":
+        command = parameters.get("command")
+        return [_terminal_text(command)] if isinstance(command, str) else []
+    if name == "apply_patch":
+        try:
+            operations = parse_patch(parameters.get("patch", ""))
+        except (ValueError, TypeError, IndexError, AttributeError):
+            return ["补丁格式无效，无法提取文件列表"]
+        labels = {"Add": "新增", "Update": "修改", "Delete": "删除"}
+        return [(f"移动 {_terminal_text(operation.path)} → {_terminal_text(operation.destination)}"
+                 if operation.destination is not None else
+                 f"{labels[operation.action]} {_terminal_text(operation.path)}")
+                for operation in operations]
+    if name in ("read_file", "write_file", "edit_file", "code_outline", "git_diff"):
+        path = parameters.get("path")
+        if not isinstance(path, str) or not path:
+            summary = "." if name == "git_diff" else ""
+        else:
+            summary = _terminal_text(path)
+        if not summary:
+            return []
+        if name == "read_file":
+            start, end, limit = (parameters.get(key) for key in ("start_line", "end_line", "limit"))
+            if start is not None or end is not None or limit is not None:
+                first = start if start is not None else 1
+                if type(first) is int and first > 0:
+                    last = end if type(end) is int and end >= first else None
+                    if type(limit) is int and limit > 0:
+                        last = min(last, first + limit - 1) if last is not None else first + limit - 1
+                    summary += f":{first}-{last}" if last is not None else f":{first}-"
+        if name == "git_diff" and parameters.get("staged") is True:
+            summary += " [暂存区]"
+        return [summary]
+    if name == "glob":
+        return [_terminal_text(parameters["pattern"])] if isinstance(parameters.get("pattern"), str) else []
+    if name == "search_code":
+        parts = [_terminal_text(parameters.get("path") or ".")]
+        for key, label in (("pattern", "pattern"), ("file_glob", "files")):
+            if isinstance(parameters.get(key), str):
+                parts.append(f"{label}=" + _terminal_text(json.dumps(parameters[key], ensure_ascii=False)))
+        return ["  ".join(parts)]
+    return []
+
+
 def _print_event(event: LoopEvent, *, color: bool = True) -> None:
     """把公共运行事件渲染到终端，保持入口只负责交互和显示。"""
     if event.type == "text_delta":
@@ -70,8 +135,24 @@ def _print_event(event: LoopEvent, *, color: bool = True) -> None:
     elif event.type == "text_reset":
         click.echo("\n[输出达到上限，正在重新生成]\n")
     elif event.type == "tool_start":
-        label = f"> {event.tool_name}"
-        click.echo("\n" + (click.style(label, fg="yellow") if color else label))
+        label = f"> {_terminal_text(event.tool_name)}"
+        details = _tool_summary(event.tool_name, event.data.get("input"))
+        heading = click.style(label, fg="yellow") if color else label
+        if event.tool_name == "apply_patch":
+            click.echo("\n" + heading)
+            for detail in details:
+                click.echo("  " + detail)
+        else:
+            click.echo("\n" + heading + (" " + details[0] if details else ""))
+    elif event.type == "tool_done" and (event.data.get("is_error") or event.tool_output.startswith("Error:")):
+        label = f"[工具失败] {_terminal_text(event.tool_name)}"
+        details = _tool_summary(event.tool_name, event.data.get("input"))
+        if details:
+            label += " " + "; ".join(details)
+        error = _terminal_text(event.tool_output)
+        if len(error) > 500:
+            error = error[:500] + "…（错误信息已截断）"
+        click.echo(label + ": " + error, err=True)
     elif event.type == "memory_saved":
         click.echo(f"\n[记忆] 已保存 {event.data['count']} 条到 {event.data['path']}\n")
     elif event.type == "warning":
@@ -134,9 +215,12 @@ async def _chat_session(cfg: Config) -> None:
             if query.strip().lower() in ("q", "exit", ""):
                 break
             click.echo()
-            async with aclosing(runtime.run_turn(query)) as events:
-                async for event in events:
-                    _print_event(event)
+            try:
+                async with aclosing(runtime.run_turn(query)) as events:
+                    async for event in events:
+                        _print_event(event)
+            except REQUEST_ERRORS as exc:
+                click.echo(f"\n[请求失败] {exc}\n会话已保留，可继续输入或重试。", err=True)
             click.echo("\n")
 
 
@@ -145,7 +229,10 @@ async def _chat_session(cfg: Config) -> None:
 @click.pass_context
 def run(ctx, prompt):
     """执行单次提示词任务后退出。"""
-    final = asyncio.run(_run_agent_loop(prompt, ctx.obj["cfg"], stream=True))
+    try:
+        final = asyncio.run(_run_agent_loop(prompt, ctx.obj["cfg"], stream=True))
+    except REQUEST_ERRORS as exc:
+        raise click.ClickException(f"模型请求失败：{exc}") from exc
     if not final.endswith("\n"):
         click.echo()
 

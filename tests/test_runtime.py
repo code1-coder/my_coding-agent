@@ -57,6 +57,33 @@ async def collect(runtime, prompt="开始", **kwargs):
 
 
 @pytest.mark.asyncio
+async def test_code_tools_runtime_round_trip(tmp_path):
+    (tmp_path / "example.py").write_text("def value():\n    return 1\n", encoding="utf-8")
+    patch = ("*** Begin Patch\n*** Update File: example.py\n@@\n def value():\n"
+             "-    return 1\n+    return 2\n*** End Patch")
+    provider = ScriptedProvider([
+        tool_response("code_outline", {"path": "example.py"}, "outline"),
+        tool_response("read_file", {"path": "example.py", "start_line": 1, "end_line": 2}, "read"),
+        tool_response("apply_patch", {"patch": patch}, "patch"),
+        text_response(),
+    ])
+    observed = []
+
+    async def record(event):
+        observed.append(event.data["tool_name"])
+
+    async with AgentRuntime(Config(workdir=str(tmp_path)), provider=provider) as runtime:
+        runtime.bus.subscribe(EventType.POST_TOOL_USE, record)
+        await collect(runtime)
+        assert observed == ["code_outline", "read_file", "apply_patch"]
+        assert "1: def value():" in str(runtime.messages)
+        assert "Applied patch:" in str(runtime.messages)
+        assert "Coding workflow:" in next(call["system"] for call in provider.calls if call["tools"])
+        assert {"search_code", "apply_patch", "git_status", "git_diff", "code_outline"} <= set(runtime.registry)
+    assert (tmp_path / "example.py").read_text() == "def value():\n    return 2\n"
+
+
+@pytest.mark.asyncio
 async def test_runtime_hooks_registry_skills_tasks_and_dynamic_mcp(tmp_path):
     skill = tmp_path / "skills" / "review"
     skill.mkdir(parents=True)
@@ -291,6 +318,38 @@ async def test_stream_failure_after_text_is_not_replayed(tmp_path):
         assert (await anext(events)).text == "已输出"
         with pytest.raises(RuntimeError, match="流式响应中断"):
             await anext(events)
+
+
+@pytest.mark.asyncio
+async def test_connection_retry_discards_partial_tool_call_and_executes_once(tmp_path, monkeypatch):
+    import httpx
+    import openai
+
+    monkeypatch.setattr("coding_agent.context.recovery.asyncio.sleep", AsyncMock())
+
+    class InterruptedProvider(ScriptedProvider):
+        attempts = 0
+
+        async def stream_message(self, *args, **kwargs):
+            self.attempts += 1
+            if self.attempts == 1:
+                yield StreamEvent(type="tool_use_start", tool_name="write_file", tool_id="incomplete")
+                yield StreamEvent(type="tool_input", tool_id="incomplete", text='{"path":')
+                raise openai.APIConnectionError(request=httpx.Request("POST", "https://example.invalid"))
+            async for event in super().stream_message(*args, **kwargs):
+                yield event
+
+    provider = InterruptedProvider([
+        tool_response("write_file", {"path": "result.txt", "content": "complete"}, "complete"),
+        text_response(),
+    ])
+    async with AgentRuntime(Config(workdir=str(tmp_path)), provider=provider) as runtime:
+        events = await collect(runtime)
+        assert sum(event.type == "tool_start" for event in events) == 1
+        assert sum(event.type == "tool_done" for event in events) == 1
+        assert "incomplete" not in str(runtime.messages)
+        assert provider.attempts == 3
+        assert (tmp_path / "result.txt").read_text() == "complete"
 
 
 @pytest.mark.asyncio

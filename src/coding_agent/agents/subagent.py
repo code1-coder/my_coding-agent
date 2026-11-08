@@ -8,8 +8,8 @@
 * 只返回 **摘要** —— 中间工具结果被丢弃。
 
 两种智能体角色：
-    ``explorer`` — bash、read_file、glob（只读 + 搜索）。
-    ``worker``   — explorer 工具 + write_file、edit_file。
+    ``explorer`` — bash、分段读取、代码搜索、Python 提纲和 Git 查看。
+    ``worker``   — explorer 工具 + write_file、edit_file、apply_patch。
 
 用法::
 
@@ -47,11 +47,11 @@ SUB_SYSTEM_TEMPLATE = (
 # ---------------------------------------------------------------------------
 
 def _explorer_tool_names() -> set[str]:
-    return {"bash", "read_file", "glob"}
+    return {"bash", "read_file", "glob", "search_code", "code_outline", "git_status", "git_diff"}
 
 
 def _worker_tool_names() -> set[str]:
-    return {"bash", "read_file", "glob", "write_file", "edit_file"}
+    return _explorer_tool_names() | {"write_file", "edit_file", "apply_patch"}
 
 
 # ---------------------------------------------------------------------------
@@ -237,20 +237,9 @@ def _build_base_tools(workdir: Path) -> dict[str, Tool]:
 
     这些是内置工具的轻量版本，不依赖 ToolRegistry。
     """
-    from coding_agent.tools.builtin import (
-        BashTool,
-        EditFileTool,
-        GlobTool,
-        ReadFileTool,
-        WriteFileTool,
-    )
-    return {
-        "bash": BashTool(workdir=workdir),
-        "read_file": ReadFileTool(workdir=workdir),
-        "write_file": WriteFileTool(workdir=workdir),
-        "edit_file": EditFileTool(workdir=workdir),
-        "glob": GlobTool(workdir=workdir),
-    }
+    from coding_agent.tools import build_builtin_tools
+
+    return {tool.name: tool for tool in build_builtin_tools(workdir)}
 
 
 def _extract_last_assistant_text(messages: list[dict[str, Any]]) -> str:

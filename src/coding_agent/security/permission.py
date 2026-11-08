@@ -166,10 +166,21 @@ class WorkspaceChecker(BasePermissionChecker):
         self.workdir = Path(workdir).resolve()
 
     async def check(self, tool_name: str, params: dict[str, Any]) -> tuple[Verdict, str]:
-        if tool_name not in ("read_file", "write_file", "edit_file"):
+        if tool_name == "apply_patch":
+            from coding_agent.tools.patch import parse_patch, patch_path
+
+            try:
+                for operation in parse_patch(params.get("patch", "")):
+                    patch_path(self.workdir, operation.path)
+                    if operation.destination is not None:
+                        patch_path(self.workdir, operation.destination)
+            except (ValueError, OSError) as exc:
+                return Verdict.DENY, str(exc)
+            return Verdict.ALLOW, ""
+        if tool_name not in ("read_file", "write_file", "edit_file", "search_code", "code_outline", "git_diff"):
             return Verdict.ALLOW, ""
 
-        rel = params.get("path", "")
+        rel = params.get("path") or "."
         try:
             resolved = (self.workdir / rel).resolve()
         except (OSError, ValueError):

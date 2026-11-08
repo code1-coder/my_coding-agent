@@ -1,5 +1,7 @@
 """内置工具集。"""
 
+from pathlib import Path
+
 from coding_agent.tools.base import Tool, ToolResult, tool_result
 from coding_agent.tools.builtin import (
     BashTool,
@@ -8,6 +10,8 @@ from coding_agent.tools.builtin import (
     ReadFileTool,
     WriteFileTool,
 )
+from coding_agent.tools.code import CodeOutlineTool, GitDiffTool, GitStatusTool, SearchCodeTool
+from coding_agent.tools.patch import ApplyPatchTool
 
 __all__ = [
     "Tool",
@@ -18,14 +22,21 @@ __all__ = [
     "WriteFileTool",
     "EditFileTool",
     "GlobTool",
+    "SearchCodeTool",
+    "CodeOutlineTool",
+    "GitStatusTool",
+    "GitDiffTool",
+    "ApplyPatchTool",
+    "build_builtin_tools",
 ]
 
-# 预构建的五个内置工具列表（使用默认工作目录）。
-# 如需自定义工作目录，请自行实例化各个工具。
-BUILTIN_TOOLS: list[Tool] = [
-    BashTool(),
-    ReadFileTool(),
-    WriteFileTool(),
-    EditFileTool(),
-    GlobTool(),
-]
+
+def build_builtin_tools(workdir: Path | str | None = None) -> list[Tool]:
+    """为主会话及子智能体构建相同的工作区工具实例。"""
+    return [tool_type(workdir=workdir) for tool_type in (
+        BashTool, ReadFileTool, WriteFileTool, EditFileTool, GlobTool,
+        SearchCodeTool, CodeOutlineTool, GitStatusTool, GitDiffTool, ApplyPatchTool,
+    )]
+
+
+BUILTIN_TOOLS: list[Tool] = build_builtin_tools()

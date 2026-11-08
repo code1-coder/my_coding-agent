@@ -90,19 +90,19 @@ export OPENAI_API_KEY="你的 API 密钥"
 **Windows PowerShell：**
 
 ```powershell
-.\.venv\Scripts\python.exe -m uvicorn coding_agent.server.app:app --host 127.0.0.1 --port 8000 --reload
+.\.venv\Scripts\python.exe -m uvicorn coding_agent.server.app:app --host 127.0.0.1 --port 8080 --reload
 ```
 
 **macOS / Linux：**
 
 ```bash
-.venv/bin/python -m uvicorn coding_agent.server.app:app --host 127.0.0.1 --port 8000 --reload
+.venv/bin/python -m uvicorn coding_agent.server.app:app --host 127.0.0.1 --port 8080 --reload
 ```
 
-看到 `Uvicorn running on http://127.0.0.1:8000` 后，打开 [网页控制台](http://127.0.0.1:8000)。
+看到 `Uvicorn running on http://127.0.0.1:8080` 后，打开 [网页控制台](http://127.0.0.1:8080)。Windows 上的 8000 端口可能被 Hyper-V、WSL 或其他系统组件列入排除范围；本项目默认使用 8080，避免 `WinError 10013`。
 
-- [健康检查](http://127.0.0.1:8000/health)：正常返回 `{"status":"ok"}`，仅确认服务存活，不验证模型配置。
-- [接口文档](http://127.0.0.1:8000/docs)：查看 HTTP 接口定义。
+- [健康检查](http://127.0.0.1:8080/health)：正常返回 `{"status":"ok"}`，仅确认服务存活，不验证模型配置。
+- [接口文档](http://127.0.0.1:8080/docs)：查看 HTTP 接口定义。
 
 保持终端运行，按 `Ctrl+C` 停止服务。`--reload` 用于开发时自动重载代码。以后启动时，进入项目目录、设置所需环境变量，再执行本节命令即可，无需重新创建虚拟环境。
 
@@ -149,6 +149,8 @@ macOS / Linux 将解释器路径替换为 `.venv/bin/python`。激活虚拟环�
 `chat` 每轮会读取相关的跨会话记忆，并在回答结束后通过模型提取新记忆。例如输入“记住你叫李华”或“记住以后用中文回答”，保存成功后会显示 `[记忆] 已保存 ...`。记忆保存在配置的 `workdir` 下的 `.memory/`，其中 `MEMORY.md` 是索引，其余 Markdown 文件记录具体内容。重新启动 `chat` 时使用同一个工作目录，即可继续读取这些记忆；仅在同一轮对话中口头答应“记住了”不能作为保存成功的依据。记忆选择和提取会额外调用配置的模型接口。
 
 ## 统一运行流程
+
+代码工具现已支持 search_code、read_file 分段读取、apply_patch、git_status、git_diff 和 Python code_outline。参见[代码工具参数与补丁格式](docs/code-tools.md)。搜索需要 PATH 中的 ripgrep (rg)，Git 查看需要 Git；无需新增 Python 依赖。
 
 CLI 的 `chat`、`run` 和网页 `/chat` 均通过 `AgentRuntime` 调用项目已有模块。入口负责终端交互或 HTTP/SSE 编码，实际处理流程保持一致：会话开始 → 提交用户输入 → 读取记忆、技能与队友回信 → 组装系统提示词 → 压缩上下文 → 调用模型 → 检查并执行工具 → 保存记忆 → 本轮结束。退出 CLI 或关闭网页服务时，会取消后台队友并关闭模型连接。
 
@@ -200,7 +202,7 @@ async def main():
 
 | 用途 | 模块名称 | 运行参数 |
 |------|----------|----------|
-| 网页控制台 | `uvicorn` | `coding_agent.server.app:app --host 127.0.0.1 --port 8000 --reload` |
+| 网页控制台 | `uvicorn` | `coding_agent.server.app:app --host 127.0.0.1 --port 8080 --reload` |
 | 命令行对话 | `coding_agent_cli.main` | `chat` |
 | 单次任务 | `coding_agent_cli.main` | `run "列出项目中的 Python 文件"` |
 
@@ -247,6 +249,8 @@ deny_list:                 # bash 命令的硬阻止子串，可按需补充
 
 记忆选择、提取、合并以及超限摘要会额外调用模型接口。流式响应已经输出文本后若中途断开，会报告错误，避免自动重放造成重复内容。修改运行配置后，CLI 重新启动，网页服务也需重新启动，以重新创建会话运行层。
 
+模型连接中断或超时且尚未显示文本时，运行层最多尝试 3 次（含首次请求），按指数退避重试；失败尝试中未完成的工具调用会丢弃。已显示部分回复后不会自动重放，也不会执行该不完整响应中的工具。交互式 chat 显示错误后保留会话，可继续输入；单次 run 显示简明错误并以非零状态退出。OpenAI 兼容接口若未发送 finish_reason 就结束流，也会作为不完整响应处理。
+
 同类环境变量同时存在时，地址优先读取 `ANTHROPIC_BASE_URL`；密钥按表中的顺序采用第一个非空值。设置模型后端时应同时确认模型、地址和密钥属于同一服务。
 
 `auto` 仅根据 `base_url` 是否包含 `anthropic` 选择后端，其余情况使用 OpenAI 兼容接口。使用 Anthropic 时可显式设置 `provider: anthropic`。
@@ -261,8 +265,8 @@ deny_list:                 # bash 命令的硬阻止子串，可按需补充
 |------|------------|
 | 显示 `Usage: ... COMMAND [ARGS]...` 后退出 | CLI 缺少子命令，补充 `chat` 或 `run`；网页启动使用 `uvicorn` |
 | 找不到 `coding_agent` 或 `uvicorn` | 在项目根目录使用同一个虚拟环境解释器重新运行 `-m pip install -r requirements.txt` |
-| 提示端口被占用 | 检查是否已有服务运行，或将 `--port 8000` 改为 `--port 8001`，并访问对应端口 |
-| Windows 启动报 `WinError 10013` | 先运行 `netstat -ano -p tcp \| findstr :8000` 检查端口；已有服务监听时，确认进程归属并停止旧服务，或改用 `--port 8001`。若没有监听进程，可运行 `netsh interface ipv4 show excludedportrange protocol=tcp` 检查是否为系统保留端口，并改用未被保留的空闲端口 |
+| 提示端口被占用 | 检查是否已有服务运行，或将 `--port 8080` 改为其他未被占用的端口，并访问对应端口 |
+| Windows 启动报 `WinError 10013` | 运行 `netsh interface ipv4 show excludedportrange protocol=tcp` 检查系统保留端口；本机的 8000 位于排除范围内，请使用项目默认的 8080，并访问对应端口 |
 | 网页打开正常，但对话失败 | 检查模型标识、接口类型、地址和密钥；修改进程环境变量后重新启动服务 |
 | 启动后找不到网页或配置 | 确认从完整项目目录运行，保留 `web/`，并将工作目录设为项目根目录 |
 | 首次运行相关功能或测试时下载分词数据 | `tiktoken` 首次加载分词表需要联网，下载后使用本地缓存 |

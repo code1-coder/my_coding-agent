@@ -7,7 +7,7 @@ import re
 from typing import TYPE_CHECKING
 
 from coding_agent.agents.lifecycle import AgentLifecycle
-from coding_agent.tools.builtin import BashTool, ReadFileTool, WriteFileTool, EditFileTool, GlobTool
+from coding_agent.tools import build_builtin_tools
 
 if TYPE_CHECKING:
     from coding_agent.runtime import AgentRuntime
@@ -17,8 +17,7 @@ if TYPE_CHECKING:
 def register_runtime_tools(runtime: AgentRuntime, registry: ToolRegistry, *, agent_name: str,
                            delegation: bool, allowed_tools: set[str] | None) -> None:
     """只负责能力适配；所有实际调用由 AgentLoop 统一检查、分发并触发 Hook。"""
-    for cls in (BashTool, ReadFileTool, WriteFileTool, EditFileTool, GlobTool):
-        tool = cls(workdir=runtime.workdir)
+    for tool in build_builtin_tools(runtime.workdir):
         if allowed_tools is None or tool.name in allowed_tools:
             registry.register_tool(tool)
 
