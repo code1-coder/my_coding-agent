@@ -88,6 +88,28 @@ def test_bash_failure_shows_command_and_escapes_error(capsys, is_error):
     assert capsys.readouterr().err == f"[工具失败] bash {command}: Error: failed\\ncommand\n"
 
 
+def test_bash_failure_shows_execution_metadata(capsys):
+    main._print_event(main.LoopEvent(
+        type="tool_done", tool_name="bash", tool_output="Error: Timeout (0.01s)",
+        data={
+            "input": {"command": "python -c sleep"},
+            "is_error": True,
+            "execution": {
+                "exit_code": None,
+                "duration_ms": 12.5,
+                "failure_stage": "timeout",
+                "timed_out": True,
+                "truncated": True,
+            },
+        },
+    ), color=False)
+    output = capsys.readouterr().err
+    assert "[耗时: 12.5 ms]" in output
+    assert "[阶段: timeout]" in output
+    assert "[已超时]" in output
+    assert "[输出已截断]" in output
+
+
 def test_tool_success_does_not_print_file_content(capsys):
     main._print_event(main.LoopEvent(type="tool_done", tool_name="read_file", tool_output="PRIVATE_BODY"))
     captured = capsys.readouterr()

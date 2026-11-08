@@ -36,7 +36,7 @@ def _safe_path(workdir: Path, rel: str) -> Path:
 
 class BashTool(Tool):
     name = "bash"
-    description = "运行 shell 命令，返回退出码、stdout、stderr、耗时和截断状态；非零退出码表示失败。输出共保留最多 50000 字符。"
+    description = "运行 shell 命令，返回退出码、stdout、stderr、耗时、超时、取消和截断状态；非零退出码表示失败。输出共保留最多 50000 字符。"
     input_schema = {
         "type": "object",
         "properties": {
@@ -45,8 +45,11 @@ class BashTool(Tool):
         "required": ["command"],
     }
 
-    def __init__(self, workdir: Path | str | None = None) -> None:
+    def __init__(self, workdir: Path | str | None = None, timeout_seconds: float = 120) -> None:
         self._workdir = Path(workdir) if workdir else Path.cwd()
+        if timeout_seconds <= 0:
+            raise ValueError("timeout_seconds must be positive")
+        self._timeout_seconds = timeout_seconds
 
     def execute(self, command: str) -> ToolResult:
         """在工作目录执行命令，保留退出状态和独立输出，最多返回 50000 字符。
@@ -54,10 +57,12 @@ class BashTool(Tool):
         非零退出码、危险命令、超时和启动失败均返回结构化失败结果。
         """
         started = time.perf_counter()
+        if not isinstance(command, str) or not command.strip():
+            return self._result(started, error="Error: command must be a non-empty string", failure_stage="validation")
         # 阻止明显危险的命令
         dangerous = ["rm -rf /", "sudo", "shutdown", "reboot", "> /dev/"]
         if any(d in command for d in dangerous):
-            return self._result(started, error="Error: Dangerous command blocked")
+            return self._result(started, error="Error: Dangerous command blocked", failure_stage="blocked")
 
         try:
             completed = subprocess.run(
@@ -68,20 +73,24 @@ class BashTool(Tool):
                 text=True,
                 encoding="utf-8",
                 errors="replace",
-                timeout=120,
+                timeout=self._timeout_seconds,
             )
         except subprocess.TimeoutExpired as exc:
             stdout = exc.stdout.decode("utf-8", errors="replace") if isinstance(exc.stdout, bytes) else exc.stdout or ""
             stderr = exc.stderr.decode("utf-8", errors="replace") if isinstance(exc.stderr, bytes) else exc.stderr or ""
-            return self._result(started, stdout, stderr, error="Error: Timeout (120s)", timed_out=True)
+            return self._result(started, stdout, stderr,
+                               error=f"Error: Timeout ({self._timeout_seconds:g}s)",
+                               timed_out=True, failure_stage="timeout")
         except (FileNotFoundError, OSError) as exc:
-            return self._result(started, error=f"Error: {exc}")
+            return self._result(started, error=f"Error: {exc}", failure_stage="startup")
 
         error = f"Error: Command exited with code {completed.returncode}" if completed.returncode != 0 else None
-        return self._result(started, completed.stdout, completed.stderr, exit_code=completed.returncode, error=error)
+        return self._result(started, completed.stdout, completed.stderr, exit_code=completed.returncode, error=error,
+                            failure_stage="nonzero_exit" if error else None)
 
     def _result(self, started: float, stdout: str = "", stderr: str = "", *,
-                exit_code: int | None = None, error: str | None = None, timed_out: bool = False) -> ToolResult:
+                exit_code: int | None = None, error: str | None = None, timed_out: bool = False,
+                failure_stage: str | None = None) -> ToolResult:
         """限制输出大小，同时保留执行状态；未正常退出时退出码为空。"""
         truncated = len(stdout) + len(stderr) > 50000
         stdout = stdout[:50000]
@@ -89,7 +98,8 @@ class BashTool(Tool):
         return ToolResult(tool_use_id="", content=(stdout + stderr).strip() or "(no output)", error=error,
                           execution={"exit_code": exit_code, "stdout": stdout, "stderr": stderr,
                                      "duration_ms": round((time.perf_counter() - started) * 1000, 3),
-                                     "timed_out": timed_out, "cancelled": False, "truncated": truncated})
+                                     "timed_out": timed_out, "cancelled": False, "truncated": truncated,
+                                     "failure_stage": failure_stage})
 
 
 # ═══════════════════════════════════════════════════════════════

@@ -11,7 +11,7 @@ CLI、网页、worker 和后台队友通过相同的 ToolRegistry 使用代码�
 
 同批工具会并发执行。存在依赖的修改、读取和测试应分成不同批次。
 
-CLI 的 chat 和 run 会在工具开始时显示文件路径；分段读取同时显示行范围，例如 read_file src/main.py:20-60。apply_patch 逐项列出新增、修改、移动和删除的路径。search_code 显示搜索范围、pattern 和 files，glob 显示文件匹配模式。bash 显示实际执行命令，例如 > bash git status --short，并在完成或失败时报告退出码、耗时和截断状态，保留引号、空格和中文。只显示参数摘要，不打印文件正文或替换内容；路径和命令中的换行与控制字符会转义。开始记录表示准备执行，工具返回失败时另行显示带目标路径或命令的简短错误。
+CLI 的 chat 和 run 会在工具开始时显示文件路径；分段读取同时显示行范围，例如 read_file src/main.py:20-60。apply_patch 逐项列出新增、修改、移动和删除的路径。search_code 显示搜索范围、pattern 和 files，glob 显示文件匹配模式。bash 显示实际执行命令，例如 > bash git status --short，并在完成或失败时报告退出码、耗时、失败阶段、超时和截断状态，保留引号、空格和中文。只显示参数摘要，不打印文件正文或替换内容；路径和命令中的换行与控制字符会转义。开始记录表示准备执行，工具返回失败时另行显示带目标路径或命令的简短错误。
 
 ## 工具参数
 
@@ -24,7 +24,7 @@ CLI 的 chat 和 run 会在工具开始时显示文件路径；分段读取同�
 | git_diff | path="src", staged=false, stat=false, context_lines=3 | 默认未暂存；staged=true 查看暂存，stat=true 查看统计；路径为字面量；不显示未跟踪文件内容 |
 | apply_patch | patch="补丁文本" | 新增、精确上下文更新、移动及删除；JSON 参数需要正确编码换行 |
 
-search_code 需要 PATH 中存在 ripgrep (rg)，Git 工具需要 Git。未安装时返回明确错误；无需新增 Python 依赖。搜索遵循 ripgrep 默认忽略规则，目录遍历不跟随符号链接。文件大小限制 2 MiB，匹配行最长展示 2000 字符；最多 1000 行结果，原始搜索输出最多读取 2 MB。Git 输出最多 50000 字节。命令超时 30 秒。结果截断时缩小路径或搜索范围。
+search_code 需要 PATH 中存在 ripgrep (rg)，Git 工具需要 Git。未安装时返回明确错误；无需新增 Python 依赖。搜索遵循 ripgrep 默认忽略规则，目录遍历不跟随符号链接。文件大小限制 2 MiB，匹配行最长展示 2000 字符；最多 1000 行结果，原始搜索输出最多读取 2 MB。Git 输出最多 50000 字节。命令默认超时 120 秒；BashTool 可通过 timeout_seconds 调整超时时间。超时、启动失败、空命令和非零退出都会返回结构化失败结果，并保留 stdout、stderr、duration_ms、timed_out、cancelled、truncated 和 failure_stage 字段。结果截断时缩小路径或搜索范围。
 
 ## 补丁格式
 

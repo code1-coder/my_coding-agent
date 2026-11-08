@@ -31,7 +31,48 @@ def test_bash_success_has_zero_exit_code(tmp_path):
     assert result.error is None
     assert result.content == "42"
     assert result.execution["exit_code"] == 0
+    assert result.execution["duration_ms"] >= 0
+    assert result.execution["cancelled"] is False
     assert '"exit_code": 0' in result.to_dict()["content"]
+
+
+def test_bash_reports_output_truncation_and_nonzero_exit(tmp_path):
+    result = BashTool(tmp_path).execute(
+        'python -c "import sys; sys.stdout.write(\'x\' * 50001); sys.exit(7)"'
+    )
+    assert result.error == "Error: Command exited with code 7"
+    assert result.execution["exit_code"] == 7
+    assert result.execution["stdout"] == "x" * 50000
+    assert result.execution["stderr"] == ""
+    assert result.execution["truncated"] is True
+    assert result.execution["failure_stage"] == "nonzero_exit"
+    assert result.to_dict()["is_error"] is True
+
+
+def test_bash_reports_timeout_and_startup_failure(tmp_path):
+    timed_out = BashTool(tmp_path, timeout_seconds=0.01).execute(
+        'python -c "import time; time.sleep(0.2)"'
+    )
+    assert timed_out.error == "Error: Timeout (0.01s)"
+    assert timed_out.execution["exit_code"] is None
+    assert timed_out.execution["timed_out"] is True
+    assert timed_out.execution["cancelled"] is False
+    assert timed_out.execution["failure_stage"] == "timeout"
+    assert timed_out.to_dict()["is_error"] is True
+
+    startup_failed = BashTool(tmp_path / "missing-workdir").execute("echo never")
+    assert startup_failed.error
+    assert startup_failed.execution["exit_code"] is None
+    assert startup_failed.execution["timed_out"] is False
+    assert startup_failed.execution["failure_stage"] == "startup"
+    assert startup_failed.to_dict()["is_error"] is True
+
+
+def test_bash_rejects_empty_command_with_structured_failure(tmp_path):
+    result = BashTool(tmp_path).execute("   ")
+    assert result.error == "Error: command must be a non-empty string"
+    assert result.execution["failure_stage"] == "validation"
+    assert result.execution["exit_code"] is None
 
 
 def test_read_file_segments_and_legacy_output(tmp_path):

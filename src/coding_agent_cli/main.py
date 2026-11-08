@@ -152,6 +152,14 @@ def _print_event(event: LoopEvent, *, color: bool = True) -> None:
         execution = event.data.get("execution", {})
         if execution.get("exit_code") is not None:
             label += f" [退出码: {execution['exit_code']}]"
+        if execution.get("duration_ms") is not None:
+            label += f" [耗时: {execution['duration_ms']} ms]"
+        if execution.get("failure_stage"):
+            label += f" [阶段: {execution['failure_stage']}]"
+        if execution.get("timed_out"):
+            label += " [已超时]"
+        if execution.get("truncated"):
+            label += " [输出已截断]"
         error = _terminal_text(event.tool_output)
         if len(error) > 500:
             error = error[:500] + "…（错误信息已截断）"
