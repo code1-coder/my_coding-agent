@@ -7,9 +7,31 @@ import pytest
 from coding_agent.agents.subagent import AgentPool
 from coding_agent.security.permission import Verdict, WorkspaceChecker
 from coding_agent.tools import (
-    ApplyPatchTool, CodeOutlineTool, GitDiffTool, GitStatusTool, ReadFileTool, SearchCodeTool,
+    ApplyPatchTool, BashTool, CodeOutlineTool, GitDiffTool, GitStatusTool, ReadFileTool, SearchCodeTool,
 )
 from coding_agent.tools.registry import ToolRegistry
+
+
+def test_bash_preserves_exit_code_and_output(tmp_path):
+    result = BashTool(tmp_path).execute(
+        'python -c "import sys; print(\'stdout\'); print(\'stderr\', file=sys.stderr); sys.exit(7)"'
+    )
+    assert result.error == "Error: Command exited with code 7"
+    assert result.content == "stdout\nstderr"
+    assert result.execution["exit_code"] == 7
+    assert result.execution["stdout"].strip() == "stdout"
+    assert result.execution["stderr"].strip() == "stderr"
+    assert result.execution["timed_out"] is False
+    assert result.execution["truncated"] is False
+    assert result.to_dict()["is_error"] is True
+
+
+def test_bash_success_has_zero_exit_code(tmp_path):
+    result = BashTool(tmp_path).execute('python -c "print(42)"')
+    assert result.error is None
+    assert result.content == "42"
+    assert result.execution["exit_code"] == 0
+    assert '"exit_code": 0' in result.to_dict()["content"]
 
 
 def test_read_file_segments_and_legacy_output(tmp_path):

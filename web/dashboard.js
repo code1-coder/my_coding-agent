@@ -369,7 +369,12 @@ function updateTool(data, finished = false) {
   if (finished) {
     card.classList.add(data.is_error ? 'failed' : 'done');
     card.querySelector('.tool-state').textContent = data.is_error ? '执行失败' : '已完成';
-    card.querySelector('.details').textContent = data.output || '工具执行结束。';
+    if (data.execution?.exit_code != null) {
+      card.querySelector('.tool-state').textContent += ' · 退出码 ' + data.execution.exit_code;
+    }
+    card.querySelector('.details').textContent = data.execution && Object.keys(data.execution).length
+      ? JSON.stringify({ ...data.execution, output: data.output }, null, 2)
+      : data.output || '工具执行结束。';
   }
 }
 

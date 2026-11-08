@@ -269,10 +269,12 @@ class AgentLifecycle:
                     tool_id = block.get("id", "")
 
                 output = self._execute_tool(tool_name, tool_input)
+                output_dict = output.to_dict() if hasattr(output, "to_dict") else None
                 results.append({
                     "type": "tool_result",
                     "tool_use_id": tool_id,
-                    "content": output,
+                    "content": output_dict["content"] if output_dict else output,
+                    **({"is_error": True} if output_dict and output_dict.get("is_error") else {}),
                 })
 
             self._messages.append({"role": "user", "content": results})
@@ -342,7 +344,7 @@ class AgentLifecycle:
                 return True
         return False
 
-    def _execute_tool(self, tool_name: str, tool_input: dict[str, Any]) -> str:
+    def _execute_tool(self, tool_name: str, tool_input: dict[str, Any]) -> Any:
         """将工具调用分发给处理器或 MessageBus 发送。"""
         if tool_name == "send_message":
             self.bus.send(
@@ -366,7 +368,7 @@ class AgentLifecycle:
         handler = self._tool_handlers.get(tool_name)
         if handler:
             try:
-                return str(handler(**tool_input))
+                return handler(**tool_input)
             except Exception as exc:
                 return f"Error: {exc}"
         return f"Unknown tool: {tool_name}"

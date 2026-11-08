@@ -35,7 +35,7 @@ from contextlib import aclosing
 from typing import Any, AsyncIterator, Callable
 
 from coding_agent.providers.base import LLMProvider, ProviderResponse
-from coding_agent.tools.base import Tool, tool_result
+from coding_agent.tools.base import Tool, ToolResult, tool_result
 from coding_agent.tools.registry import ToolRegistry
 from coding_agent.hooks.bus import Event, EventBus, EventType
 from coding_agent.security.permission import PermissionPipeline, Verdict
@@ -196,11 +196,12 @@ class AgentLoop:
                 self._execute_one(block, execution_id=execution_id)
                 for block, execution_id in zip(blocks, execution_ids)
             ))
-            messages.append({"role": "user", "content": results})
+            messages.append({"role": "user", "content": [result.to_dict() for result in results]})
             for block, result, execution_id in zip(blocks, results, execution_ids):
                 yield LoopEvent(type="tool_done", tool_name=block["name"],
-                                tool_id=block["id"], tool_output=str(result["content"]),
-                                data={"input": block.get("input", {}), "is_error": result.get("is_error", False),
+                                tool_id=block["id"], tool_output=result.error or result.content,
+                                data={"input": block.get("input", {}), "is_error": bool(result.error),
+                                      "execution": result.execution,
                                       "execution_id": execution_id, "agent": self.agent_name})
 
         await self.emit(EventType.STOP, stop_reason="max_iterations")
@@ -284,8 +285,8 @@ class AgentLoop:
 
     # ── 内部辅助方法 ────────────────────────────────────
 
-    async def _execute_one(self, block: dict[str, Any], *, execution_id: str = "") -> dict[str, Any]:
-        """执行单个 tool_use 块，并用原调用 ID 构建 tool_result 字典。
+    async def _execute_one(self, block: dict[str, Any], *, execution_id: str = "") -> ToolResult:
+        """执行单个 tool_use 块，保留执行信息与原调用 ID。
 
         未注册的工具和执行异常均转换为错误结果，交由模型在后续轮次
         处理，避免单个工具失败直接中断同轮的其他工具调用。
@@ -296,6 +297,7 @@ class AgentLoop:
 
         error = None
         output = ""
+        execution = {}
         try:
             blocked = await self.emit(EventType.PRE_TOOL_USE, tool_name=tool_name,
                                       params=tool_input, tool_id=tool_id, execution_id=execution_id)
@@ -307,6 +309,7 @@ class AgentLoop:
                     raise PermissionError(reason)
             result = await self.registry.dispatch(tool_name, tool_input, tool_use_id=tool_id)
             output, error = result.content, result.error
+            execution = result.execution
         except Exception as exc:
             error = str(exc)
         if error:
@@ -315,7 +318,8 @@ class AgentLoop:
             "agent": self.agent_name, "tool_name": tool_name, "tool_id": tool_id,
             "execution_id": execution_id,
             "output": error or output, "error": error,
+            "execution": execution,
         }, context=self.event_context)
         await self.event_bus.emit(event)
-        return tool_result(tool_id, content=str(event.data["output"]),
-                           error=str(event.data["output"]) if error else None)
+        return ToolResult(tool_id, content=str(event.data["output"]),
+                          error=str(event.data["output"]) if error else None, execution=execution)
