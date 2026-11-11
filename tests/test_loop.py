@@ -236,7 +236,100 @@ async def test_max_iterations():
 
     events = await _collect_events(loop, messages)
     assert events[-1].type == "done"
+    assert provider.call_count == 4
+    assert sum(event.type == "tool_done" for event in events) == 3
+    assert events[-1].data["stop_reason"] == "max_iterations"
+    assert "轮次上限" in events[-1].text
+    assert "不能确认" in events[-1].text
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("stream", [True, False])
+async def test_empty_final_response_gets_one_tool_free_summary(stream):
+    class Provider(MockProvider):
+        async def create_message(self, messages, tools=None, system="", max_tokens=8000):
+            if self.call_count == 2:
+                assert tools == []
+                assert "交付本轮结果" in messages[-1]["content"]
+                assert "echo: verified" in str(messages)
+            return await super().create_message(messages, tools, system, max_tokens)
+
+    provider = Provider([
+        ProviderResponse(content=[{"type": "text", "text": "正在检查。"}, {
+            "type": "tool_use", "id": "read", "name": "echo", "input": {"message": "verified"},
+        }], stop_reason="tool_use"),
+        ProviderResponse(content=[], stop_reason="end_turn"),
+        ProviderResponse(content=[{"type": "text", "text": "检查结果：verified。"}], stop_reason="end_turn"),
+    ])
+    loop = AgentLoop(provider=provider, tools=[EchoTool()])
+    messages = [{"role": "user", "content": "检查并报告结果"}]
+    events = [event async for event in loop.run(messages, stream=stream)]
+    visible = "".join(event.text for event in events if event.type == "text_delta")
+    assert visible.count("检查结果：verified。") == 1
+    assert events[-1].text == visible
+    assert messages[-1]["content"][0]["text"] == "检查结果：verified。"
+    assert all(message.get("content") for message in messages)
+    assert sum(event.type == "tool_done" for event in events) == 1
     assert provider.call_count == 3
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("outcome", ["empty", "error", "tools"])
+async def test_final_summary_fallback_is_bounded_and_does_not_execute_tools(outcome):
+    class Provider(MockProvider):
+        async def create_message(self, messages, tools=None, system="", max_tokens=8000):
+            if self.call_count == 1:
+                assert tools == []
+                if outcome == "error":
+                    self.call_count += 1
+                    raise RuntimeError("summary unavailable")
+            return await super().create_message(messages, tools, system, max_tokens)
+
+    final = ProviderResponse(content=[], stop_reason="end_turn")
+    if outcome == "tools":
+        final = ProviderResponse(content=[{
+            "type": "tool_use", "id": "unexpected", "name": "echo", "input": {"message": "do not run"},
+        }], stop_reason="tool_use")
+    provider = Provider([ProviderResponse(content=[], stop_reason="end_turn"), final])
+    events = await _collect_events(AgentLoop(provider, [EchoTool()]), [{"role": "user", "content": "hi"}])
+    assert provider.call_count == 2
+    assert not any(event.type == "tool_start" for event in events)
+    assert "未能自动生成" in events[-1].text
+    assert events[-1].data["final_answer_generated"] is False
+
+
+@pytest.mark.asyncio
+async def test_final_response_without_stream_deltas_is_visible():
+    class Provider(MockProvider):
+        async def stream_message(self, *arguments, **options):
+            yield StreamEvent(type="done", response=await self.create_message(*arguments, **options))
+
+    provider = Provider([ProviderResponse(content=[{"type": "text", "text": "实际结果"}], stop_reason="end_turn")])
+    events = await _collect_events(AgentLoop(provider, []), [{"role": "user", "content": "hi"}])
+    assert [event.text for event in events if event.type == "text_delta"] == ["实际结果"]
+    assert events[-1].text == "实际结果"
+    assert provider.call_count == 1
+
+
+@pytest.mark.asyncio
+async def test_cancelling_summary_propagates_without_fake_completion():
+    started = asyncio.Event()
+
+    class Provider(MockProvider):
+        async def create_message(self, messages, tools=None, system="", max_tokens=8000):
+            if self.call_count == 1:
+                started.set()
+                await asyncio.Event().wait()
+            return await super().create_message(messages, tools, system, max_tokens)
+
+    provider = Provider([ProviderResponse(content=[], stop_reason="end_turn")])
+    messages = [{"role": "user", "content": "hi"}]
+    task = asyncio.create_task(_collect_events(AgentLoop(provider, []), messages))
+    await asyncio.wait_for(started.wait(), 2)
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    assert messages == [{"role": "user", "content": "hi"}]
 
 
 @pytest.mark.asyncio

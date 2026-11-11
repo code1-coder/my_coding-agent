@@ -37,7 +37,7 @@ class Config:
     max_tokens: int = 8000
     system_prompt: str = (
         "You are a coding agent. Use tools to solve tasks. "
-        "Act, don't explain — just do the work."
+        "Do the work, then report the result, verification and any remaining limitations to the user."
     )
     provider: str = "auto"  # 模型后端类型：Anthropic、OpenAI 兼容接口或自动识别
     workdir: str = field(default_factory=lambda: str(Path.cwd()))

@@ -26,7 +26,7 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 
 PROMPT_SECTIONS: dict[str, str] = {
-    "identity": "You are a coding agent. Act, don't explain.",
+    "identity": "You are a coding agent. Use tools to solve tasks and report the result.",
 }
 
 # ---------------------------------------------------------------------------
@@ -62,6 +62,13 @@ def assemble_system_prompt(context: dict[str, Any]) -> str:
     sections: list[str] = []
 
     sections.append(context.get("identity") or PROMPT_SECTIONS["identity"])
+    sections.append(
+        "Final response: always deliver a user-facing answer before ending the turn, in the user's language. "
+        "After using tools, state the outcome, relevant changed files, actual verification and remaining work. "
+        "Progress updates, tool results and complete_task are not a final answer. "
+        "If blocked or interrupted by a limit, explain what was done and what remains; never claim unverified success. "
+        "Fix incorrect source code before verification; passing tests alone does not prove the real behavior works."
+    )
 
     # 动态：工具
     tools = context.get("enabled_tools", [])

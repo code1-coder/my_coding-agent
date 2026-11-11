@@ -182,8 +182,13 @@ class AgentLoop:
                 messages.append({"role": "assistant", "content": response.content})
 
             if response.stop_reason != "tool_use" or not response.tool_use_blocks:
+                if not response.text.strip() or response.stop_reason in ("max_tokens", "tool_use"):
+                    reason = response.stop_reason if response.stop_reason != "end_turn" else "empty_response"
+                    async for event in self._finish_without_answer(messages, text, reason):
+                        yield event
+                    return
                 await self.emit(EventType.STOP, stop_reason=response.stop_reason, response=response)
-                yield LoopEvent(type="done", text=text)
+                yield LoopEvent(type="done", text=text, data={"stop_reason": response.stop_reason})
                 return
 
             blocks = response.tool_use_blocks
@@ -204,8 +209,55 @@ class AgentLoop:
                                       "execution": result.execution,
                                       "execution_id": execution_id, "agent": self.agent_name})
 
-        await self.emit(EventType.STOP, stop_reason="max_iterations")
-        yield LoopEvent(type="done", text=text, data={"stop_reason": "max_iterations"})
+        async for event in self._finish_without_answer(messages, text, "max_iterations"):
+            yield event
+
+    async def _finish_without_answer(self, messages: list[dict[str, Any]], text: str,
+                                     reason: str) -> AsyncIterator[LoopEvent]:
+        """最多补充一次无工具总结；失败时明确告知缺少交付，不能静默结束。"""
+        notices = {
+            "max_iterations": "已达到本轮执行轮次上限，已停止继续调用工具；任务是否完成仍需依据执行结果确认。",
+            "max_tokens": "模型输出达到长度上限，回答可能不完整。",
+            "tool_use": "模型请求使用工具，但未提供有效工具调用。",
+        }
+        notice = notices.get(reason, "")
+        request_messages = list(messages)
+        if request_messages and request_messages[-1].get("role") == "assistant":
+            last_content = request_messages[-1].get("content")
+            empty = (not last_content.strip() if isinstance(last_content, str) else not last_content or
+                     all(isinstance(block, dict) and block.get("type") == "text" and
+                         not block.get("text", "").strip() for block in last_content))
+            if empty:
+                request_messages.pop()
+                messages.pop()
+        request_messages.append({"role": "user", "content": (
+            "请立即向用户交付本轮结果，不要调用任何工具或继续执行任务。"
+            "根据本轮对话和已有工具结果，说明实际完成事项、相关文件、实际验证、失败或未完成事项。"
+            "不要把计划、测试通过或工具调用结束当作任务已完成，不要编造结果。"
+            "请使用用户的语言。" + notice
+        )})
+        answer = ""
+        try:
+            async with asyncio.timeout(30), aclosing(
+                self._model_events(request_messages, False, final_only=True),
+            ) as events:
+                async for event in events:
+                    if event.type == "done":
+                        response = event.response
+                        if response.stop_reason == "end_turn" and not response.tool_use_blocks:
+                            answer = response.text.strip()
+        except Exception:
+            logger.exception("补充最终答复失败")
+        generated = bool(answer)
+        if not answer:
+            answer = "未能自动生成本轮结果说明，不能确认任务已完整交付。请核对本轮工具执行记录与工作区改动。"
+        delivery = "\n\n".join(part for part in (notice, answer) if part)
+        messages.append({"role": "assistant", "content": [{"type": "text", "text": delivery}]})
+        rendered = ("\n\n" if text else "") + delivery
+        yield LoopEvent(type="text_delta", text=rendered)
+        await self.emit(EventType.STOP, stop_reason=reason)
+        yield LoopEvent(type="done", text=text + rendered,
+                        data={"stop_reason": reason, "final_answer_generated": generated})
 
     async def emit(self, event_type: EventType, **data: Any) -> Any:
         """用同一会话上下文分发事件，使内置 Hook 和自定义 Hook 实际生效。"""
@@ -213,7 +265,7 @@ class AgentLoop:
             event_type, data={"agent": self.agent_name, **data}, context=self.event_context,
         ))
 
-    async def _model_events(self, messages: list[dict[str, Any]], stream: bool):
+    async def _model_events(self, messages: list[dict[str, Any]], stream: bool, *, final_only: bool = False):
         """在恢复管理器中执行模型请求，同时通过队列实时转发文本增量。"""
         queue: asyncio.Queue = asyncio.Queue()
         sentinel = object()
@@ -227,7 +279,7 @@ class AgentLoop:
                                           purpose="agent", model=provider.model_id)
                 if blocked is not None:
                     raise PermissionError(f"模型调用被 Hook 阻止：{blocked}")
-                kwargs = dict(messages=messages, tools=self.registry.list_tools(),
+                kwargs = dict(messages=messages, tools=[] if final_only else self.registry.list_tools(),
                               system=self.system_prompt, max_tokens=(
                                   self.recovery.current_max_tokens(self.recovery_state)
                                   if self.recovery else self.max_tokens))
@@ -246,6 +298,8 @@ class AgentLoop:
                         queue.put_nowait(StreamEvent(type="text_delta", text=response.text))
                 if response is None:
                     raise RuntimeError("模型响应流未正常结束")
+                if stream and not sent_text and response.text:
+                    queue.put_nowait(StreamEvent(type="text_delta", text=response.text))
                 await self.emit(EventType.POST_LLM_CALL, response=response,
                                 usage=response.usage, purpose="agent")
                 return response
@@ -258,7 +312,7 @@ class AgentLoop:
 
         async def request():
             try:
-                if self.recovery is not None:
+                if self.recovery is not None and not final_only:
                     response = await self.recovery.call(
                         attempt, self.recovery_state, messages, max_tokens=self.max_tokens,
                     )

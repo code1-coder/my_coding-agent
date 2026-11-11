@@ -49,6 +49,26 @@ def test_web_reuses_runtime_and_isolates_session_history(configured_server):
     assert not server.runtimes
 
 
+def test_web_delivers_result_after_real_file_write(configured_server, tmp_path, monkeypatch):
+    provider = ScriptedProvider([
+        tool_response("write_file", {"path": "result.txt", "content": "verified"}),
+        text_response(""),
+        text_response("已写入 result.txt，内容为 verified。"),
+    ])
+    monkeypatch.setattr(server, "_get_provider", lambda _: provider)
+    with TestClient(server.app) as client:
+        response = client.post("/chat", json={"prompt": "写文件并报告结果", "session_id": "delivery"})
+        assert response.status_code == 200
+        events = decode_events(response)
+        visible = "".join(event.get("text", "") for event in events if event["type"] == "text_delta")
+        assert visible == "已写入 result.txt，内容为 verified。"
+        assert events[-1]["type"] == "done"
+        assert events[-1]["text"] == visible
+        assert sum(event["type"] == "tool_start" for event in events) == 1
+        assert (tmp_path / "result.txt").read_text(encoding="utf-8") == "verified"
+        assert server.sessions["delivery"][-1]["content"][0]["text"] == visible
+
+
 def test_web_uses_skills_memory_context_hooks_and_task_board(configured_server, tmp_path, monkeypatch):
     cfg, providers = configured_server
     cfg.context_limit = 50
