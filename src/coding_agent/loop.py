@@ -35,7 +35,7 @@ from contextlib import aclosing
 from typing import Any, AsyncIterator, Callable
 
 from coding_agent.providers.base import LLMProvider, ProviderResponse
-from coding_agent.tools.base import Tool, ToolResult, tool_result
+from coding_agent.tools.base import Tool, ToolCancelledError, ToolResult, tool_result
 from coding_agent.tools.registry import ToolRegistry
 from coding_agent.hooks.bus import Event, EventBus, EventType
 from coding_agent.security.permission import PermissionPipeline, Verdict
@@ -298,6 +298,7 @@ class AgentLoop:
         error = None
         output = ""
         execution = {}
+        cancellation = None
         try:
             blocked = await self.emit(EventType.PRE_TOOL_USE, tool_name=tool_name,
                                       params=tool_input, tool_id=tool_id, execution_id=execution_id)
@@ -310,6 +311,10 @@ class AgentLoop:
             result = await self.registry.dispatch(tool_name, tool_input, tool_use_id=tool_id)
             output, error = result.content, result.error
             execution = result.execution
+        except ToolCancelledError as exc:
+            cancellation = exc
+            output, error = exc.result.content, exc.result.error
+            execution = exc.result.execution
         except Exception as exc:
             error = str(exc)
         if error:
@@ -321,5 +326,7 @@ class AgentLoop:
             "execution": execution,
         }, context=self.event_context)
         await self.event_bus.emit(event)
+        if cancellation is not None:
+            raise cancellation
         return ToolResult(tool_id, content=str(event.data["output"]),
                           error=str(event.data["output"]) if error else None, execution=execution)

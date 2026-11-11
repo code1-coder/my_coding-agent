@@ -33,9 +33,9 @@ from __future__ import annotations
 
 import json
 import logging
-import random
 import re
 import time
+import uuid
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 
@@ -105,7 +105,7 @@ class TaskBoard:
         return self._tasks_dir / f"{task_id}.json"
 
     def _generate_id(self) -> str:
-        return f"task_{int(time.time())}_{random.randint(0, 9999):04d}"
+        return f"task_{int(time.time())}_{uuid.uuid4().hex}"
 
     # ── 创建、读取、更新和删除 ───────────────────────────────────────────────
 
@@ -123,7 +123,15 @@ class TaskBoard:
             status="pending",
             blockedBy=blockedBy or [],
         )
-        self._save(task)
+        # Creation must never overwrite an existing task (including a completed
+        # dependency). Exclusive creation also protects concurrent processes.
+        while True:
+            try:
+                with self._task_path(task.id).open("x", encoding="utf-8") as stream:
+                    json.dump(task.to_dict(), stream, indent=2)
+                break
+            except FileExistsError:
+                task.id = self._generate_id()
         logger.debug("Task created: %s — %s", task.id, task.subject)
         return task
 

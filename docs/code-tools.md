@@ -26,6 +26,12 @@ CLI 的 chat 和 run 会在工具开始时显示文件路径；分段读取同�
 
 search_code 需要 PATH 中存在 ripgrep (rg)，Git 工具需要 Git。未安装时返回明确错误；无需新增 Python 依赖。搜索遵循 ripgrep 默认忽略规则，目录遍历不跟随符号链接。文件大小限制 2 MiB，匹配行最长展示 2000 字符；最多 1000 行结果，原始搜索输出最多读取 2 MB。Git 输出最多 50000 字节。命令默认超时 120 秒；BashTool 可通过 timeout_seconds 调整超时时间。超时、启动失败、空命令和非零退出都会返回结构化失败结果，并保留 stdout、stderr、duration_ms、timed_out、cancelled、truncated 和 failure_stage 字段。结果截断时缩小路径或搜索范围。
 
+BashTool 的异步入口直接管理子进程。取消时先终止进程树、回收输出和进程，再传播取消异常；工具结束事件中的 cancelled=true、termination_confirmed=true 表示终止已确认，failure_stage=cancelled。超时也使用相同清理流程。清理失败时 termination_confirmed=false、cancelled=false，failure_stage 为 cleanup 或 supervision，不将取消请求已收到当作进程已停止；启动前失败时 termination_confirmed=null。同步 execute 复用相同执行逻辑，异步调用方应使用 aexecute，避免阻塞事件循环。
+
+Windows 将执行进程绑定到 Job Object 后才放行命令，并查询 Job 的 ActiveProcesses=0 确认退出。Linux 使用独立监督进程，在启动 Shell 前设置 child subreaper；取消时逐轮终止其直接子进程并接管、回收孤儿后代，包括 setsid 和双重 fork 后代。只有 waitpid 确认不存在任何待回收子进程，且监督进程退出，才通过独立控制通道确认终止；stdout/stderr EOF 和 Shell 主进程退出均不能作为进程树已退出的依据。正常运行时，Windows 和 Linux 均等待后代结束，因此关闭输出的后台任务仍受命令超时约束，并可继续取消。该机制用于管理普通命令后代，不构成对抗恶意命令或系统服务代启动的安全隔离。其他 Unix 平台当前缺少同等终止确认机制，会在启动前明确返回不支持，不能视为已经通过跨 Unix 验收。
+
+在仓库根目录运行进程树验收命令：Windows 使用 .venv/Scripts/python.exe -m pytest -q -s tests/test_code_tools.py -k 'stops_real_process_tree or stops_detached_descendants'；Linux 使用 .venv/bin/python -m pytest -q -s tests/test_code_tools.py -k 'stops_real_process_tree or stops_detached_descendants'。用例启动真实父子进程并持续写入各自日志，经注册表取消、AgentLoop 取消及超时后检查 PID 已停止、日志不再变化，且下一条命令可正常执行；附加用例检查输出重定向、父进程先退出的后代及停止后的延迟修改。无需模型 API；该检查不等同于浏览器点击停止的端到端验证。本次未增加长任务句柄和流式输出接口。
+
 ## 补丁格式
 
 采用 Codex 风格的显式文件操作及上下文行，不接受 Git unified diff 的行号头：

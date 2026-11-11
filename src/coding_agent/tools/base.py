@@ -42,6 +42,14 @@ class ToolResult:
         return d
 
 
+class ToolCancelledError(asyncio.CancelledError):
+    """携带执行结果传播取消；termination_confirmed 标识是否已确认终止。"""
+
+    def __init__(self, result: ToolResult) -> None:
+        super().__init__(result.error)
+        self.result = result
+
+
 class Tool(ABC):
     """智能体可调用的工具的抽象基类。
 
