@@ -16,6 +16,7 @@ from coding_agent.providers.base import (
     StreamEvent,
 )
 from coding_agent.tools.base import Tool
+from coding_agent.tools.registry import ToolRegistry
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -351,3 +352,88 @@ async def test_non_streaming_mode():
     # 非流式模式下，完整文本应通过单个 text_delta 事件返回
     text_parts = [e.text for e in events if e.type == "text_delta"]
     assert "non-streamed response" in "".join(text_parts)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("cancel", [False, True])
+async def test_large_batch_reports_completed_tools_before_slow_tool_and_cleans_up(cancel):
+    release = asyncio.Event()
+    stopped = asyncio.Event()
+    registry = ToolRegistry()
+
+    @registry.register(name="controlled")
+    async def controlled(slow: bool):
+        if slow:
+            try:
+                await release.wait()
+            finally:
+                stopped.set()
+        return "slow" if slow else "fast"
+
+    blocks = [{"type": "tool_use", "id": str(index), "name": "controlled",
+               "input": {"slow": index == 0}} for index in range(41)]
+    provider = MockProvider([
+        ProviderResponse(content=blocks, stop_reason="tool_use"),
+        ProviderResponse(content=[{"type": "text", "text": "完成"}], stop_reason="end_turn"),
+    ])
+    messages = [{"role": "user", "content": "批量执行"}]
+    events = AgentLoop(provider, [], registry=registry, progress_interval=0.02).run(messages)
+    try:
+        for _ in blocks:
+            assert (await anext(events)).type == "tool_start"
+        completed_ids = []
+        for _ in range(40):
+            event = await asyncio.wait_for(anext(events), 2)
+            assert event.type == "tool_done"
+            completed_ids.append(event.tool_id)
+        assert set(completed_ids) == {str(index) for index in range(1, 41)}
+        assert not stopped.is_set()
+        waiting = await asyncio.wait_for(anext(events), 2)
+        assert waiting.type == "warning"
+        assert waiting.data["pending_tools"] == [{"tool_name": "controlled", "tool_id": "0"}]
+        if cancel:
+            await events.aclose()
+        else:
+            release.set()
+            remaining = [event async for event in events]
+            assert [event.tool_id for event in remaining if event.type == "tool_done"] == ["0"]
+            assert remaining[-1].type == "done"
+        assert stopped.is_set()
+        results = messages[2]["content"]
+        assert [result["tool_use_id"] for result in results] == [str(index) for index in range(41)]
+        assert all(result["content"] == "fast" for result in results[1:])
+        assert bool(results[0].get("is_error")) is cancel
+    finally:
+        release.set()
+        await events.aclose()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("stream", [True, False])
+async def test_stalled_model_has_visible_progress_and_total_timeout(stream):
+    from coding_agent.context.recovery import RecoveryManager
+    from coding_agent.providers.base import ModelRequestError
+
+    cancelled = asyncio.Event()
+
+    class Provider(MockProvider):
+        async def create_message(self, *arguments, **options):
+            self.call_count += 1
+            try:
+                await asyncio.Event().wait()
+            finally:
+                cancelled.set()
+
+    provider = Provider([])
+    loop = AgentLoop(provider, [], model_timeout=0.1, progress_interval=0.02,
+                     recovery=RecoveryManager())
+    events = loop.run([{"role": "user", "content": "开始"}], stream=stream)
+    observed = []
+    with pytest.raises(ModelRequestError, match="已停止等待"):
+        async with asyncio.timeout(2):
+            async for event in events:
+                observed.append(event)
+    assert observed and all(event.type == "warning" for event in observed)
+    assert all(event.data["phase"] == "model" for event in observed)
+    assert cancelled.is_set()
+    assert provider.call_count == 1

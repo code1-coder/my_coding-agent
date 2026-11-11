@@ -93,6 +93,8 @@ class AgentLoop:
         recovery: RecoveryManager | None = None,
         agent_name: str = "lead",
         provider_for_model: Callable[[str], LLMProvider] | None = None,
+        model_timeout: float = 180.0,
+        progress_interval: float = 10.0,
     ) -> None:
         self.provider = provider
         self.system_prompt = system_prompt
@@ -109,6 +111,8 @@ class AgentLoop:
         self.recovery_state = RecoveryState(current_model=provider.model_id)
         self.agent_name = agent_name
         self.provider_for_model = provider_for_model
+        self.model_timeout = model_timeout
+        self.progress_interval = progress_interval
 
     # ── 公共 API ──────────────────────────────────────────
 
@@ -154,7 +158,11 @@ class AgentLoop:
         text = ""
         for iteration in range(self.max_iterations):
             if self.compaction is not None:
-                await self.compaction.run(messages)
+                async with aclosing(self.wait_events(
+                    self.compaction.run(messages), "整理工具输出和压缩上下文",
+                )) as events:
+                    async for event in events:
+                        yield event
             response = None
             prefix = text
             async with aclosing(self._model_events(messages, stream)) as events:
@@ -164,6 +172,8 @@ class AgentLoop:
                         yield LoopEvent(type="text_delta", text=ev.text)
                     elif ev.type == "done":
                         response = ev.response
+                    elif ev.type == "warning":
+                        yield ev
             if response is None:
                 raise RuntimeError("模型未返回完整响应")
 
@@ -197,17 +207,9 @@ class AgentLoop:
                 yield LoopEvent(type="tool_start", tool_name=block["name"],
                                 tool_id=block["id"], data={"input": block.get("input", {}),
                                 "execution_id": execution_id, "agent": self.agent_name})
-            results = await asyncio.gather(*(
-                self._execute_one(block, execution_id=execution_id)
-                for block, execution_id in zip(blocks, execution_ids)
-            ))
-            messages.append({"role": "user", "content": [result.to_dict() for result in results]})
-            for block, result, execution_id in zip(blocks, results, execution_ids):
-                yield LoopEvent(type="tool_done", tool_name=block["name"],
-                                tool_id=block["id"], tool_output=result.error or result.content,
-                                data={"input": block.get("input", {}), "is_error": bool(result.error),
-                                      "execution": result.execution,
-                                      "execution_id": execution_id, "agent": self.agent_name})
+            async with aclosing(self._tool_events(messages, blocks, execution_ids)) as events:
+                async for event in events:
+                    yield event
 
         async for event in self._finish_without_answer(messages, text, "max_iterations"):
             yield event
@@ -246,6 +248,8 @@ class AgentLoop:
                         response = event.response
                         if response.stop_reason == "end_turn" and not response.tool_use_blocks:
                             answer = response.text.strip()
+                    elif event.type == "warning":
+                        yield event
         except Exception:
             logger.exception("补充最终答复失败")
         generated = bool(answer)
@@ -264,6 +268,55 @@ class AgentLoop:
         return await self.event_bus.emit(Event(
             event_type, data={"agent": self.agent_name, **data}, context=self.event_context,
         ))
+
+    async def wait_events(self, operation, phase: str) -> AsyncIterator[LoopEvent]:
+        """等待异步阶段时定期报告状态，关闭生成器时回收操作。"""
+        task = asyncio.create_task(operation)
+        try:
+            while not task.done():
+                completed, _ = await asyncio.wait({task}, timeout=self.progress_interval)
+                if not completed:
+                    yield LoopEvent(type="warning", text=f"仍在{phase}，可取消当前请求。",
+                                    data={"phase": phase, "agent": self.agent_name})
+            await task
+        finally:
+            if not task.done():
+                task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+
+    async def _tool_events(self, messages, blocks, execution_ids) -> AsyncIterator[LoopEvent]:
+        tasks = [asyncio.create_task(self._execute_one(block, execution_id=execution_id))
+                 for block, execution_id in zip(blocks, execution_ids)]
+        indexes = {task: index for index, task in enumerate(tasks)}
+        pending = set(tasks)
+        try:
+            while pending:
+                completed, pending = await asyncio.wait(
+                    pending, timeout=self.progress_interval, return_when=asyncio.FIRST_COMPLETED,
+                )
+                if not completed:
+                    waiting = [{"tool_name": blocks[indexes[task]]["name"],
+                                "tool_id": blocks[indexes[task]]["id"]} for task in tasks if task in pending]
+                    labels = ", ".join(f"{item['tool_name']} ({item['tool_id']})" for item in waiting[:5])
+                    yield LoopEvent(type="warning", text=f"仍在等待 {len(pending)} 个工具：{labels}；可取消当前请求。",
+                                    data={"phase": "tools", "pending_tools": waiting, "agent": self.agent_name})
+                for task in sorted(completed, key=indexes.__getitem__):
+                    index = indexes[task]
+                    block, result = blocks[index], task.result()
+                    yield LoopEvent(type="tool_done", tool_name=block["name"],
+                                    tool_id=block["id"], tool_output=result.error or result.content,
+                                    data={"input": block.get("input", {}), "is_error": bool(result.error),
+                                          "execution": result.execution,
+                                          "execution_id": execution_ids[index], "agent": self.agent_name})
+        finally:
+            for task in tasks:
+                if not task.done():
+                    task.cancel()
+            outcomes = await asyncio.gather(*tasks, return_exceptions=True)
+            results = [outcome.to_dict() if isinstance(outcome, ToolResult) else
+                       tool_result(block["id"], error="本轮请求已中断，工具结果不可用。")
+                       for block, outcome in zip(blocks, outcomes)]
+            messages.append({"role": "user", "content": results})
 
     async def _model_events(self, messages: list[dict[str, Any]], stream: bool, *, final_only: bool = False):
         """在恢复管理器中执行模型请求，同时通过队列实时转发文本增量。"""
@@ -312,12 +365,19 @@ class AgentLoop:
 
         async def request():
             try:
-                if self.recovery is not None and not final_only:
-                    response = await self.recovery.call(
-                        attempt, self.recovery_state, messages, max_tokens=self.max_tokens,
-                    )
-                else:
-                    response = await attempt()
+                try:
+                    async with asyncio.timeout(self.model_timeout):
+                        if self.recovery is not None and not final_only:
+                            response = await self.recovery.call(
+                                attempt, self.recovery_state, messages, max_tokens=self.max_tokens,
+                            )
+                        else:
+                            response = await attempt()
+                except TimeoutError as exc:
+                    raise ModelRequestError(
+                        f"模型请求超过 {self.model_timeout:g} 秒（含重试与恢复），已停止等待。"
+                        "请检查模型服务或调整 model_timeout 后重试。"
+                    ) from exc
                 if response is None:
                     raise RuntimeError("上下文压缩后请求仍超出模型限制")
                 queue.put_nowait(StreamEvent(type="done", response=response))
@@ -327,7 +387,12 @@ class AgentLoop:
         task = asyncio.create_task(request())
         try:
             while True:
-                event = await queue.get()
+                try:
+                    event = await asyncio.wait_for(queue.get(), timeout=self.progress_interval)
+                except TimeoutError:
+                    yield LoopEvent(type="warning", text="仍在等待模型响应或恢复，可取消当前请求。",
+                                    data={"phase": "model", "agent": self.agent_name})
+                    continue
                 if event is sentinel:
                     break
                 yield event

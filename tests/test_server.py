@@ -106,6 +106,26 @@ def test_web_reports_model_errors_and_cleans_up(configured_server, monkeypatch):
     assert provider.closed
 
 
+def test_web_exposes_waiting_progress_and_model_timeout(configured_server, monkeypatch):
+    cfg, _ = configured_server
+    cfg.model_timeout = 0.15
+    cfg.progress_interval = 0.02
+
+    class StalledProvider(ScriptedProvider):
+        async def create_message(self, *arguments, **options):
+            await asyncio.Event().wait()
+
+    provider = StalledProvider()
+    monkeypatch.setattr(server, "_get_provider", lambda _: provider)
+    with TestClient(server.app) as client:
+        events = decode_events(client.post("/chat", json={"prompt": "检查等待", "session_id": "stall"}))
+        assert any(event["type"] == "warning" and event["phase"] == "model" for event in events)
+        assert events[-1]["type"] == "error"
+        assert "已停止等待" in events[-1]["message"]
+        assert not server.runtimes["stall"].turn_lock.locked()
+    assert provider.closed
+
+
 def test_health_empty_prompt_and_websocket_need_no_model(configured_server):
     _, providers = configured_server
     with TestClient(server.app) as client:

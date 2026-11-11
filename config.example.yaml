@@ -15,6 +15,9 @@ api_key: null
 max_tokens: 8000
 escalated_max_tokens: 64000  # 输出截断后重试使用的上限
 fallback_model: null        # 同一服务商的备用模型；null 表示不启用
+model_timeout: 180
+maintenance_timeout: 30
+progress_interval: 10
 
 # 上下文管理：令牌数为估算值，大输出文件写入 .task_outputs/。
 context_limit: 50000        # 超过此令牌数时调用模型生成摘要
