@@ -322,9 +322,16 @@ class AgentLoop:
         """在恢复管理器中执行模型请求，同时通过队列实时转发文本增量。"""
         queue: asyncio.Queue = asyncio.Queue()
         sentinel = object()
+        loop = asyncio.get_running_loop()
+        request_started_at = loop.time()
+        request_attempts = 0
+        last_activity: tuple[str, float] | None = None
 
         async def attempt():
+            nonlocal last_activity, request_attempts
             sent_text = False
+            request_attempts += 1
+            last_activity = None
             try:
                 provider = (self.provider_for_model(self.recovery_state.current_model)
                             if self.provider_for_model else self.provider)
@@ -340,9 +347,11 @@ class AgentLoop:
                 if stream:
                     async with aclosing(provider.stream_message(**kwargs)) as events:
                         async for event in events:
+                            if event.type != "done":
+                                last_activity = (event.type, loop.time())
+                                queue.put_nowait(event)
                             if event.type == "text_delta":
                                 sent_text = sent_text or bool(event.text)
-                                queue.put_nowait(event)
                             elif event.type == "done":
                                 response = event.response
                 else:
@@ -390,12 +399,52 @@ class AgentLoop:
                 try:
                     event = await asyncio.wait_for(queue.get(), timeout=self.progress_interval)
                 except TimeoutError:
-                    yield LoopEvent(type="warning", text="仍在等待模型响应或恢复，可取消当前请求。",
-                                    data={"phase": "model", "agent": self.agent_name})
+                    now = loop.time()
+                    if (last_activity is not None
+                            and now - last_activity[1] < self.progress_interval):
+                        continue
+                    elapsed = now - request_started_at
+                    if last_activity is None:
+                        activity = (
+                            "当前尝试尚未收到可观测的模型流事件，服务端状态未知"
+                            if stream else "当前为非流式请求，调用完成前没有可观测的中间事件"
+                        )
+                        idle_seconds = None
+                        activity_type = None
+                    else:
+                        activity_type, activity_at = last_activity
+                        idle_seconds = now - activity_at
+                        activity_label = {
+                            "text_delta": "文本增量",
+                            "tool_use_start": "工具调用声明",
+                            "tool_input": "工具参数增量",
+                        }.get(activity_type, "模型流事件")
+                        activity = f"最近收到{activity_label}，{idle_seconds:.1f}秒前"
+                    retry_count = max(0, request_attempts - 1)
+                    retry_status = (
+                        f"，应用层已发起{request_attempts}次请求尝试"
+                        if retry_count else ""
+                    )
+                    yield LoopEvent(
+                        type="warning",
+                        text=f"模型请求已等待{elapsed:.1f}秒；{activity}{retry_status}，可取消当前请求。",
+                        data={
+                            "phase": "model",
+                            "agent": self.agent_name,
+                            "request_elapsed_seconds": elapsed,
+                            "last_protocol_event": activity_type,
+                            "seconds_since_protocol_event": idle_seconds,
+                            "request_attempts": request_attempts,
+                            "application_retry_count": retry_count,
+                        },
+                    )
                     continue
                 if event is sentinel:
                     break
-                yield event
+                if event.type == "text_delta":
+                    yield event
+                elif event.type == "done":
+                    yield event
             await task
         finally:
             if not task.done():

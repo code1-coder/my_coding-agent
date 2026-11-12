@@ -437,3 +437,67 @@ async def test_stalled_model_has_visible_progress_and_total_timeout(stream):
     assert all(event.data["phase"] == "model" for event in observed)
     assert cancelled.is_set()
     assert provider.call_count == 1
+
+
+@pytest.mark.asyncio
+async def test_tool_argument_stream_is_counted_as_activity_without_exposing_arguments():
+    tool_response = ProviderResponse(
+        content=[{"type": "tool_use", "id": "tool-1", "name": "echo",
+                  "input": {"message": "private argument"}}],
+        stop_reason="tool_use",
+    )
+    final_response = ProviderResponse(
+        content=[{"type": "text", "text": "完成"}], stop_reason="end_turn",
+    )
+
+    class Provider(MockProvider):
+        async def stream_message(self, *arguments, **options):
+            self.call_count += 1
+            if self.call_count == 1:
+                for _ in range(16):
+                    yield StreamEvent(type="tool_input", tool_id="tool-1", text="secret")
+                    await asyncio.sleep(0.01)
+                yield StreamEvent(type="done", response=tool_response)
+            else:
+                yield StreamEvent(type="done", response=final_response)
+
+    provider = Provider([tool_response, final_response])
+    events = await _collect_events(
+        AgentLoop(provider, [EchoTool()], progress_interval=0.025),
+        [{"role": "user", "content": "运行工具"}],
+    )
+
+    model_warnings = [event for event in events
+                      if event.type == "warning" and event.data.get("phase") == "model"]
+    assert model_warnings == []
+    assert events[-1].type == "done"
+
+
+@pytest.mark.asyncio
+async def test_model_wait_warning_reports_recent_tool_argument_activity():
+    release = asyncio.Event()
+    response = ProviderResponse(content=[], stop_reason="end_turn")
+
+    class Provider(MockProvider):
+        async def stream_message(self, *arguments, **options):
+            self.call_count += 1
+            yield StreamEvent(type="tool_input", tool_id="tool-1", text="private argument")
+            await release.wait()
+            yield StreamEvent(type="done", response=response)
+
+    provider = Provider([response])
+    events = AgentLoop(provider, [], progress_interval=0.02).run(
+        [{"role": "user", "content": "等待工具参数流"}]
+    )
+    try:
+        warning = await asyncio.wait_for(anext(events), timeout=1)
+        assert warning.type == "warning"
+        assert warning.data["last_protocol_event"] == "tool_input"
+        assert warning.data["seconds_since_protocol_event"] >= 0.01
+        assert warning.data["request_attempts"] == 1
+        assert warning.data["application_retry_count"] == 0
+        assert "工具参数增量" in warning.text
+        assert "private argument" not in warning.text
+    finally:
+        release.set()
+        await events.aclose()
