@@ -16,6 +16,7 @@ from coding_agent.providers.base import (
     StreamEvent,
 )
 from coding_agent.tools.base import Tool
+from coding_agent.tools.registry import ToolRegistry
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -236,7 +237,100 @@ async def test_max_iterations():
 
     events = await _collect_events(loop, messages)
     assert events[-1].type == "done"
+    assert provider.call_count == 4
+    assert sum(event.type == "tool_done" for event in events) == 3
+    assert events[-1].data["stop_reason"] == "max_iterations"
+    assert "轮次上限" in events[-1].text
+    assert "不能确认" in events[-1].text
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("stream", [True, False])
+async def test_empty_final_response_gets_one_tool_free_summary(stream):
+    class Provider(MockProvider):
+        async def create_message(self, messages, tools=None, system="", max_tokens=8000):
+            if self.call_count == 2:
+                assert tools == []
+                assert "交付本轮结果" in messages[-1]["content"]
+                assert "echo: verified" in str(messages)
+            return await super().create_message(messages, tools, system, max_tokens)
+
+    provider = Provider([
+        ProviderResponse(content=[{"type": "text", "text": "正在检查。"}, {
+            "type": "tool_use", "id": "read", "name": "echo", "input": {"message": "verified"},
+        }], stop_reason="tool_use"),
+        ProviderResponse(content=[], stop_reason="end_turn"),
+        ProviderResponse(content=[{"type": "text", "text": "检查结果：verified。"}], stop_reason="end_turn"),
+    ])
+    loop = AgentLoop(provider=provider, tools=[EchoTool()])
+    messages = [{"role": "user", "content": "检查并报告结果"}]
+    events = [event async for event in loop.run(messages, stream=stream)]
+    visible = "".join(event.text for event in events if event.type == "text_delta")
+    assert visible.count("检查结果：verified。") == 1
+    assert events[-1].text == visible
+    assert messages[-1]["content"][0]["text"] == "检查结果：verified。"
+    assert all(message.get("content") for message in messages)
+    assert sum(event.type == "tool_done" for event in events) == 1
     assert provider.call_count == 3
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("outcome", ["empty", "error", "tools"])
+async def test_final_summary_fallback_is_bounded_and_does_not_execute_tools(outcome):
+    class Provider(MockProvider):
+        async def create_message(self, messages, tools=None, system="", max_tokens=8000):
+            if self.call_count == 1:
+                assert tools == []
+                if outcome == "error":
+                    self.call_count += 1
+                    raise RuntimeError("summary unavailable")
+            return await super().create_message(messages, tools, system, max_tokens)
+
+    final = ProviderResponse(content=[], stop_reason="end_turn")
+    if outcome == "tools":
+        final = ProviderResponse(content=[{
+            "type": "tool_use", "id": "unexpected", "name": "echo", "input": {"message": "do not run"},
+        }], stop_reason="tool_use")
+    provider = Provider([ProviderResponse(content=[], stop_reason="end_turn"), final])
+    events = await _collect_events(AgentLoop(provider, [EchoTool()]), [{"role": "user", "content": "hi"}])
+    assert provider.call_count == 2
+    assert not any(event.type == "tool_start" for event in events)
+    assert "未能自动生成" in events[-1].text
+    assert events[-1].data["final_answer_generated"] is False
+
+
+@pytest.mark.asyncio
+async def test_final_response_without_stream_deltas_is_visible():
+    class Provider(MockProvider):
+        async def stream_message(self, *arguments, **options):
+            yield StreamEvent(type="done", response=await self.create_message(*arguments, **options))
+
+    provider = Provider([ProviderResponse(content=[{"type": "text", "text": "实际结果"}], stop_reason="end_turn")])
+    events = await _collect_events(AgentLoop(provider, []), [{"role": "user", "content": "hi"}])
+    assert [event.text for event in events if event.type == "text_delta"] == ["实际结果"]
+    assert events[-1].text == "实际结果"
+    assert provider.call_count == 1
+
+
+@pytest.mark.asyncio
+async def test_cancelling_summary_propagates_without_fake_completion():
+    started = asyncio.Event()
+
+    class Provider(MockProvider):
+        async def create_message(self, messages, tools=None, system="", max_tokens=8000):
+            if self.call_count == 1:
+                started.set()
+                await asyncio.Event().wait()
+            return await super().create_message(messages, tools, system, max_tokens)
+
+    provider = Provider([ProviderResponse(content=[], stop_reason="end_turn")])
+    messages = [{"role": "user", "content": "hi"}]
+    task = asyncio.create_task(_collect_events(AgentLoop(provider, []), messages))
+    await asyncio.wait_for(started.wait(), 2)
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    assert messages == [{"role": "user", "content": "hi"}]
 
 
 @pytest.mark.asyncio
@@ -258,3 +352,152 @@ async def test_non_streaming_mode():
     # 非流式模式下，完整文本应通过单个 text_delta 事件返回
     text_parts = [e.text for e in events if e.type == "text_delta"]
     assert "non-streamed response" in "".join(text_parts)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("cancel", [False, True])
+async def test_large_batch_reports_completed_tools_before_slow_tool_and_cleans_up(cancel):
+    release = asyncio.Event()
+    stopped = asyncio.Event()
+    registry = ToolRegistry()
+
+    @registry.register(name="controlled")
+    async def controlled(slow: bool):
+        if slow:
+            try:
+                await release.wait()
+            finally:
+                stopped.set()
+        return "slow" if slow else "fast"
+
+    blocks = [{"type": "tool_use", "id": str(index), "name": "controlled",
+               "input": {"slow": index == 0}} for index in range(41)]
+    provider = MockProvider([
+        ProviderResponse(content=blocks, stop_reason="tool_use"),
+        ProviderResponse(content=[{"type": "text", "text": "完成"}], stop_reason="end_turn"),
+    ])
+    messages = [{"role": "user", "content": "批量执行"}]
+    events = AgentLoop(provider, [], registry=registry, progress_interval=0.02).run(messages)
+    try:
+        for _ in blocks:
+            assert (await anext(events)).type == "tool_start"
+        completed_ids = []
+        for _ in range(40):
+            event = await asyncio.wait_for(anext(events), 2)
+            assert event.type == "tool_done"
+            completed_ids.append(event.tool_id)
+        assert set(completed_ids) == {str(index) for index in range(1, 41)}
+        assert not stopped.is_set()
+        waiting = await asyncio.wait_for(anext(events), 2)
+        assert waiting.type == "warning"
+        assert waiting.data["pending_tools"] == [{"tool_name": "controlled", "tool_id": "0"}]
+        if cancel:
+            await events.aclose()
+        else:
+            release.set()
+            remaining = [event async for event in events]
+            assert [event.tool_id for event in remaining if event.type == "tool_done"] == ["0"]
+            assert remaining[-1].type == "done"
+        assert stopped.is_set()
+        results = messages[2]["content"]
+        assert [result["tool_use_id"] for result in results] == [str(index) for index in range(41)]
+        assert all(result["content"] == "fast" for result in results[1:])
+        assert bool(results[0].get("is_error")) is cancel
+    finally:
+        release.set()
+        await events.aclose()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("stream", [True, False])
+async def test_stalled_model_has_visible_progress_and_total_timeout(stream):
+    from coding_agent.context.recovery import RecoveryManager
+    from coding_agent.providers.base import ModelRequestError
+
+    cancelled = asyncio.Event()
+
+    class Provider(MockProvider):
+        async def create_message(self, *arguments, **options):
+            self.call_count += 1
+            try:
+                await asyncio.Event().wait()
+            finally:
+                cancelled.set()
+
+    provider = Provider([])
+    loop = AgentLoop(provider, [], model_timeout=0.1, progress_interval=0.02,
+                     recovery=RecoveryManager())
+    events = loop.run([{"role": "user", "content": "开始"}], stream=stream)
+    observed = []
+    with pytest.raises(ModelRequestError, match="已停止等待"):
+        async with asyncio.timeout(2):
+            async for event in events:
+                observed.append(event)
+    assert observed and all(event.type == "warning" for event in observed)
+    assert all(event.data["phase"] == "model" for event in observed)
+    assert cancelled.is_set()
+    assert provider.call_count == 1
+
+
+@pytest.mark.asyncio
+async def test_tool_argument_stream_is_counted_as_activity_without_exposing_arguments():
+    tool_response = ProviderResponse(
+        content=[{"type": "tool_use", "id": "tool-1", "name": "echo",
+                  "input": {"message": "private argument"}}],
+        stop_reason="tool_use",
+    )
+    final_response = ProviderResponse(
+        content=[{"type": "text", "text": "完成"}], stop_reason="end_turn",
+    )
+
+    class Provider(MockProvider):
+        async def stream_message(self, *arguments, **options):
+            self.call_count += 1
+            if self.call_count == 1:
+                for _ in range(16):
+                    yield StreamEvent(type="tool_input", tool_id="tool-1", text="secret")
+                    await asyncio.sleep(0.01)
+                yield StreamEvent(type="done", response=tool_response)
+            else:
+                yield StreamEvent(type="done", response=final_response)
+
+    provider = Provider([tool_response, final_response])
+    events = await _collect_events(
+        AgentLoop(provider, [EchoTool()], progress_interval=0.025),
+        [{"role": "user", "content": "运行工具"}],
+    )
+
+    model_warnings = [event for event in events
+                      if event.type == "warning" and event.data.get("phase") == "model"]
+    assert model_warnings == []
+    assert events[-1].type == "done"
+
+
+@pytest.mark.asyncio
+async def test_model_wait_warning_reports_recent_tool_argument_activity():
+    release = asyncio.Event()
+    response = ProviderResponse(content=[], stop_reason="end_turn")
+
+    class Provider(MockProvider):
+        async def stream_message(self, *arguments, **options):
+            self.call_count += 1
+            yield StreamEvent(type="tool_input", tool_id="tool-1", text="private argument")
+            await release.wait()
+            yield StreamEvent(type="done", response=response)
+
+    provider = Provider([response])
+    events = AgentLoop(provider, [], progress_interval=0.02).run(
+        [{"role": "user", "content": "等待工具参数流"}]
+    )
+    try:
+        warning = await asyncio.wait_for(anext(events), timeout=1)
+        assert warning.type == "warning"
+        assert warning.data["last_protocol_event"] == "tool_input"
+        assert warning.data["seconds_since_protocol_event"] >= 0.01
+        assert warning.data["request_attempts"] == 1
+        assert warning.data["application_retry_count"] == 0
+        assert "工具参数增量" in warning.text
+        assert "private argument" not in warning.text
+    finally:
+        release.set()
+        await events.aclose()

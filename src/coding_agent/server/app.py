@@ -141,6 +141,7 @@ async def _get_runtime(session_id: str) -> AgentRuntime:
                 "tool_name": event.data["tool_name"],
                 "output": str(event.data.get("output", ""))[:4000],
                 "is_error": bool(event.data.get("error")),
+                "execution": event.data.get("execution", {}),
             })
 
         runtime.bus.subscribe(EventType.POST_TOOL_USE, notify_tool_done, priority=90)

@@ -17,6 +17,7 @@
 from __future__ import annotations
 
 import os
+import math
 from dataclasses import dataclass, field
 from pathlib import Path
 from dotenv import load_dotenv
@@ -37,7 +38,7 @@ class Config:
     max_tokens: int = 8000
     system_prompt: str = (
         "You are a coding agent. Use tools to solve tasks. "
-        "Act, don't explain — just do the work."
+        "Do the work, then report the result, verification and any remaining limitations to the user."
     )
     provider: str = "auto"  # 模型后端类型：Anthropic、OpenAI 兼容接口或自动识别
     workdir: str = field(default_factory=lambda: str(Path.cwd()))
@@ -54,6 +55,9 @@ class Config:
     team_idle_timeout: float = 60.0
     fallback_model: str | None = None
     escalated_max_tokens: int = 64000
+    model_timeout: float = 180.0
+    maintenance_timeout: float = 30.0
+    progress_interval: float = 10.0
 
 
 def load_config(path: str | Path = "config.yaml") -> Config:
@@ -103,6 +107,10 @@ def validate_config(cfg: Config) -> None:
         raise ValueError("配置 keep_recent 必须是非负整数")
     if type(cfg.team_idle_timeout) not in (int, float) or cfg.team_idle_timeout < 0:
         raise ValueError("配置 team_idle_timeout 必须是非负数")
+    for name in ("model_timeout", "maintenance_timeout", "progress_interval"):
+        value = getattr(cfg, name)
+        if type(value) not in (int, float) or not math.isfinite(value) or value <= 0:
+            raise ValueError(f"配置 {name} 必须是有限正数（秒）")
     for name in ("mcp_servers", "deny_list"):
         value = getattr(cfg, name)
         if not isinstance(value, list) or any(not isinstance(item, str) for item in value):

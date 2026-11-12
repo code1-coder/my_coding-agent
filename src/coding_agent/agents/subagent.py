@@ -210,10 +210,12 @@ class AgentPool:
                     output = f"Error: {exc}"
 
                 logger.debug("子智能体 [%s] %s → %s", spec.name, tool_name, str(output)[:100])
+                output_dict = output.to_dict() if hasattr(output, "to_dict") else None
                 results.append({
                     "type": "tool_result",
                     "tool_use_id": tool_id,
-                    "content": output,
+                    "content": output_dict["content"] if output_dict else output,
+                    **({"is_error": True} if output_dict and output_dict.get("is_error") else {}),
                 })
 
             messages.append({"role": "user", "content": results})

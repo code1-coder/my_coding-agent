@@ -49,6 +49,26 @@ def test_web_reuses_runtime_and_isolates_session_history(configured_server):
     assert not server.runtimes
 
 
+def test_web_delivers_result_after_real_file_write(configured_server, tmp_path, monkeypatch):
+    provider = ScriptedProvider([
+        tool_response("write_file", {"path": "result.txt", "content": "verified"}),
+        text_response(""),
+        text_response("已写入 result.txt，内容为 verified。"),
+    ])
+    monkeypatch.setattr(server, "_get_provider", lambda _: provider)
+    with TestClient(server.app) as client:
+        response = client.post("/chat", json={"prompt": "写文件并报告结果", "session_id": "delivery"})
+        assert response.status_code == 200
+        events = decode_events(response)
+        visible = "".join(event.get("text", "") for event in events if event["type"] == "text_delta")
+        assert visible == "已写入 result.txt，内容为 verified。"
+        assert events[-1]["type"] == "done"
+        assert events[-1]["text"] == visible
+        assert sum(event["type"] == "tool_start" for event in events) == 1
+        assert (tmp_path / "result.txt").read_text(encoding="utf-8") == "verified"
+        assert server.sessions["delivery"][-1]["content"][0]["text"] == visible
+
+
 def test_web_uses_skills_memory_context_hooks_and_task_board(configured_server, tmp_path, monkeypatch):
     cfg, providers = configured_server
     cfg.context_limit = 50
@@ -83,6 +103,26 @@ def test_web_reports_model_errors_and_cleans_up(configured_server, monkeypatch):
     with TestClient(server.app) as client:
         response = client.post("/chat", json={"prompt": "你好"})
         assert decode_events(response)[-1] == {"type": "error", "message": "模拟模型请求失败"}
+    assert provider.closed
+
+
+def test_web_exposes_waiting_progress_and_model_timeout(configured_server, monkeypatch):
+    cfg, _ = configured_server
+    cfg.model_timeout = 0.15
+    cfg.progress_interval = 0.02
+
+    class StalledProvider(ScriptedProvider):
+        async def create_message(self, *arguments, **options):
+            await asyncio.Event().wait()
+
+    provider = StalledProvider()
+    monkeypatch.setattr(server, "_get_provider", lambda _: provider)
+    with TestClient(server.app) as client:
+        events = decode_events(client.post("/chat", json={"prompt": "检查等待", "session_id": "stall"}))
+        assert any(event["type"] == "warning" and event["phase"] == "model" for event in events)
+        assert events[-1]["type"] == "error"
+        assert "已停止等待" in events[-1]["message"]
+        assert not server.runtimes["stall"].turn_lock.locked()
     assert provider.closed
 
 

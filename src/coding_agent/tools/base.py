@@ -7,6 +7,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from typing import Any
@@ -20,22 +21,33 @@ class ToolResult:
         tool_use_id: 触发本次执行的 tool_use 块的 ID。
         content: 工具的输出文本（未处理错误时为空字符串）。
         error: 如果不为 None，表示工具以此错误消息失败。
+        execution: 命令退出码、输出、耗时等执行信息；不直接添加到模型协议字段。
     """
 
     tool_use_id: str
     content: str = ""
     error: str | None = None
+    execution: dict[str, Any] = field(default_factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
         """转换为模型协议所需的工具结果，失败时附上 is_error 标记。"""
         d: dict[str, Any] = {
             "type": "tool_result",
             "tool_use_id": self.tool_use_id,
-            "content": self.error if self.error else self.content,
+            "content": (json.dumps({**self.execution, "output": self.error or self.content}, ensure_ascii=False)
+                        if self.execution else self.error or self.content),
         }
         if self.error:
             d["is_error"] = True
         return d
+
+
+class ToolCancelledError(asyncio.CancelledError):
+    """携带执行结果传播取消；termination_confirmed 标识是否已确认终止。"""
+
+    def __init__(self, result: ToolResult) -> None:
+        super().__init__(result.error)
+        self.result = result
 
 
 class Tool(ABC):
@@ -88,16 +100,16 @@ class Tool(ABC):
     # ── 执行 ───────────────────────────────────────────────────
 
     @abstractmethod
-    def execute(self, **kwargs: Any) -> str:
+    def execute(self, **kwargs: Any) -> str | ToolResult:
         """同步执行工具。
 
         返回:
-            工具输出字符串。抛出异常以表示不可恢复的错误
+            工具输出字符串或结构化 ToolResult。抛出异常以表示不可恢复的错误
             （框架会捕获并包装异常）。
         """
         ...
 
-    async def aexecute(self, **kwargs: Any) -> str:
+    async def aexecute(self, **kwargs: Any) -> str | ToolResult:
         """异步包装器 —— 默认在线程池中运行 ``execute``。
 
         如果工具有原生异步实现，可以重写此方法。

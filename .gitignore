@@ -57,6 +57,9 @@ junit.xml
 /examples/memory-demo-output/
 /demo_memory/
 
+# 本地编码智能体开发约束（不提交）
+/AGENTS.md
+
 # 编辑器、操作系统和临时文件
 .idea/
 .vscode/

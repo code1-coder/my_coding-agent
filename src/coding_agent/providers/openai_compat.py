@@ -19,6 +19,7 @@ from typing import Any, AsyncIterator
 
 from openai import AsyncOpenAI
 
+from coding_agent.providers.activity import observe_http_client
 from coding_agent.providers.base import (
     IncompleteStreamError,
     LLMProvider,
@@ -50,6 +51,7 @@ class OpenAICompatProvider(LLMProvider):
             # 默认使用 OpenAI 公共端点
             pass
         self._client = AsyncOpenAI(**kwargs)
+        self.http_activity_supported = observe_http_client(self._client)
 
     async def aclose(self) -> None:
         """在所属事件循环关闭前释放 SDK 的异步连接池。"""

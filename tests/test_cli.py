@@ -88,6 +88,28 @@ def test_bash_failure_shows_command_and_escapes_error(capsys, is_error):
     assert capsys.readouterr().err == f"[工具失败] bash {command}: Error: failed\\ncommand\n"
 
 
+def test_bash_failure_shows_execution_metadata(capsys):
+    main._print_event(main.LoopEvent(
+        type="tool_done", tool_name="bash", tool_output="Error: Timeout (0.01s)",
+        data={
+            "input": {"command": "python -c sleep"},
+            "is_error": True,
+            "execution": {
+                "exit_code": None,
+                "duration_ms": 12.5,
+                "failure_stage": "timeout",
+                "timed_out": True,
+                "truncated": True,
+            },
+        },
+    ), color=False)
+    output = capsys.readouterr().err
+    assert "[耗时: 12.5 ms]" in output
+    assert "[阶段: timeout]" in output
+    assert "[已超时]" in output
+    assert "[输出已截断]" in output
+
+
 def test_tool_success_does_not_print_file_content(capsys):
     main._print_event(main.LoopEvent(type="tool_done", tool_name="read_file", tool_output="PRIVATE_BODY"))
     captured = capsys.readouterr()
@@ -167,6 +189,31 @@ def test_chat_preserves_loop_and_history_across_turns(provider):
     assert provider.history[1][1]["content"][0]["text"] == "我叫李华。"
     assert provider.closed
     assert provider.owner_loop.is_closed()
+
+
+@pytest.mark.parametrize("mode", ["run", "chat", "limit"])
+def test_cli_delivers_result_after_real_file_write(tmp_path, monkeypatch, mode):
+    from test_runtime import ScriptedProvider, text_response, tool_response
+
+    provider = ScriptedProvider([
+        tool_response("write_file", {"path": "result.txt", "content": "verified"}),
+        *([] if mode == "limit" else [text_response("")]),
+        text_response("已写入 result.txt，内容为 verified。"),
+    ])
+    cfg = Config(workdir=str(tmp_path), max_iterations=1 if mode == "limit" else 50)
+    monkeypatch.setattr(main, "load_config", lambda _: cfg)
+    monkeypatch.setattr(main, "_build_provider", lambda _: provider)
+    arguments = ["chat"] if mode == "chat" else ["run", "写入 result.txt 并报告结果"]
+    result = CliRunner().invoke(main.cli, arguments, input="写入 result.txt 并报告结果\nexit\n")
+    assert result.exit_code == 0, result.exception
+    assert (tmp_path / "result.txt").read_text(encoding="utf-8") == "verified"
+    assert result.output.count("已写入 result.txt，内容为 verified。") == 1
+    summary_calls = [call for call in provider.calls if call["tools"] == []]
+    assert len(summary_calls) == 1
+    assert "Wrote" in str(summary_calls[0]["messages"])
+    if mode == "limit":
+        assert "轮次上限" in result.output
+    assert provider.closed
 
 
 @pytest.mark.parametrize("user_input", ["q\n", "exit\n", ""])

@@ -398,6 +398,8 @@ async def test_large_tool_output_is_persisted_in_actual_runtime(tmp_path):
 @pytest.mark.parametrize("changes", [
     {"context_limit": 0}, {"max_messages": 2}, {"keep_recent": -1},
     {"max_iterations": False}, {"team_idle_timeout": -1}, {"mcp_servers": "docs"},
+    {"model_timeout": 0}, {"maintenance_timeout": float("inf")},
+    {"progress_interval": float("nan")}, {"model_timeout": True},
 ])
 def test_invalid_runtime_options_fail_before_creating_provider(tmp_path, changes):
     from unittest.mock import Mock
@@ -418,3 +420,70 @@ def test_non_transient_generation_error_is_not_retried(monkeypatch):
         asyncio.run(with_retry(call, RecoveryState()))
     assert call.await_count == 1
     sleep.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_many_tools_continue_after_stalled_compaction_and_memory_requests(tmp_path):
+    stopped = []
+
+    class Provider(ScriptedProvider):
+        async def create_message(self, messages, tools=None, **options):
+            if tools is None:
+                try:
+                    await asyncio.Event().wait()
+                finally:
+                    stopped.append(True)
+            return await super().create_message(messages, tools=tools, **options)
+
+    (tmp_path / "note.txt").write_text("真实文件内容", encoding="utf-8")
+    blocks = [{"type": "tool_use", "id": f"read-{index}", "name": "read_file",
+               "input": {"path": "note.txt"}} for index in range(40)]
+    provider = Provider([ProviderResponse(content=blocks, stop_reason="tool_use"), text_response("读取完成")])
+    cfg = Config(workdir=str(tmp_path), context_limit=1000, maintenance_timeout=0.12,
+                 progress_interval=0.02)
+    async with AgentRuntime(cfg, provider=provider) as runtime:
+        errors = []
+
+        async def record(event):
+            errors.append(event.data)
+
+        runtime.bus.subscribe(EventType.ERROR, record)
+        async with asyncio.timeout(3):
+            events = await collect(runtime)
+        assert sum(event.type == "tool_done" for event in events) == 40
+        assert events[-1].text == "读取完成"
+        assert events[-1].type == "done"
+        assert len(stopped) == 2
+        assert any(event.data.get("phase") == "整理工具输出和压缩上下文" for event in events)
+        assert any(event.data.get("phase") == "提取和保存记忆" for event in events)
+        assert any("已停止等待" in event.get("error", "") for event in errors)
+        assert not runtime.workspace_lock.locked()
+        assert "真实文件内容" in str(provider.calls[-1]["messages"])
+
+
+@pytest.mark.asyncio
+async def test_cancelling_memory_phase_releases_workspace_and_turn_locks(tmp_path):
+    started = asyncio.Event()
+    stopped = asyncio.Event()
+
+    class Provider(ScriptedProvider):
+        async def create_message(self, messages, tools=None, **options):
+            if tools is None:
+                started.set()
+                try:
+                    await asyncio.Event().wait()
+                finally:
+                    stopped.set()
+            return await super().create_message(messages, tools=tools, **options)
+
+    async with AgentRuntime(Config(workdir=str(tmp_path), progress_interval=0.02),
+                            provider=Provider([text_response()])) as runtime:
+        events = runtime.run_turn("开始")
+        assert (await anext(events)).type == "text_delta"
+        event = await asyncio.wait_for(anext(events), 2)
+        assert event.type == "warning"
+        assert started.is_set()
+        await events.aclose()
+        assert stopped.is_set()
+        assert not runtime.workspace_lock.locked()
+        assert not runtime.turn_lock.locked()

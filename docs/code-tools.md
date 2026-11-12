@@ -11,7 +11,13 @@ CLI、网页、worker 和后台队友通过相同的 ToolRegistry 使用代码�
 
 同批工具会并发执行。存在依赖的修改、读取和测试应分成不同批次。
 
-CLI 的 chat 和 run 会在工具开始时显示文件路径；分段读取同时显示行范围，例如 read_file src/main.py:20-60。apply_patch 逐项列出新增、修改、移动和删除的路径。search_code 显示搜索范围、pattern 和 files，glob 显示文件匹配模式。bash 显示实际执行命令，例如 > bash git status --short，保留引号、空格和中文。只显示参数摘要，不打印文件正文或替换内容；路径和命令中的换行与控制字符会转义。开始记录表示准备执行，工具返回失败时另行显示带目标路径或命令的简短错误。
+每个工具完成后立即发送 tool_done，不再等待同批最慢的工具；写回模型的工具结果仍按调用顺序排列。取消或关闭本轮时会取消并回收批次中的异步任务，保留已完成结果，为未完成调用补充中断结果。同步线程工具仍受其自身取消能力限制，不把取消等待当作线程已停止。
+
+等待工具、模型、上下文整理和记忆处理时，默认每 10 秒报告当前阶段；工具等待提示包含尚未完成的名称和调用 ID。config.yaml 可设置 progress_interval（秒）。model_timeout 默认 180 秒，限制一次模型请求连同重试和恢复的总等待时间，超时显示错误；maintenance_timeout 默认 30 秒，限制单次内部摘要或记忆请求连同重试的等待时间。内部请求失败沿用原有降级逻辑：摘要保留原历史，记忆处理跳过失败操作，并记录错误。三个值必须是有限正数。持续输出的长响应也受模型总时限限制，可按所用服务调整。取消会传播，不自动重放已经执行的工具。
+
+每轮结束前应主动交付结果，说明实际完成事项、相关文件、实际验证与未完成事项。模型空回复、无有效工具调用或耗尽输出长度恢复时，运行层最多补充一次禁用工具的总结请求，30 秒内未能生成有效答复则显示明确提示。达到执行轮次上限时同样停止工具并补充总结，明确说明已达到上限，不能据此声称任务完成；这次总结请求不计入工具执行轮次。补充答复通过 text_delta 显示到 CLI 和网页，并保留在会话中；已有正常答复不会重复输出。此机制保证反馈可见，不替代对实际工作结果的核验。
+
+CLI 的 chat 和 run 会在工具开始时显示文件路径；分段读取同时显示行范围，例如 read_file src/main.py:20-60。apply_patch 逐项列出新增、修改、移动和删除的路径。search_code 显示搜索范围、pattern 和 files，glob 显示文件匹配模式。bash 显示实际执行命令，例如 > bash git status --short，并在完成或失败时报告退出码、耗时、失败阶段、超时和截断状态，保留引号、空格和中文。只显示参数摘要，不打印文件正文或替换内容；路径和命令中的换行与控制字符会转义。开始记录表示准备执行，工具返回失败时另行显示带目标路径或命令的简短错误。
 
 ## 工具参数
 
@@ -24,7 +30,13 @@ CLI 的 chat 和 run 会在工具开始时显示文件路径；分段读取同�
 | git_diff | path="src", staged=false, stat=false, context_lines=3 | 默认未暂存；staged=true 查看暂存，stat=true 查看统计；路径为字面量；不显示未跟踪文件内容 |
 | apply_patch | patch="补丁文本" | 新增、精确上下文更新、移动及删除；JSON 参数需要正确编码换行 |
 
-search_code 需要 PATH 中存在 ripgrep (rg)，Git 工具需要 Git。未安装时返回明确错误；无需新增 Python 依赖。搜索遵循 ripgrep 默认忽略规则，目录遍历不跟随符号链接。文件大小限制 2 MiB，匹配行最长展示 2000 字符；最多 1000 行结果，原始搜索输出最多读取 2 MB。Git 输出最多 50000 字节。命令超时 30 秒。结果截断时缩小路径或搜索范围。
+search_code 需要 PATH 中存在 ripgrep (rg)，Git 工具需要 Git。未安装时返回明确错误；无需新增 Python 依赖。搜索遵循 ripgrep 默认忽略规则，目录遍历不跟随符号链接。文件大小限制 2 MiB，匹配行最长展示 2000 字符；最多 1000 行结果，原始搜索输出最多读取 2 MB。Git 输出最多 50000 字节。命令默认超时 120 秒；BashTool 可通过 timeout_seconds 调整超时时间。超时、启动失败、空命令和非零退出都会返回结构化失败结果，并保留 stdout、stderr、duration_ms、timed_out、cancelled、truncated 和 failure_stage 字段。结果截断时缩小路径或搜索范围。
+
+BashTool 的异步入口直接管理子进程。取消时先终止进程树、回收输出和进程，再传播取消异常；工具结束事件中的 cancelled=true、termination_confirmed=true 表示终止已确认，failure_stage=cancelled。超时也使用相同清理流程。清理失败时 termination_confirmed=false、cancelled=false，failure_stage 为 cleanup 或 supervision，不将取消请求已收到当作进程已停止；启动前失败时 termination_confirmed=null。同步 execute 复用相同执行逻辑，异步调用方应使用 aexecute，避免阻塞事件循环。
+
+Windows 将执行进程绑定到 Job Object 后才放行命令，并查询 Job 的 ActiveProcesses=0 确认退出。Linux 使用独立监督进程，在启动 Shell 前设置 child subreaper；取消时逐轮终止其直接子进程并接管、回收孤儿后代，包括 setsid 和双重 fork 后代。只有 waitpid 确认不存在任何待回收子进程，且监督进程退出，才通过独立控制通道确认终止；stdout/stderr EOF 和 Shell 主进程退出均不能作为进程树已退出的依据。正常运行时，Windows 和 Linux 均等待后代结束，因此关闭输出的后台任务仍受命令超时约束，并可继续取消。该机制用于管理普通命令后代，不构成对抗恶意命令或系统服务代启动的安全隔离。其他 Unix 平台当前缺少同等终止确认机制，会在启动前明确返回不支持，不能视为已经通过跨 Unix 验收。
+
+在仓库根目录运行进程树验收命令：Windows 使用 .venv/Scripts/python.exe -m pytest -q -s tests/test_code_tools.py -k 'stops_real_process_tree or stops_detached_descendants'；Linux 使用 .venv/bin/python -m pytest -q -s tests/test_code_tools.py -k 'stops_real_process_tree or stops_detached_descendants'。用例启动真实父子进程并持续写入各自日志，经注册表取消、AgentLoop 取消及超时后检查 PID 已停止、日志不再变化，且下一条命令可正常执行；附加用例检查输出重定向、父进程先退出的后代及停止后的延迟修改。无需模型 API；该检查不等同于浏览器点击停止的端到端验证。本次未增加长任务句柄和流式输出接口。
 
 ## 补丁格式
 

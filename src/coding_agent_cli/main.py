@@ -149,10 +149,25 @@ def _print_event(event: LoopEvent, *, color: bool = True) -> None:
         details = _tool_summary(event.tool_name, event.data.get("input"))
         if details:
             label += " " + "; ".join(details)
+        execution = event.data.get("execution", {})
+        if execution.get("exit_code") is not None:
+            label += f" [退出码: {execution['exit_code']}]"
+        if execution.get("duration_ms") is not None:
+            label += f" [耗时: {execution['duration_ms']} ms]"
+        if execution.get("failure_stage"):
+            label += f" [阶段: {execution['failure_stage']}]"
+        if execution.get("timed_out"):
+            label += " [已超时]"
+        if execution.get("truncated"):
+            label += " [输出已截断]"
         error = _terminal_text(event.tool_output)
         if len(error) > 500:
             error = error[:500] + "…（错误信息已截断）"
         click.echo(label + ": " + error, err=True)
+    elif event.type == "tool_done" and event.tool_name == "bash" and event.data.get("execution"):
+        execution = event.data["execution"]
+        click.echo(f"[bash 完成] 退出码: {execution['exit_code']}，耗时: {execution['duration_ms']} ms"
+                   + ("，输出已截断" if execution.get("truncated") else ""))
     elif event.type == "memory_saved":
         click.echo(f"\n[记忆] 已保存 {event.data['count']} 条到 {event.data['path']}\n")
     elif event.type == "warning":

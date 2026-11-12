@@ -1,15 +1,385 @@
+import asyncio
 import json
+import os
 import shutil
 import subprocess
+import sys
 
 import pytest
 
 from coding_agent.agents.subagent import AgentPool
 from coding_agent.security.permission import Verdict, WorkspaceChecker
 from coding_agent.tools import (
-    ApplyPatchTool, CodeOutlineTool, GitDiffTool, GitStatusTool, ReadFileTool, SearchCodeTool,
+    ApplyPatchTool, BashTool, CodeOutlineTool, GitDiffTool, GitStatusTool, ReadFileTool, SearchCodeTool,
 )
 from coding_agent.tools.registry import ToolRegistry
+
+
+def _process_running(pid):
+    if os.name == "nt":
+        import ctypes
+        from ctypes import wintypes
+
+        api = ctypes.WinDLL("kernel32", use_last_error=True)
+        api.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+        api.OpenProcess.restype = wintypes.HANDLE
+        api.GetExitCodeProcess.argtypes = [wintypes.HANDLE, ctypes.POINTER(wintypes.DWORD)]
+        api.CloseHandle.argtypes = [wintypes.HANDLE]
+        handle = api.OpenProcess(0x1000, False, pid)
+        if not handle:
+            assert ctypes.get_last_error() == 87
+            return False
+        try:
+            code = wintypes.DWORD()
+            assert api.GetExitCodeProcess(handle, ctypes.byref(code))
+            return code.value == 259
+        finally:
+            api.CloseHandle(handle)
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    from pathlib import Path
+
+    status = Path(f"/proc/{pid}/stat")
+    return not (status.exists() and status.read_text().split()[2] == "Z")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("mode", ["registry", "loop", "timeout", "parent_exits"])
+async def test_bash_stops_real_process_tree(tmp_path, mode):
+    from coding_agent.hooks.bus import EventType
+    from coding_agent.loop import AgentLoop
+    from coding_agent.providers.base import ProviderResponse
+    from test_loop import MockProvider
+
+    script = tmp_path / "process_tree.py"
+    script.write_text(
+        "import os, pathlib, subprocess, sys, time\n"
+        "role = sys.argv[1]\n"
+        "if role == 'parent':\n"
+        "    subprocess.Popen([sys.executable, __file__, 'child'])\n"
+        "pathlib.Path(role + '.pid').write_text(str(os.getpid()))\n"
+        "print(role, flush=True)\n"
+        "print(role + '-stderr', file=sys.stderr, flush=True)\n"
+        "while True:\n"
+        "    with open(role + '.log', 'a') as output:\n"
+        "        output.write('heartbeat\\n')\n"
+        f"    if role == 'parent' and {mode == 'parent_exits'}:\n"
+        "        sys.exit(0)\n"
+        "    time.sleep(0.02)\n", encoding="utf-8",
+    )
+    command = f'"{sys.executable}" "{script}" parent'
+    tool = BashTool(tmp_path, timeout_seconds=2 if mode == "timeout" else 30)
+    registry = ToolRegistry()
+    registry.register_tool(tool)
+    completed = []
+    if mode == "loop":
+        provider = MockProvider([ProviderResponse(content=[{
+            "type": "tool_use", "id": "tree", "name": "bash", "input": {"command": command},
+        }], stop_reason="tool_use")])
+        loop = AgentLoop(provider, [], registry=registry)
+
+        async def record(event):
+            completed.append(event.data)
+
+        loop.event_bus.subscribe(EventType.POST_TOOL_USE, record)
+
+        async def run():
+            async for event in loop.run([{"role": "user", "content": "run"}]):
+                pass
+
+        task = asyncio.create_task(run())
+    else:
+        task = asyncio.create_task(registry.dispatch("bash", {"command": command}, tool_use_id="tree"))
+    try:
+        async with asyncio.timeout(10):
+            while not all((tmp_path / f"{role}.log").exists() for role in ("parent", "child")):
+                if task.done():
+                    pytest.fail(f"Command finished before readiness: {task.result()}")
+                await asyncio.sleep(0.02)
+        pids = [int((tmp_path / f"{role}.pid").read_text()) for role in ("parent", "child")]
+        if mode == "parent_exits":
+            async with asyncio.timeout(5):
+                while _process_running(pids[0]):
+                    await asyncio.sleep(0.02)
+            assert _process_running(pids[1])
+        else:
+            assert all(_process_running(pid) for pid in pids)
+        if mode == "timeout":
+            result = await asyncio.wait_for(task, 10)
+            assert result.execution["timed_out"] is True
+            assert result.execution["cancelled"] is False
+        else:
+            task.cancel()
+            await asyncio.sleep(0)
+            task.cancel()
+            with pytest.raises(asyncio.CancelledError) as cancelled:
+                await asyncio.wait_for(task, 10)
+            assert task.cancelled()
+            if mode == "loop":
+                assert completed[-1]["execution"]["cancelled"] is True
+                assert completed[-1]["execution"]["failure_stage"] == "cancelled"
+            else:
+                result = cancelled.value.result
+                assert result.execution["cancelled"] is True
+                assert result.execution["timed_out"] is False
+                assert "parent" in result.execution["stdout"]
+                assert "child-stderr" in result.execution["stderr"]
+        assert not any(_process_running(pid) for pid in pids)
+        snapshots = [(tmp_path / f"{role}.log").read_bytes() for role in ("parent", "child")]
+        await asyncio.sleep(0.2)
+        assert snapshots == [(tmp_path / f"{role}.log").read_bytes() for role in ("parent", "child")]
+        followup = await tool.aexecute(f'"{sys.executable}" -c "print(123)"')
+        assert followup.execution["exit_code"] == 0
+        assert followup.content == "123"
+        print(f"{mode}: stopped PIDs={pids}; heartbeat unchanged; next command=123")
+    finally:
+        if not task.done():
+            task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+
+
+@pytest.mark.asyncio
+async def test_bash_cancel_during_process_creation(tmp_path, monkeypatch):
+    factory_name = "create_subprocess_exec"
+    original = getattr(asyncio, factory_name)
+    started = asyncio.Event()
+    release = asyncio.Event()
+    processes = []
+
+    async def delayed_spawn(*arguments, **options):
+        process = await original(*arguments, **options)
+        processes.append(process)
+        started.set()
+        await release.wait()
+        return process
+
+    monkeypatch.setattr(asyncio, factory_name, delayed_spawn)
+    task = asyncio.create_task(BashTool(tmp_path).aexecute(
+        f'"{sys.executable}" -c "import time; time.sleep(2); print(456)"',
+    ))
+    try:
+        await asyncio.wait_for(started.wait(), 5)
+        task.cancel()
+        release.set()
+        with pytest.raises(asyncio.CancelledError):
+            await asyncio.wait_for(task, 10)
+        assert all(process.returncode is not None for process in processes)
+        assert not any(_process_running(process.pid) for process in processes)
+    finally:
+        release.set()
+        if not task.done():
+            task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("mode", ["cancel", "timeout", "parent_exits"])
+async def test_bash_stops_detached_descendants_with_redirected_output(tmp_path, mode):
+    """EOF and an exited Shell must not hide a double-forked/session-detached writer."""
+    script = tmp_path / "detached.py"
+    script.write_text(
+        "import os, pathlib, subprocess, sys, time\n"
+        "role = sys.argv[1]\n"
+        "if role in ('parent', 'launcher'):\n"
+        "    subprocess.Popen([sys.executable, __file__, 'launcher' if role == 'parent' else 'worker'],\n"
+        "                     stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,\n"
+        "                     start_new_session=os.name != 'nt')\n"
+        "if role == 'launcher':\n"
+        "    sys.exit(0)\n"
+        "pathlib.Path(role + '.pid').write_text(str(os.getpid()))\n"
+        f"if role == 'parent' and {mode == 'parent_exits'}:\n"
+        "    sys.exit(0)\n"
+        "started = time.monotonic()\n"
+        "while True:\n"
+        "    with open(role + '.log', 'a') as output:\n"
+        "        output.write('heartbeat\\n')\n"
+        "    if time.monotonic() - started > 1:\n"
+        "        pathlib.Path(role + '.late').write_text('late modification')\n"
+        "    time.sleep(0.01)\n", encoding="utf-8",
+    )
+    tool = BashTool(tmp_path, timeout_seconds=0.8 if mode == "timeout" else 30)
+    task = asyncio.create_task(tool.aexecute(f'"{sys.executable}" "{script}" parent'))
+    try:
+        async with asyncio.timeout(10):
+            while not (tmp_path / "worker.log").exists():
+                if task.done():
+                    pytest.fail(f"Command finished before detached worker readiness: {task.result()}")
+                await asyncio.sleep(0.01)
+        pids = [int((tmp_path / f"{role}.pid").read_text()) for role in ("parent", "worker")]
+        assert _process_running(pids[1])
+        if mode == "parent_exits":
+            async with asyncio.timeout(5):
+                while _process_running(pids[0]):
+                    await asyncio.sleep(0.01)
+            assert not task.done(), "Detached writer must keep execution supervised after Shell EOF"
+        if mode == "timeout":
+            result = await asyncio.wait_for(task, 10)
+            assert result.execution["timed_out"] is True
+        else:
+            task.cancel()
+            await asyncio.sleep(0)
+            task.cancel()
+            with pytest.raises(asyncio.CancelledError) as cancelled:
+                await asyncio.wait_for(task, 10)
+            result = cancelled.value.result
+            assert result.execution["cancelled"] is True
+        assert result.execution["termination_confirmed"] is True
+        assert not any(_process_running(pid) for pid in pids)
+        if sys.platform == "linux":
+            from pathlib import Path
+
+            assert not any(Path(f"/proc/{pid}").exists() for pid in pids), "Descendants must also be reaped"
+        snapshot = (tmp_path / "worker.log").read_bytes()
+        await asyncio.sleep(1.1)
+        assert (tmp_path / "worker.log").read_bytes() == snapshot
+        assert not list(tmp_path.glob("*.late"))
+    finally:
+        if not task.done():
+            task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+
+
+@pytest.mark.asyncio
+async def test_bash_refuses_unverified_platform_before_launch(tmp_path, monkeypatch):
+    if os.name == "nt":
+        pytest.skip("Unix platform guard")
+    monkeypatch.setattr(sys, "platform", "darwin")
+    result = await BashTool(tmp_path).aexecute("touch should-not-exist")
+    assert result.execution["failure_stage"] == "startup"
+    assert result.execution["termination_confirmed"] is None
+    assert not (tmp_path / "should-not-exist").exists()
+
+
+@pytest.mark.asyncio
+@pytest.mark.skipif(sys.platform != "linux", reason="Linux supervisor protocol")
+@pytest.mark.parametrize("evidence", ["missing", "failed"])
+async def test_bash_requires_supervisor_completion_evidence(tmp_path, monkeypatch, evidence):
+    helper = tmp_path / "broken_supervisor.py"
+    helper.write_text(
+        "import socket, sys\n"
+        "control = socket.socket(fileno=int(sys.argv[1]))\n"
+        + ("control.sendall(b'{\"tree_stopped\": false, \"error\": \"not reaped\"}\\n')\n"
+           if evidence == "failed" else ""), encoding="utf-8",
+    )
+    original = asyncio.create_subprocess_exec
+
+    async def broken_supervisor(*arguments, **options):
+        return await original(arguments[0], str(helper), *arguments[2:], **options)
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", broken_supervisor)
+    result = await BashTool(tmp_path).aexecute("echo never-launched")
+    assert result.error
+    assert result.execution["failure_stage"] == "supervision"
+    assert result.execution["termination_confirmed"] is False
+    assert result.execution["cancelled"] is False
+
+
+@pytest.mark.asyncio
+@pytest.mark.skipif(sys.platform != "linux", reason="Linux subreaper setup")
+async def test_bash_fails_before_launch_if_subreaper_unavailable(tmp_path, monkeypatch):
+    from coding_agent.tools import _process_supervisor
+
+    class UnavailableKernel:
+        def prctl(self, *args):
+            return -1
+
+    monkeypatch.setattr(_process_supervisor.ctypes, "CDLL", lambda *a, **kw: UnavailableKernel())
+    with pytest.raises(OSError, match="subreaper"):
+        _process_supervisor.supervise("touch never-launched", None)
+    assert not (tmp_path / "never-launched").exists()
+
+
+@pytest.mark.asyncio
+@pytest.mark.skipif(os.name != "nt", reason="Windows Job evidence")
+async def test_bash_does_not_claim_cancellation_when_job_confirmation_fails(tmp_path, monkeypatch):
+    from coding_agent.tools.builtin import _WindowsProcessJob
+
+    async def unconfirmed(self):
+        raise RuntimeError("Job accounting unavailable")
+
+    monkeypatch.setattr(_WindowsProcessJob, "wait", unconfirmed)
+    task = asyncio.create_task(BashTool(tmp_path).aexecute(
+        f'"{sys.executable}" -c "import pathlib,time; pathlib.Path(\'ready\').touch(); time.sleep(30)"'))
+    try:
+        async with asyncio.timeout(5):
+            while not (tmp_path / "ready").exists():
+                await asyncio.sleep(0.01)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError) as cancelled:
+            await asyncio.wait_for(task, 10)
+        execution = cancelled.value.result.execution
+        assert execution["cancelled"] is False
+        assert execution["termination_confirmed"] is False
+        assert execution["failure_stage"] == "cleanup"
+    finally:
+        if not task.done():
+            task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+
+
+def test_bash_preserves_exit_code_and_output(tmp_path):
+    result = BashTool(tmp_path).execute(
+        'python -c "import sys; print(\'stdout\'); print(\'stderr\', file=sys.stderr); sys.exit(7)"'
+    )
+    assert result.error == "Error: Command exited with code 7"
+    assert result.content == "stdout\nstderr"
+    assert result.execution["exit_code"] == 7
+    assert result.execution["stdout"].strip() == "stdout"
+    assert result.execution["stderr"].strip() == "stderr"
+    assert result.execution["timed_out"] is False
+    assert result.execution["truncated"] is False
+    assert result.to_dict()["is_error"] is True
+
+
+def test_bash_success_has_zero_exit_code(tmp_path):
+    result = BashTool(tmp_path).execute('python -c "print(42)"')
+    assert result.error is None
+    assert result.content == "42"
+    assert result.execution["exit_code"] == 0
+    assert result.execution["duration_ms"] >= 0
+    assert result.execution["cancelled"] is False
+    assert '"exit_code": 0' in result.to_dict()["content"]
+
+
+def test_bash_reports_output_truncation_and_nonzero_exit(tmp_path):
+    result = BashTool(tmp_path).execute(
+        'python -c "import sys; sys.stdout.write(\'x\' * 50001); sys.exit(7)"'
+    )
+    assert result.error == "Error: Command exited with code 7"
+    assert result.execution["exit_code"] == 7
+    assert result.execution["stdout"] == "x" * 50000
+    assert result.execution["stderr"] == ""
+    assert result.execution["truncated"] is True
+    assert result.execution["failure_stage"] == "nonzero_exit"
+    assert result.to_dict()["is_error"] is True
+
+
+def test_bash_reports_timeout_and_startup_failure(tmp_path):
+    timed_out = BashTool(tmp_path, timeout_seconds=0.01).execute(
+        'python -c "import time; time.sleep(0.2)"'
+    )
+    assert timed_out.error == "Error: Timeout (0.01s)"
+    assert timed_out.execution["exit_code"] is None
+    assert timed_out.execution["timed_out"] is True
+    assert timed_out.execution["cancelled"] is False
+    assert timed_out.execution["failure_stage"] == "timeout"
+    assert timed_out.to_dict()["is_error"] is True
+
+    startup_failed = BashTool(tmp_path / "missing-workdir").execute("echo never")
+    assert startup_failed.error
+    assert startup_failed.execution["exit_code"] is None
+    assert startup_failed.execution["timed_out"] is False
+    assert startup_failed.execution["failure_stage"] == "startup"
+    assert startup_failed.to_dict()["is_error"] is True
+
+
+def test_bash_rejects_empty_command_with_structured_failure(tmp_path):
+    result = BashTool(tmp_path).execute("   ")
+    assert result.error == "Error: command must be a non-empty string"
+    assert result.execution["failure_stage"] == "validation"
+    assert result.execution["exit_code"] is None
 
 
 def test_read_file_segments_and_legacy_output(tmp_path):

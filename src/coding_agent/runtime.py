@@ -147,7 +147,13 @@ class AgentRuntime:
                 await self.emit(EventType.ERROR, purpose="maintenance", error=str(exc))
                 raise
 
-        return await with_retry(call, state, fallback_model=self.cfg.fallback_model)
+        try:
+            async with asyncio.timeout(self.cfg.maintenance_timeout):
+                return await with_retry(call, state, fallback_model=self.cfg.fallback_model)
+        except TimeoutError as exc:
+            message = f"内部摘要/记忆请求超过 {self.cfg.maintenance_timeout:g} 秒，已停止等待。"
+            await self.emit(EventType.ERROR, purpose="maintenance", error=message)
+            raise TimeoutError(message) from exc
 
     def provider_for_model(self, model_id: str) -> LLMProvider:
         """备用模型使用独立客户端，避免并行子任务修改同一客户端的模型状态。"""
@@ -209,6 +215,8 @@ class AgentRuntime:
                                      escalated_max_tokens=max(self.cfg.max_tokens, self.cfg.escalated_max_tokens)),
             agent_name=agent_name,
             provider_for_model=self.provider_for_model,
+            model_timeout=self.cfg.model_timeout,
+            progress_interval=self.cfg.progress_interval,
         )
 
     def system_prompt(self, registry: ToolRegistry, memories: str = "", identity: str = "") -> str:
@@ -231,9 +239,18 @@ class AgentRuntime:
             if blocked is not None:
                 raise PermissionError(f"用户输入被 Hook 阻止：{blocked}")
             self.messages.append({"role": "user", "content": prompt})
-            async with self.workspace_lock:
-                relevant = await self.memory.select_and_load(self.messages)
-            loop = self.make_loop(self.registry, system=self.system_prompt(self.registry, relevant))
+            loop = self.make_loop(self.registry, system="")
+            relevant = ""
+
+            async def load_memory():
+                nonlocal relevant
+                async with self.workspace_lock:
+                    relevant = await self.memory.select_and_load(self.messages)
+
+            async with aclosing(loop.wait_events(load_memory(), "选择和加载记忆")) as events:
+                async for event in events:
+                    yield event
+            loop.system_prompt = self.system_prompt(self.registry, relevant)
             done = None
             async with aclosing(loop.run(self.messages, stream=stream)) as events:
                 async for event in events:
@@ -245,10 +262,18 @@ class AgentRuntime:
             if self.messages and self.messages[-1].get("role") == "assistant":
                 snapshot.append(self.messages[-1])
             try:
-                async with self.workspace_lock:
-                    saved = await self.memory.extract(snapshot)
-                    if saved:
-                        await self.memory.consolidate()
+                saved = 0
+
+                async def save_memory():
+                    nonlocal saved
+                    async with self.workspace_lock:
+                        saved = await self.memory.extract(snapshot)
+                        if saved:
+                            await self.memory.consolidate()
+
+                async with aclosing(loop.wait_events(save_memory(), "提取和保存记忆")) as events:
+                    async for event in events:
+                        yield event
                 if saved:
                     yield LoopEvent(type="memory_saved", data={"count": saved,
                                     "path": str(self.workdir / ".memory")})
