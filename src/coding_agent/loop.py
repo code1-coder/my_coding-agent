@@ -42,6 +42,7 @@ from coding_agent.security.permission import PermissionPipeline, Verdict
 from coding_agent.context.compaction import CompactionPipeline
 from coding_agent.context.recovery import RecoveryManager, RecoveryState
 from coding_agent.providers.base import ModelRequestError, StreamEvent
+from coding_agent.providers.activity import RequestActivity, _current_request_activity
 
 logger = logging.getLogger(__name__)
 
@@ -325,16 +326,19 @@ class AgentLoop:
         loop = asyncio.get_running_loop()
         request_started_at = loop.time()
         request_attempts = 0
-        last_activity: tuple[str, float] | None = None
+        request_activity = RequestActivity()
 
         async def attempt():
-            nonlocal last_activity, request_attempts
+            nonlocal request_attempts
             sent_text = False
             request_attempts += 1
-            last_activity = None
+            provider = (self.provider_for_model(self.recovery_state.current_model)
+                        if self.provider_for_model else self.provider)
+            request_activity.begin_provider_attempt(
+                http_observed=bool(getattr(provider, "http_activity_supported", False)),
+            )
+            activity_token = _current_request_activity.set(request_activity)
             try:
-                provider = (self.provider_for_model(self.recovery_state.current_model)
-                            if self.provider_for_model else self.provider)
                 blocked = await self.emit(EventType.PRE_LLM_CALL, messages=messages,
                                           purpose="agent", model=provider.model_id)
                 if blocked is not None:
@@ -348,7 +352,7 @@ class AgentLoop:
                     async with aclosing(provider.stream_message(**kwargs)) as events:
                         async for event in events:
                             if event.type != "done":
-                                last_activity = (event.type, loop.time())
+                                request_activity.mark_model_event(event.type)
                                 queue.put_nowait(event)
                             if event.type == "text_delta":
                                 sent_text = sent_text or bool(event.text)
@@ -371,6 +375,8 @@ class AgentLoop:
                     # 已显示的增量无法安全重放，避免重试后产生重复文本。
                     raise ModelRequestError("流式响应中断，已显示部分内容，未自动重放。请重试本轮请求。") from exc
                 raise
+            finally:
+                _current_request_activity.reset(activity_token)
 
         async def request():
             try:
@@ -400,42 +406,68 @@ class AgentLoop:
                     event = await asyncio.wait_for(queue.get(), timeout=self.progress_interval)
                 except TimeoutError:
                     now = loop.time()
-                    if (last_activity is not None
-                            and now - last_activity[1] < self.progress_interval):
+                    if (request_activity.last_activity_type in {
+                            "text_delta", "tool_use_start", "tool_input",
+                    } and request_activity.last_activity_at is not None
+                            and now - request_activity.last_activity_at < self.progress_interval):
                         continue
                     elapsed = now - request_started_at
-                    if last_activity is None:
-                        activity = (
-                            "当前尝试尚未收到可观测的模型流事件，服务端状态未知"
+                    if request_activity.last_activity_type is None:
+                        activity_text = (
+                            "尚未收到可观测的模型流或 HTTP 活动，服务端状态未知"
                             if stream else "当前为非流式请求，调用完成前没有可观测的中间事件"
                         )
                         idle_seconds = None
                         activity_type = None
                     else:
-                        activity_type, activity_at = last_activity
-                        idle_seconds = now - activity_at
+                        activity_type = request_activity.last_activity_type
+                        idle_seconds = now - request_activity.last_activity_at
                         activity_label = {
                             "text_delta": "文本增量",
                             "tool_use_start": "工具调用声明",
                             "tool_input": "工具参数增量",
+                            "http_request_started": f"HTTP 请求已发出，尚未收到响应（距发送 {idle_seconds:.1f} 秒）",
+                            "http_response": (
+                                f"已收到 HTTP {request_activity.last_http_status} 响应，"
+                                f"尚未收到响应数据（距响应 {idle_seconds:.1f} 秒）"
+                            ),
+                            "http_response_data": "HTTP 响应数据",
+                            "http_error": f"HTTP 请求发生连接错误（距错误 {idle_seconds:.1f} 秒）",
                         }.get(activity_type, "模型流事件")
-                        activity = f"最近收到{activity_label}，{idle_seconds:.1f}秒前"
+                        if activity_type in {"http_request_started", "http_response", "http_error"}:
+                            activity_text = activity_label
+                        else:
+                            activity_text = f"最近收到{activity_label}，{idle_seconds:.1f}秒前"
                     retry_count = max(0, request_attempts - 1)
-                    retry_status = (
-                        f"，应用层已发起{request_attempts}次请求尝试"
-                        if retry_count else ""
+                    http_retry_count = request_activity.http_retry_count
+                    retry_summary = (
+                        f"HTTP 请求{request_activity.http_request_attempts}次（SDK HTTP 重试"
+                        f"{http_retry_count}次）"
+                        if request_activity.http_observation_supported
+                        else "HTTP 网络计数不可用（当前 Provider 未接入 HTTP 观测）"
                     )
                     yield LoopEvent(
                         type="warning",
-                        text=f"模型请求已等待{elapsed:.1f}秒；{activity}{retry_status}，可取消当前请求。",
+                        text=(f"模型请求已等待{elapsed:.1f}秒；{activity_text}；应用层共调用"
+                              f"{request_attempts}次（额外恢复尝试{retry_count}次），{retry_summary}，可取消当前请求。"),
                         data={
                             "phase": "model",
                             "agent": self.agent_name,
                             "request_elapsed_seconds": elapsed,
-                            "last_protocol_event": activity_type,
-                            "seconds_since_protocol_event": idle_seconds,
+                            "last_protocol_event": (
+                                activity_type if request_activity.last_activity_source == "model" else None
+                            ),
+                            "last_activity_type": activity_type,
+                            "last_activity_source": request_activity.last_activity_source,
+                            "seconds_since_protocol_event": (
+                                idle_seconds if request_activity.last_activity_source == "model" else None
+                            ),
                             "request_attempts": request_attempts,
                             "application_retry_count": retry_count,
+                            "http_request_attempts": request_activity.http_request_attempts,
+                            "http_retry_count": http_retry_count,
+                            "http_observation_supported": request_activity.http_observation_supported,
+                            "last_http_status": request_activity.last_http_status,
                         },
                     )
                     continue

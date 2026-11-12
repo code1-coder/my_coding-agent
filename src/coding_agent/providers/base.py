@@ -108,6 +108,7 @@ class LLMProvider(ABC):
         self.model_id = model_id
         self.api_key = api_key
         self.base_url = base_url
+        self.http_activity_supported = False
 
     async def aclose(self) -> None:
         """释放异步资源；持有网络客户端的后端应覆盖此方法。"""

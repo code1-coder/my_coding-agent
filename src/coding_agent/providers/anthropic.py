@@ -10,6 +10,7 @@ from typing import Any, AsyncIterator
 
 from anthropic import AsyncAnthropic
 
+from coding_agent.providers.activity import observe_http_client
 from coding_agent.providers.base import (
     LLMProvider,
     ProviderResponse,
@@ -36,6 +37,7 @@ class AnthropicProvider(LLMProvider):
         if base_url:
             kwargs["base_url"] = base_url
         self._client = AsyncAnthropic(**kwargs)
+        self.http_activity_supported = observe_http_client(self._client)
 
     async def aclose(self) -> None:
         """在所属事件循环关闭前释放 SDK 的异步连接池。"""
