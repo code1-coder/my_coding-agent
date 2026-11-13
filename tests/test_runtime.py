@@ -398,7 +398,8 @@ async def test_large_tool_output_is_persisted_in_actual_runtime(tmp_path):
 @pytest.mark.parametrize("changes", [
     {"context_limit": 0}, {"max_messages": 2}, {"keep_recent": -1},
     {"max_iterations": False}, {"team_idle_timeout": -1}, {"mcp_servers": "docs"},
-    {"model_timeout": 0}, {"maintenance_timeout": float("inf")},
+    {"model_timeout": 0}, {"model_idle_timeout": 0}, {"model_connect_timeout": float("inf")},
+    {"final_answer_timeout": float("nan")}, {"maintenance_timeout": float("inf")},
     {"progress_interval": float("nan")}, {"model_timeout": True},
 ])
 def test_invalid_runtime_options_fail_before_creating_provider(tmp_path, changes):
@@ -408,6 +409,12 @@ def test_invalid_runtime_options_fail_before_creating_provider(tmp_path, changes
     with pytest.raises(ValueError):
         AgentRuntime(Config(workdir=str(tmp_path), **changes), provider_factory=factory)
     factory.assert_not_called()
+
+
+def test_model_connection_and_idle_timeouts_are_independent():
+    from coding_agent.config import validate_config
+
+    validate_config(Config(model_connect_timeout=5, model_idle_timeout=1))
 
 
 def test_non_transient_generation_error_is_not_retried(monkeypatch):

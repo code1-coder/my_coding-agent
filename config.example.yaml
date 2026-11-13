@@ -15,7 +15,10 @@ api_key: null
 max_tokens: 8000
 escalated_max_tokens: 64000  # 输出截断后重试使用的上限
 fallback_model: null        # 同一服务商的备用模型；null 表示不启用
-model_timeout: 180
+model_timeout: 900       # 包含重试与恢复的硬总上限
+model_connect_timeout: 20
+model_idle_timeout: 120
+final_answer_timeout: 30
 maintenance_timeout: 30
 progress_interval: 10
 

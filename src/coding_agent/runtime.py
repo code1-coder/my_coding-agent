@@ -36,7 +36,10 @@ def build_provider(cfg: Config) -> LLMProvider:
     if hint == "auto":
         hint = "anthropic" if "anthropic" in (cfg.base_url or "").lower() else "openai_compat"
     provider_cls = AnthropicProvider if hint == "anthropic" else OpenAICompatProvider
-    return provider_cls(model_id=cfg.model_id, api_key=cfg.api_key, base_url=cfg.base_url)
+    return provider_cls(
+        model_id=cfg.model_id, api_key=cfg.api_key, base_url=cfg.base_url,
+        connect_timeout=cfg.model_connect_timeout, idle_timeout=cfg.model_idle_timeout,
+    )
 
 
 class AgentRuntime:
@@ -216,6 +219,9 @@ class AgentRuntime:
             agent_name=agent_name,
             provider_for_model=self.provider_for_model,
             model_timeout=self.cfg.model_timeout,
+            model_connect_timeout=self.cfg.model_connect_timeout,
+            model_idle_timeout=self.cfg.model_idle_timeout,
+            final_answer_timeout=self.cfg.final_answer_timeout,
             progress_interval=self.cfg.progress_interval,
         )
 

@@ -172,6 +172,7 @@ async def with_retry(
         抛出原始异常。
     """
     connection_attempts = 0
+    server_attempts = 0
     for attempt in range(MAX_RETRIES):
         try:
             result = await fn()
@@ -193,6 +194,20 @@ async def with_retry(
             ename = type(exc).__name__.lower()
             emsg = str(exc).lower()
             status = getattr(exc, "status_code", None)
+
+            if status in (408, 409) or (status is not None and 500 <= status < 600 and status != 529):
+                server_attempts += 1
+                if server_attempts >= MAX_CONNECTION_ATTEMPTS:
+                    raise ModelRequestError(
+                        f"模型服务连续返回 HTTP {status}（{server_attempts} 次尝试），已停止重试。"
+                    ) from exc
+                delay = _retry_delay(server_attempts - 1)
+                logger.warning(
+                    "[HTTP %s] 重试 %d/%d，等待 %.1fs",
+                    status, server_attempts, MAX_CONNECTION_ATTEMPTS - 1, delay,
+                )
+                await asyncio.sleep(delay)
+                continue
 
             # ── 429 限流 ──────────────────────────────────
             if status == 429 or "ratelimit" in ename or re.search(r"\b429\b", emsg) or "rate limit" in emsg or "rate_limit" in emsg:

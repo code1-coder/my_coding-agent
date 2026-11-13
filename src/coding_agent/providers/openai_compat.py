@@ -19,7 +19,7 @@ from typing import Any, AsyncIterator
 
 from openai import AsyncOpenAI
 
-from coding_agent.providers.activity import observe_http_client
+from coding_agent.providers.activity import observe_http_client, sdk_timeout
 from coding_agent.providers.base import (
     IncompleteStreamError,
     LLMProvider,
@@ -40,6 +40,8 @@ class OpenAICompatProvider(LLMProvider):
         model_id: str = "gpt-5",
         api_key: str | None = None,
         base_url: str | None = None,
+        connect_timeout: float = 20.0,
+        idle_timeout: float = 120.0,
     ) -> None:
         super().__init__(model_id=model_id, api_key=api_key, base_url=base_url)
         kwargs: dict[str, Any] = {}
@@ -50,6 +52,10 @@ class OpenAICompatProvider(LLMProvider):
         else:
             # 默认使用 OpenAI 公共端点
             pass
+        kwargs.update(
+            timeout=sdk_timeout("openai", connect_timeout, idle_timeout),
+            max_retries=0,
+        )
         self._client = AsyncOpenAI(**kwargs)
         self.http_activity_supported = observe_http_client(self._client)
 

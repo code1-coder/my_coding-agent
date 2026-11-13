@@ -41,7 +41,7 @@ from coding_agent.hooks.bus import Event, EventBus, EventType
 from coding_agent.security.permission import PermissionPipeline, Verdict
 from coding_agent.context.compaction import CompactionPipeline
 from coding_agent.context.recovery import RecoveryManager, RecoveryState
-from coding_agent.providers.base import ModelRequestError, StreamEvent
+from coding_agent.providers.base import ModelIdleTimeout, ModelRequestError, StreamEvent
 from coding_agent.providers.activity import RequestActivity, _current_request_activity
 
 logger = logging.getLogger(__name__)
@@ -94,7 +94,10 @@ class AgentLoop:
         recovery: RecoveryManager | None = None,
         agent_name: str = "lead",
         provider_for_model: Callable[[str], LLMProvider] | None = None,
-        model_timeout: float = 180.0,
+        model_timeout: float = 900.0,
+        model_connect_timeout: float = 20.0,
+        model_idle_timeout: float = 120.0,
+        final_answer_timeout: float = 30.0,
         progress_interval: float = 10.0,
     ) -> None:
         self.provider = provider
@@ -113,6 +116,9 @@ class AgentLoop:
         self.agent_name = agent_name
         self.provider_for_model = provider_for_model
         self.model_timeout = model_timeout
+        self.model_connect_timeout = model_connect_timeout
+        self.model_idle_timeout = model_idle_timeout
+        self.final_answer_timeout = final_answer_timeout
         self.progress_interval = progress_interval
 
     # ── 公共 API ──────────────────────────────────────────
@@ -241,7 +247,7 @@ class AgentLoop:
         )})
         answer = ""
         try:
-            async with asyncio.timeout(30), aclosing(
+            async with asyncio.timeout(self.final_answer_timeout), aclosing(
                 self._model_events(request_messages, False, final_only=True),
             ) as events:
                 async for event in events:
@@ -338,6 +344,7 @@ class AgentLoop:
                 http_observed=bool(getattr(provider, "http_activity_supported", False)),
             )
             activity_token = _current_request_activity.set(request_activity)
+            idle_timeout = asyncio.timeout(None)
             try:
                 blocked = await self.emit(EventType.PRE_LLM_CALL, messages=messages,
                                           purpose="agent", model=provider.model_id)
@@ -348,20 +355,26 @@ class AgentLoop:
                                   self.recovery.current_max_tokens(self.recovery_state)
                                   if self.recovery else self.max_tokens))
                 response = None
-                if stream:
-                    async with aclosing(provider.stream_message(**kwargs)) as events:
-                        async for event in events:
-                            if event.type != "done":
-                                request_activity.mark_model_event(event.type)
-                                queue.put_nowait(event)
-                            if event.type == "text_delta":
-                                sent_text = sent_text or bool(event.text)
-                            elif event.type == "done":
-                                response = event.response
-                else:
-                    response = await provider.create_message(**kwargs)
-                    if response.text:
-                        queue.put_nowait(StreamEvent(type="text_delta", text=response.text))
+                async with idle_timeout:
+                    request_activity.monitor_idle_timeout(
+                        idle_timeout, self.model_idle_timeout,
+                        wait_for_http_request=bool(getattr(provider, "http_activity_supported", False)),
+                    )
+                    request_activity.mark_request_started()
+                    if stream:
+                        async with aclosing(provider.stream_message(**kwargs)) as events:
+                            async for event in events:
+                                if event.type != "done":
+                                    request_activity.mark_model_event(event.type)
+                                    queue.put_nowait(event)
+                                if event.type == "text_delta":
+                                    sent_text = sent_text or bool(event.text)
+                                elif event.type == "done":
+                                    response = event.response
+                    else:
+                        response = await provider.create_message(**kwargs)
+                        if response.text:
+                            queue.put_nowait(StreamEvent(type="text_delta", text=response.text))
                 if response is None:
                     raise RuntimeError("模型响应流未正常结束")
                 if stream and not sent_text and response.text:
@@ -370,12 +383,21 @@ class AgentLoop:
                                 usage=response.usage, purpose="agent")
                 return response
             except Exception as exc:
-                await self.emit(EventType.ERROR, error=str(exc), purpose="agent")
+                error = ModelIdleTimeout(
+                    f"模型请求空闲超时：连续 {self.model_idle_timeout:g} 秒没有可观测活动，"
+                    "单次尝试已停止。"
+                ) if idle_timeout.expired() and isinstance(exc, TimeoutError) else exc
+                await self.emit(EventType.ERROR, error=str(error), purpose="agent")
                 if sent_text:
                     # 已显示的增量无法安全重放，避免重试后产生重复文本。
-                    raise ModelRequestError("流式响应中断，已显示部分内容，未自动重放。请重试本轮请求。") from exc
+                    if isinstance(error, ModelIdleTimeout):
+                        raise error from exc
+                    raise ModelRequestError("流式响应中断，已显示部分内容，未自动重放。请重试本轮请求。") from error
+                if error is not exc:
+                    raise error from exc
                 raise
             finally:
+                request_activity.stop_idle_timeout_monitoring()
                 _current_request_activity.reset(activity_token)
 
         async def request():
@@ -390,7 +412,7 @@ class AgentLoop:
                             response = await attempt()
                 except TimeoutError as exc:
                     raise ModelRequestError(
-                        f"模型请求超过 {self.model_timeout:g} 秒（含重试与恢复），已停止等待。"
+                        f"模型请求超过总时限 {self.model_timeout:g} 秒（含重试与恢复），已停止等待。"
                         "请检查模型服务或调整 model_timeout 后重试。"
                     ) from exc
                 if response is None:
@@ -433,13 +455,17 @@ class AgentLoop:
                             ),
                             "http_response_data": "HTTP 响应数据",
                             "http_error": f"HTTP 请求发生连接错误（距错误 {idle_seconds:.1f} 秒）",
+                            "request_started": "模型请求处理中，尚无可观测的模型响应",
                         }.get(activity_type, "模型流事件")
-                        if activity_type in {"http_request_started", "http_response", "http_error"}:
+                        if activity_type in {
+                                "http_request_started", "http_response", "http_error", "request_started",
+                        }:
                             activity_text = activity_label
                         else:
                             activity_text = f"最近收到{activity_label}，{idle_seconds:.1f}秒前"
                     retry_count = max(0, request_attempts - 1)
                     http_retry_count = request_activity.http_retry_count
+                    remaining_total = max(0.0, self.model_timeout - elapsed)
                     retry_summary = (
                         f"HTTP 请求{request_activity.http_request_attempts}次（SDK HTTP 重试"
                         f"{http_retry_count}次）"
@@ -449,11 +475,18 @@ class AgentLoop:
                     yield LoopEvent(
                         type="warning",
                         text=(f"模型请求已等待{elapsed:.1f}秒；{activity_text}；应用层共调用"
-                              f"{request_attempts}次（额外恢复尝试{retry_count}次），{retry_summary}，可取消当前请求。"),
+                              f"{request_attempts}次（额外恢复尝试{retry_count}次），{retry_summary}；"
+                              f"连接上限 {self.model_connect_timeout:.1f} 秒、空闲上限 "
+                              f"{self.model_idle_timeout:.1f} 秒；总预算 {self.model_timeout:.1f} 秒，"
+                              f"剩余 {remaining_total:.1f} 秒，可取消当前请求。"),
                         data={
                             "phase": "model",
                             "agent": self.agent_name,
                             "request_elapsed_seconds": elapsed,
+                            "connect_timeout_seconds": self.model_connect_timeout,
+                            "idle_timeout_seconds": self.model_idle_timeout,
+                            "total_timeout_seconds": self.model_timeout,
+                            "remaining_total_seconds": remaining_total,
                             "last_protocol_event": (
                                 activity_type if request_activity.last_activity_source == "model" else None
                             ),

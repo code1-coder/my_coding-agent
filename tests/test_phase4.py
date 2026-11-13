@@ -116,6 +116,28 @@ class TestWithRetry:
         assert state.total_429_retries == 2
 
     @pytest.mark.asyncio
+    @pytest.mark.parametrize("status", [408, 409, 500, 503, 599])
+    async def test_retries_transient_http_statuses_with_a_bound(self, monkeypatch, status):
+        from unittest.mock import AsyncMock
+        from coding_agent.providers.base import ModelRequestError
+
+        sleep = AsyncMock()
+        monkeypatch.setattr("coding_agent.context.recovery.asyncio.sleep", sleep)
+
+        class StatusError(Exception):
+            status_code = status
+
+        call = AsyncMock(side_effect=[StatusError(f"HTTP {status}"), "ok"])
+        assert await with_retry(call, RecoveryState()) == "ok"
+        assert call.await_count == 2
+        sleep.assert_awaited_once()
+
+        failing_call = AsyncMock(side_effect=StatusError(f"HTTP {status}"))
+        with pytest.raises(ModelRequestError, match=f"HTTP {status}"):
+            await with_retry(failing_call, RecoveryState())
+        assert failing_call.await_count == 3
+
+    @pytest.mark.asyncio
     async def test_529_fallback_model(self, monkeypatch):
         monkeypatch.setattr("asyncio.sleep", AsyncMock())
         state = RecoveryState(current_model="primary")

@@ -16,6 +16,10 @@ class ModelRequestError(RuntimeError):
     """可向用户展示的模型请求失败。"""
 
 
+class ModelIdleTimeout(ModelRequestError):
+    """模型尝试在空闲期限内未观察到协议或 HTTP 活动。"""
+
+
 class IncompleteStreamError(ModelRequestError):
     """模型流未提供完整结束标记。"""
 

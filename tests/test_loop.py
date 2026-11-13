@@ -12,6 +12,7 @@ import pytest
 from coding_agent.loop import AgentLoop, LoopEvent
 from coding_agent.providers.base import (
     LLMProvider,
+    ModelRequestError,
     ProviderResponse,
     StreamEvent,
 )
@@ -501,3 +502,70 @@ async def test_model_wait_warning_reports_recent_tool_argument_activity():
     finally:
         release.set()
         await events.aclose()
+
+
+@pytest.mark.asyncio
+async def test_active_model_stream_can_exceed_soft_budget_within_hard_limit():
+    response = ProviderResponse(
+        content=[{"type": "text", "text": "长响应完成"}], stop_reason="end_turn",
+    )
+
+    class Provider(MockProvider):
+        async def stream_message(self, *arguments, **options):
+            self.call_count += 1
+            for _ in range(8):
+                yield StreamEvent(type="tool_input", tool_id="tool-1", text="{}")
+                await asyncio.sleep(0.015)
+            yield StreamEvent(type="done", response=response)
+
+    events = await asyncio.wait_for(
+        _collect_events(AgentLoop(
+            Provider([response]), [], model_timeout=0.3, model_idle_timeout=0.04,
+            progress_interval=0.01,
+        ), [{"role": "user", "content": "等待持续响应"}]),
+        timeout=1,
+    )
+    assert events[-1].type == "done"
+    assert events[-1].text == "长响应完成"
+
+
+@pytest.mark.asyncio
+async def test_idle_model_stream_stops_before_total_budget_and_cleans_up():
+    stopped = asyncio.Event()
+    response = ProviderResponse(content=[], stop_reason="end_turn")
+
+    class Provider(MockProvider):
+        async def stream_message(self, *arguments, **options):
+            try:
+                yield StreamEvent(type="tool_input", tool_id="tool-1", text="{}")
+                await asyncio.Event().wait()
+                yield StreamEvent(type="done", response=response)
+            finally:
+                stopped.set()
+
+    loop = AgentLoop(Provider([response]), [], model_timeout=1,
+                     model_idle_timeout=0.04, progress_interval=0.01)
+    with pytest.raises(ModelRequestError, match="空闲"):
+        await asyncio.wait_for(_collect_events(loop, [{"role": "user", "content": "静默流"}]), timeout=0.5)
+    assert stopped.is_set()
+
+
+@pytest.mark.asyncio
+async def test_active_model_stream_respects_finite_hard_limit_and_cancels_provider():
+    stopped = asyncio.Event()
+    response = ProviderResponse(content=[], stop_reason="end_turn")
+
+    class Provider(MockProvider):
+        async def stream_message(self, *arguments, **options):
+            try:
+                while True:
+                    yield StreamEvent(type="tool_input", tool_id="tool-1", text="{}")
+                    await asyncio.sleep(0.01)
+            finally:
+                stopped.set()
+
+    loop = AgentLoop(Provider([response]), [], model_timeout=0.08,
+                     model_idle_timeout=0.05, progress_interval=0.01)
+    with pytest.raises(ModelRequestError, match="总时限"):
+        await asyncio.wait_for(_collect_events(loop, [{"role": "user", "content": "持续流"}]), timeout=0.5)
+    assert stopped.is_set()
