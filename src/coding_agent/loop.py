@@ -40,7 +40,7 @@ from coding_agent.tools.registry import ToolRegistry
 from coding_agent.hooks.bus import Event, EventBus, EventType
 from coding_agent.security.permission import PermissionPipeline, Verdict
 from coding_agent.context.compaction import CompactionPipeline
-from coding_agent.context.recovery import RecoveryManager, RecoveryState
+from coding_agent.context.recovery import RecoveryManager, RecoveryState, is_model_request_failure
 from coding_agent.providers.base import ModelIdleTimeout, ModelRequestError, StreamEvent
 from coding_agent.providers.activity import RequestActivity, _current_request_activity
 
@@ -163,6 +163,7 @@ class AgentLoop:
         """
         self.recovery_state = RecoveryState(current_model=self.provider.model_id)
         text = ""
+        tool_outcomes: dict[tuple[str, str, bool], int] = {}
         for iteration in range(self.max_iterations):
             if self.compaction is not None:
                 async with aclosing(self.wait_events(
@@ -172,15 +173,26 @@ class AgentLoop:
                         yield event
             response = None
             prefix = text
-            async with aclosing(self._model_events(messages, stream)) as events:
-                async for ev in events:
-                    if ev.type == "text_delta":
-                        text += ev.text
-                        yield LoopEvent(type="text_delta", text=ev.text)
-                    elif ev.type == "done":
-                        response = ev.response
-                    elif ev.type == "warning":
-                        yield ev
+            try:
+                async with aclosing(self._model_events(messages, stream)) as events:
+                    async for ev in events:
+                        if ev.type == "text_delta":
+                            text += ev.text
+                            yield LoopEvent(type="text_delta", text=ev.text)
+                        elif ev.type == "done":
+                            response = ev.response
+                        elif ev.type == "warning":
+                            yield ev
+            except Exception as exc:
+                if not is_model_request_failure(exc):
+                    raise
+                delivery = self._request_failure_delivery(exc, tool_outcomes)
+                history_text = (f"模型中断前的未完成输出：\n{text}\n\n" if text else "") + delivery
+                messages.append({"role": "assistant", "content": [{"type": "text", "text": history_text}]})
+                yield LoopEvent(type="error", text=delivery, data={
+                    "failed": True, "failure_type": type(exc).__name__,
+                })
+                return
             if response is None:
                 raise RuntimeError("模型未返回完整响应")
 
@@ -216,10 +228,42 @@ class AgentLoop:
                                 "execution_id": execution_id, "agent": self.agent_name})
             async with aclosing(self._tool_events(messages, blocks, execution_ids)) as events:
                 async for event in events:
+                    if event.type == "tool_done":
+                        arguments = event.data.get("input")
+                        target = arguments.get("path", "") if isinstance(arguments, dict) else ""
+                        target = target if isinstance(target, str) else ""
+                        outcome = (event.tool_name, target, bool(event.data.get("is_error")))
+                        tool_outcomes[outcome] = tool_outcomes.get(outcome, 0) + 1
                     yield event
 
         async for event in self._finish_without_answer(messages, text, "max_iterations"):
             yield event
+
+    @staticmethod
+    def _request_failure_delivery(exc: Exception, tool_outcomes: dict[tuple[str, str, bool], int]) -> str:
+        if isinstance(exc, ModelRequestError):
+            reason = str(exc)
+        else:
+            status = getattr(exc, "status_code", None)
+            if isinstance(status, int):
+                reason = f"模型服务返回 HTTP {status}"
+            elif isinstance(exc, (ConnectionError, TimeoutError)):
+                reason = "模型服务连接或请求超时"
+            else:
+                reason = "模型服务 API 请求失败"
+
+        lines = [f"模型请求失败，本轮未完成。失败原因：{reason}"]
+        if tool_outcomes:
+            lines.append("本轮已记录的工具执行：")
+            lines.extend(
+                f"- {name}{f'（{target}）' if target else ''}："
+                f"{'执行失败' if failed else '执行成功'}（{count} 次）"
+                for (name, target, failed), count in sorted(tool_outcomes.items())
+            )
+        else:
+            lines.append("本轮没有已完成的工具执行。")
+        lines.append("未完成事项：模型没有确认任务结果，请核对上述执行记录后再判断是否完成。")
+        return "\n".join(lines)
 
     async def _finish_without_answer(self, messages: list[dict[str, Any]], text: str,
                                      reason: str) -> AsyncIterator[LoopEvent]:
@@ -392,7 +436,10 @@ class AgentLoop:
                     # 已显示的增量无法安全重放，避免重试后产生重复文本。
                     if isinstance(error, ModelIdleTimeout):
                         raise error from exc
-                    raise ModelRequestError("流式响应中断，已显示部分内容，未自动重放。请重试本轮请求。") from error
+                    if is_model_request_failure(error):
+                        raise ModelRequestError(
+                            "流式响应中断，已显示部分内容，未自动重放。请重试本轮请求。"
+                        ) from error
                 if error is not exc:
                     raise error from exc
                 raise

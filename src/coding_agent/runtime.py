@@ -258,12 +258,16 @@ class AgentRuntime:
                     yield event
             loop.system_prompt = self.system_prompt(self.registry, relevant)
             done = None
+            failed = False
             async with aclosing(loop.run(self.messages, stream=stream)) as events:
                 async for event in events:
                     if event.type == "done":
                         done = event
                     else:
+                        failed = failed or event.type == "error"
                         yield event
+            if failed:
+                return
             snapshot = [{"role": "user", "content": prompt}]
             if self.messages and self.messages[-1].get("role") == "assistant":
                 snapshot.append(self.messages[-1])
@@ -299,6 +303,8 @@ class AgentRuntime:
         async for event in loop.run(messages, stream=False):
             if event.type == "done":
                 final = event.text
+            elif event.type == "error":
+                final = "子任务模型请求失败，结果未确认：\n" + event.text
         return final
 
     async def _run_subagent(self, description: str, spec: SubagentSpec, max_turns: int) -> str:

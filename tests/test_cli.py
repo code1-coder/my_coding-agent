@@ -9,7 +9,7 @@ from click.testing import CliRunner
 
 from coding_agent.config import Config
 from coding_agent.memory import MemoryStore
-from coding_agent.providers.base import LLMProvider, ProviderResponse, StreamEvent
+from coding_agent.providers.base import LLMProvider, ModelRequestError, ProviderResponse, StreamEvent
 from coding_agent_cli import main
 
 
@@ -150,7 +150,7 @@ class LoopBoundProvider(LLMProvider):
         self.systems.append(system)
         self.history.append(deepcopy(messages))
         if self.fail:
-            raise RuntimeError("模拟请求失败")
+            raise ModelRequestError("模拟请求失败")
         text = "我叫李华。"
         yield StreamEvent(type="text_delta", text=text)
         yield StreamEvent(
@@ -227,10 +227,21 @@ def test_chat_closes_provider_on_quit_or_eof(provider, user_input):
 def test_chat_closes_provider_on_request_failure(provider):
     provider.fail = True
     result = CliRunner().invoke(main.cli, ["chat"], input="你好\n")
-    assert isinstance(result.exception, RuntimeError)
-    assert str(result.exception) == "模拟请求失败"
+    assert result.exit_code == 0, result.exception
+    assert "模拟请求失败" in result.output
+    assert "会话已保留" in result.output
     assert provider.closed
     assert provider.owner_loop.is_closed()
+
+
+def test_run_exits_nonzero_after_model_request_failure(provider):
+    provider.fail = True
+    result = CliRunner().invoke(main.cli, ["run", "执行任务"])
+    assert result.exit_code == 1
+    assert "模型请求失败" in result.output
+    assert "模拟请求失败" in result.output
+    assert "Traceback" not in result.output
+    assert provider.closed
 
 
 def test_chat_survives_exhausted_connection_failure(provider, monkeypatch):

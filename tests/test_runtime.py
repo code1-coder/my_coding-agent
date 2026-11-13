@@ -9,7 +9,7 @@ import pytest
 
 from coding_agent.config import Config
 from coding_agent.hooks.bus import EventBus, EventType
-from coding_agent.providers.base import LLMProvider, ProviderResponse, StreamEvent
+from coding_agent.providers.base import LLMProvider, ModelRequestError, ProviderResponse, StreamEvent
 from coding_agent.runtime import AgentRuntime
 
 
@@ -306,18 +306,65 @@ async def test_cancelling_turn_repairs_unmatched_tool_calls(tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_model_failure_after_tool_execution_is_delivered_and_skips_memory(tmp_path):
+    from unittest.mock import AsyncMock
+
+    provider = ScriptedProvider([
+        tool_response("write_file", {"path": "result.txt", "content": "written"}),
+        ModelRequestError("模型服务暂不可用"),
+    ])
+    async with AgentRuntime(Config(workdir=str(tmp_path)), provider=provider) as runtime:
+        runtime.memory.extract = AsyncMock(return_value=0)
+        events = await collect(runtime, "写入结果并总结")
+
+        assert any(event.type == "tool_done" and event.tool_name == "write_file"
+                   and not event.data["is_error"] for event in events)
+        failures = [event for event in events if event.type == "error"]
+        assert len(failures) == 1
+        assert "write_file" in failures[0].text
+        assert "执行成功" in failures[0].text
+        assert "模型服务暂不可用" in failures[0].text
+        assert not any(event.type == "done" for event in events)
+        runtime.memory.extract.assert_not_awaited()
+        assert (tmp_path / "result.txt").read_text(encoding="utf-8") == "written"
+        assert runtime.messages[-1]["role"] == "assistant"
+        assert not runtime.turn_lock.locked()
+
+        provider.responses.append(text_response("下一轮正常完成"))
+        next_events = await collect(runtime, "继续检查")
+        assert any(event.type == "done" and "下一轮正常完成" in event.text for event in next_events)
+
+
+@pytest.mark.asyncio
+async def test_child_runtime_returns_model_failure_instead_of_empty_success(tmp_path):
+    from coding_agent.tools.registry import ToolRegistry
+
+    provider = ScriptedProvider([ModelRequestError("模型服务暂不可用")])
+    async with AgentRuntime(Config(workdir=str(tmp_path)), provider=provider) as runtime:
+        result = await runtime.run_child(
+            [{"role": "user", "content": "执行子任务"}], "",
+            agent_name="worker", registry=ToolRegistry(), max_iterations=2,
+        )
+
+    assert "子任务模型请求失败" in result
+    assert "结果未确认" in result
+    assert "模型服务暂不可用" in result
+
+
+@pytest.mark.asyncio
 async def test_stream_failure_after_text_is_not_replayed(tmp_path):
     class InterruptedProvider(ScriptedProvider):
         async def stream_message(self, *args, **kwargs):
             yield StreamEvent(type="text_delta", text="已输出")
-            raise RuntimeError("429 rate limit")
+            raise ModelRequestError("模型响应连接中断")
 
     provider = InterruptedProvider()
     async with AgentRuntime(Config(workdir=str(tmp_path)), provider=provider) as runtime:
-        events = runtime.run_turn("测试")
-        assert (await anext(events)).text == "已输出"
-        with pytest.raises(RuntimeError, match="流式响应中断"):
-            await anext(events)
+        events = await collect(runtime, "测试")
+        assert [event.type for event in events] == ["text_delta", "error"]
+        assert events[0].text == "已输出"
+        assert "已显示部分内容，未自动重放" in events[-1].text
+        assert not any(event.type == "done" for event in events)
 
 
 @pytest.mark.asyncio

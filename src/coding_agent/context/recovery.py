@@ -148,6 +148,12 @@ def is_connection_error(exc: Exception) -> bool:
                             httpx.TransportError, ConnectionError, TimeoutError, IncompleteStreamError))
 
 
+def is_model_request_failure(exc: Exception) -> bool:
+    """识别可安全转为失败终态的模型请求异常，不包含程序缺陷和取消。"""
+    return isinstance(exc, (ModelRequestError, openai.APIError, anthropic.APIError,
+                            httpx.TransportError, ConnectionError, TimeoutError))
+
+
 async def with_retry(
     fn: LLMCall,
     state: RecoveryState,

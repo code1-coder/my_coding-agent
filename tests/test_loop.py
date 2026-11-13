@@ -314,6 +314,50 @@ async def test_final_response_without_stream_deltas_is_visible():
 
 
 @pytest.mark.asyncio
+async def test_model_request_failure_emits_failure_without_success_completion():
+    class FailingProvider(MockProvider):
+        async def create_message(self, *arguments, **options):
+            raise ModelRequestError("模型服务暂不可用")
+
+    messages = [{"role": "user", "content": "检查项目"}]
+    events = await _collect_events(AgentLoop(FailingProvider([]), []), messages)
+
+    assert [event.type for event in events] == ["error"]
+    assert events[0].data["failed"] is True
+    assert "模型服务暂不可用" in events[0].text
+    assert "本轮未完成" in events[0].text
+    assert not any(event.type == "done" for event in events)
+    assert messages[-1]["role"] == "assistant"
+    assert "模型请求失败" in messages[-1]["content"][0]["text"]
+
+
+@pytest.mark.asyncio
+async def test_unexpected_provider_bug_is_not_converted_to_request_failure():
+    class BuggyProvider(MockProvider):
+        async def create_message(self, *arguments, **options):
+            raise RuntimeError("provider programming bug")
+
+    with pytest.raises(RuntimeError, match="provider programming bug"):
+        await _collect_events(AgentLoop(BuggyProvider([]), []), [{"role": "user", "content": "检查"}])
+
+
+@pytest.mark.asyncio
+async def test_unexpected_provider_bug_after_partial_text_is_not_relabelled():
+    class BuggyProvider(MockProvider):
+        async def stream_message(self, *arguments, **options):
+            yield StreamEvent(type="text_delta", text="部分输出")
+            raise RuntimeError("provider programming bug")
+
+    events = []
+    loop = AgentLoop(BuggyProvider([]), [])
+    with pytest.raises(RuntimeError, match="provider programming bug"):
+        async for event in loop.run([{"role": "user", "content": "检查"}]):
+            events.append(event)
+    assert [event.text for event in events if event.type == "text_delta"] == ["部分输出"]
+    assert not any(event.type == "error" for event in events)
+
+
+@pytest.mark.asyncio
 async def test_cancelling_summary_propagates_without_fake_completion():
     started = asyncio.Event()
 
@@ -413,7 +457,6 @@ async def test_large_batch_reports_completed_tools_before_slow_tool_and_cleans_u
 @pytest.mark.parametrize("stream", [True, False])
 async def test_stalled_model_has_visible_progress_and_total_timeout(stream):
     from coding_agent.context.recovery import RecoveryManager
-    from coding_agent.providers.base import ModelRequestError
 
     cancelled = asyncio.Event()
 
@@ -430,12 +473,13 @@ async def test_stalled_model_has_visible_progress_and_total_timeout(stream):
                      recovery=RecoveryManager())
     events = loop.run([{"role": "user", "content": "开始"}], stream=stream)
     observed = []
-    with pytest.raises(ModelRequestError, match="已停止等待"):
-        async with asyncio.timeout(2):
-            async for event in events:
-                observed.append(event)
-    assert observed and all(event.type == "warning" for event in observed)
-    assert all(event.data["phase"] == "model" for event in observed)
+    async with asyncio.timeout(2):
+        async for event in events:
+            observed.append(event)
+    assert any(event.type == "warning" and event.data["phase"] == "model" for event in observed)
+    assert observed[-1].type == "error"
+    assert "已停止等待" in observed[-1].text
+    assert not any(event.type == "done" for event in observed)
     assert cancelled.is_set()
     assert provider.call_count == 1
 
@@ -545,8 +589,12 @@ async def test_idle_model_stream_stops_before_total_budget_and_cleans_up():
 
     loop = AgentLoop(Provider([response]), [], model_timeout=1,
                      model_idle_timeout=0.04, progress_interval=0.01)
-    with pytest.raises(ModelRequestError, match="空闲"):
-        await asyncio.wait_for(_collect_events(loop, [{"role": "user", "content": "静默流"}]), timeout=0.5)
+    events = await asyncio.wait_for(
+        _collect_events(loop, [{"role": "user", "content": "静默流"}]), timeout=0.5,
+    )
+    assert events[-1].type == "error"
+    assert "空闲" in events[-1].text
+    assert not any(event.type == "done" for event in events)
     assert stopped.is_set()
 
 
@@ -566,6 +614,10 @@ async def test_active_model_stream_respects_finite_hard_limit_and_cancels_provid
 
     loop = AgentLoop(Provider([response]), [], model_timeout=0.08,
                      model_idle_timeout=0.05, progress_interval=0.01)
-    with pytest.raises(ModelRequestError, match="总时限"):
-        await asyncio.wait_for(_collect_events(loop, [{"role": "user", "content": "持续流"}]), timeout=0.5)
+    events = await asyncio.wait_for(
+        _collect_events(loop, [{"role": "user", "content": "持续流"}]), timeout=0.5,
+    )
+    assert events[-1].type == "error"
+    assert "总时限" in events[-1].text
+    assert not any(event.type == "done" for event in events)
     assert stopped.is_set()

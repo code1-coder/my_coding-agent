@@ -172,19 +172,27 @@ def _print_event(event: LoopEvent, *, color: bool = True) -> None:
         click.echo(f"\n[记忆] 已保存 {event.data['count']} 条到 {event.data['path']}\n")
     elif event.type == "warning":
         click.echo("\n" + event.text, err=True)
+    elif event.type == "error":
+        click.echo("\n" + event.text + "\n本次失败，会话已保留，可继续输入。", err=True)
 
 
 async def _run_agent_loop(prompt: str, cfg: Config, *, stream: bool = True, color: bool = True) -> str:
     """单次任务也经过完整运行流程，并在退出前释放队友和客户端。"""
     runtime, _ = _create_runtime(cfg)
     final = ""
+    failure = None
     async with runtime:
         async with aclosing(runtime.run_turn(prompt, stream=stream)) as events:
             async for event in events:
+                if event.type == "error":
+                    failure = event.text
+                    continue
                 if stream or event.type != "text_delta":
                     _print_event(event, color=color)
                 if event.type == "done":
                     final = event.text
+    if failure:
+        raise click.ClickException(failure)
     return final
 
 

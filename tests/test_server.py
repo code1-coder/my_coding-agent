@@ -11,6 +11,7 @@ from fastapi.testclient import TestClient
 import coding_agent.server.app as server
 from coding_agent.config import Config
 from coding_agent.memory import MemoryStore
+from coding_agent.providers.base import ModelRequestError
 from test_runtime import ScriptedProvider, text_response, tool_response
 
 
@@ -103,6 +104,20 @@ def test_web_reports_model_errors_and_cleans_up(configured_server, monkeypatch):
     with TestClient(server.app) as client:
         response = client.post("/chat", json={"prompt": "你好"})
         assert decode_events(response)[-1] == {"type": "error", "message": "模拟模型请求失败"}
+    assert provider.closed
+
+
+def test_web_delivers_model_request_failure_without_success_done(configured_server, monkeypatch):
+    provider = ScriptedProvider([ModelRequestError("模型服务暂不可用")])
+    monkeypatch.setattr(server, "_get_provider", lambda _: provider)
+    with TestClient(server.app) as client:
+        events = decode_events(client.post("/chat", json={"prompt": "检查任务"}))
+
+    assert events[-1]["type"] == "error"
+    assert events[-1]["failed"] is True
+    assert events[-1]["message"] == events[-1]["text"]
+    assert "模型服务暂不可用" in events[-1]["message"]
+    assert not any(event["type"] == "done" for event in events)
     assert provider.closed
 
 

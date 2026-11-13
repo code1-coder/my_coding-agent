@@ -300,6 +300,8 @@ async def chat(request: Request):
                         payload = {"type": event.type, **event.data}
                         if event.text or event.type == "text_reset":
                             payload["text"] = event.text
+                        if event.type == "error":
+                            payload["message"] = event.text
                         if event.tool_name:
                             payload.update(tool_name=event.tool_name, tool_id=event.tool_id,
                                            output=event.tool_output[:4000])
