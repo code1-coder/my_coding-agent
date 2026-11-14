@@ -442,6 +442,26 @@ async def test_large_tool_output_is_persisted_in_actual_runtime(tmp_path):
         assert path.read_text(encoding="utf-8") == "x" * 40000
 
 
+@pytest.mark.asyncio
+async def test_runtime_keeps_persisted_output_reference_after_micro_compaction(tmp_path):
+    (tmp_path / "large.txt").write_text("evidence-" + "x" * 40000, encoding="utf-8")
+    provider = ScriptedProvider([
+        tool_response("read_file", {"path": "large.txt"}, "first-read"),
+        tool_response("read_file", {"path": "large.txt"}, "second-read"),
+        tool_response("read_file", {"path": "large.txt"}, "third-read"),
+        tool_response("read_file", {"path": "large.txt"}, "fourth-read"),
+        text_response(),
+    ])
+    async with AgentRuntime(Config(workdir=str(tmp_path)), provider=provider) as runtime:
+        await collect(runtime)
+        agent_calls = [call for call in provider.calls if call["tools"] is not None]
+        old_result = str(agent_calls[-1]["messages"])
+
+    assert "<persisted-output>" in old_result
+    assert ".task_outputs/tool-results/first-read.txt" in old_result
+    assert "完整结果已保存" in old_result
+
+
 @pytest.mark.parametrize("changes", [
     {"context_limit": 0}, {"max_messages": 2}, {"keep_recent": -1},
     {"max_iterations": False}, {"team_idle_timeout": -1}, {"mcp_servers": "docs"},

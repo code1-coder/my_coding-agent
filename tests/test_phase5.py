@@ -177,9 +177,11 @@ class TestPromptCompactIntegration:
         # 最近 3 条结果不应被压缩
         for i in range(7, 10):
             assert "earlier tool result compacted" not in msgs[i]["content"][0]["content"].lower()
-        # 前 7 条结果应被压缩
+        # 前 7 条结果应保留有限预览，不能诱导重跑
         for i in range(7):
-            assert "earlier tool result compacted" in msgs[i]["content"][0]["content"].lower()
+            content = msgs[i]["content"][0]["content"].lower()
+            assert "earlier result preview" in content
+            assert "re-run if needed" not in content
 
     def test_tool_result_budget_persists(self, tmp_path):
         """大型工具结果应持久化到文件，并降低估算的令牌数量。"""

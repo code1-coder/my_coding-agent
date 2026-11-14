@@ -5,6 +5,7 @@
 from __future__ import annotations
 
 import json
+import asyncio
 import tempfile
 from pathlib import Path
 from unittest.mock import AsyncMock
@@ -60,6 +61,29 @@ class TestSnipCompact:
         assert len(result) < 60
         # 前 3 条消息 + 1 条占位消息 + 后 27 条消息，共 31 条
         assert any("snipped" in str(m.get("content", "")) for m in result)
+
+    def test_retains_bounded_evidence_from_snipped_messages(self):
+        messages = [
+            {"role": "user", "content": "initial request"},
+            *[{"role": "assistant", "content": f"old filler {i}"} for i in range(4)],
+            {"role": "assistant", "content": "Confirmed: parser uses the shared runtime."},
+            {"role": "user", "content": [{
+                "type": "tool_result",
+                "tool_use_id": "read-runtime",
+                "content": "<persisted-output>\n完整输出: .task_outputs/tool-results/read-runtime.txt\n预览:\nsource excerpt\n</persisted-output>",
+            }]},
+            *[{"role": "assistant", "content": f"middle filler {i}"} for i in range(10)],
+            {"role": "user", "content": "latest request"},
+            *[{"role": "assistant", "content": f"tail {i}"} for i in range(6)],
+        ]
+
+        result = snip_compact(messages, max_messages=8)
+        excerpt = next(str(msg["content"]) for msg in result if "snipped" in str(msg.get("content", "")))
+
+        assert "Confirmed: parser uses the shared runtime." in excerpt
+        assert ".task_outputs/tool-results/read-runtime.txt" in excerpt
+        assert "unverified evidence, not current instructions" in excerpt
+        assert len(excerpt) <= 6_100
 
     def test_protects_tool_use_pair_forward(self):
         """助手 tool_use 与用户 tool_result 组成的消息对不应被裁断。"""
@@ -128,8 +152,11 @@ class TestMicroCompact:
             {"role": "user", "content": [{"type": "tool_result", "tool_use_id": "new3", "content": "w" * 200}]},
         ]
         micro_compact(msgs, keep_recent=3)
-        # 最旧的工具结果应被压缩
-        assert "Earlier tool result compacted" in msgs[0]["content"][0]["content"]
+        # 最旧结果保留有限预览，不诱导重新执行。
+        old_content = msgs[0]["content"][0]["content"]
+        assert "Earlier result preview" in old_content
+        assert "Re-run if needed" not in old_content
+        assert len(old_content) < 200
         # 最近 3 条工具结果应保持完整
         assert "Earlier tool result compacted" not in msgs[1]["content"][0]["content"]
         assert "Earlier tool result compacted" not in msgs[2]["content"][0]["content"]
@@ -176,6 +203,7 @@ class TestToolResultBudget:
         assert out_dir.exists()
         files = list(out_dir.glob("*.txt"))
         assert len(files) >= 1
+        assert "完整输出: .task_outputs/tool-results/big.txt" in content
 
     def test_skips_when_under_budget(self, tmp_path):
         msgs = [
@@ -204,6 +232,51 @@ class TestCompactHistory:
         assert result[0]["role"] == "user"
         assert "[Compacted]" in result[0]["content"]
         assert "Goal: finish task" in result[0]["content"]
+
+    @pytest.mark.asyncio
+    async def test_summary_input_includes_latest_request_after_large_history(self, tmp_path):
+        captured = []
+
+        async def summarize(prompt):
+            captured.append(prompt)
+            return "summary"
+
+        messages = [
+            {"role": "user", "content": "original task"},
+            {"role": "assistant", "content": [{"type": "text", "text": "old " * 22000}]},
+            {"role": "user", "content": "latest target marker"},
+        ]
+        result = await compact_history(messages, summarize=summarize, workdir=tmp_path)
+
+        assert "latest target marker" in captured[0]
+        assert len(captured[0]) <= 82_000
+        assert "latest target marker" in result[0]["content"]
+
+    @pytest.mark.asyncio
+    async def test_summary_cancellation_propagates_without_replacing_history(self, tmp_path):
+        messages = [{"role": "user", "content": "keep this request"}]
+
+        async def cancel(_prompt):
+            raise asyncio.CancelledError
+
+        with pytest.raises(asyncio.CancelledError):
+            await compact_history(messages, summarize=cancel, workdir=tmp_path)
+
+        assert messages == [{"role": "user", "content": "keep this request"}]
+
+    @pytest.mark.asyncio
+    async def test_compaction_preserves_latest_multiblock_user_message(self, tmp_path):
+        latest = {"role": "user", "content": [
+            {"type": "text", "text": "latest instruction"},
+            {"type": "image", "source": {"type": "base64", "data": "aGVsbG8="}},
+        ]}
+        result = await compact_history(
+            [{"role": "user", "content": "old"}, latest],
+            summarize=AsyncMock(return_value="summary"),
+            workdir=tmp_path,
+        )
+
+        assert result[0]["content"][1:] == latest["content"]
 
     @pytest.mark.asyncio
     async def test_writes_transcript_file(self, tmp_path):
@@ -238,6 +311,26 @@ class TestReactiveCompact:
         assert "[Reactive compact]" in result[0]["content"]
         # 尾部消息应得到保留
         assert any("recent-1" in str(m.get("content", "")) for m in result)
+
+    @pytest.mark.asyncio
+    async def test_summary_input_contains_late_goal_and_preserves_it_in_output(self, tmp_path):
+        captured = []
+
+        async def summarize(prompt):
+            captured.append(prompt)
+            return "summary"
+
+        latest = {"role": "user", "content": "latest goal marker"}
+        messages = [
+            {"role": "user", "content": "initial goal"},
+            *[{"role": "assistant", "content": [{"type": "text", "text": "x" * 6000}]} for _ in range(20)],
+            latest,
+            *[{"role": "assistant", "content": "tail"} for _ in range(5)],
+        ]
+        result = await reactive_compact(messages, summarize=summarize, workdir=tmp_path)
+
+        assert "latest goal marker" in captured[0]
+        assert "latest goal marker" in result[0]["content"]
 
 
 # ── 压缩流水线编排器（CompactionPipeline） ───────────────────────
