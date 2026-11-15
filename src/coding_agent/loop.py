@@ -47,6 +47,7 @@ from coding_agent.providers.activity import RequestActivity, _current_request_ac
 
 logger = logging.getLogger(__name__)
 _MAX_NO_PROGRESS_READ_ROUNDS = 3
+_MAX_REPEATED_TOOL_FAILURES = 3
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -166,6 +167,7 @@ class AgentLoop:
         self.recovery_state = RecoveryState(current_model=self.provider.model_id)
         text = ""
         tool_outcomes: dict[tuple[str, str, bool], int] = {}
+        tool_failure_streaks: dict[str, int] = {}
         no_progress_read_rounds = 0
         for iteration in range(self.max_iterations):
             if self.compaction is not None:
@@ -230,6 +232,7 @@ class AgentLoop:
                                 tool_id=block["id"], data={"input": block.get("input", {}),
                                 "execution_id": execution_id, "agent": self.agent_name})
             round_results = []
+            round_failures: list[tuple[str, str, str]] = []
             async with aclosing(self._tool_events(messages, blocks, execution_ids)) as events:
                 async for event in events:
                     if event.type == "tool_done":
@@ -238,9 +241,28 @@ class AgentLoop:
                         target = target if isinstance(target, str) else ""
                         outcome = (event.tool_name, target, bool(event.data.get("is_error")))
                         tool_outcomes[outcome] = tool_outcomes.get(outcome, 0) + 1
+                        if event.data.get("is_error"):
+                            round_failures.append((event.tool_name, target, event.tool_output))
                         round_results.append((event.tool_name, event.data.get("metadata", {}),
                                               bool(event.data.get("is_error"))))
                     yield event
+            round_tool_names = {name for name, _metadata, _failed in round_results}
+            for tool_name in round_tool_names:
+                failures = [failure for failure in round_failures if failure[0] == tool_name]
+                if failures:
+                    tool_failure_streaks[tool_name] = tool_failure_streaks.get(tool_name, 0) + len(failures)
+                else:
+                    tool_failure_streaks.pop(tool_name, None)
+                if tool_failure_streaks.get(tool_name, 0) >= _MAX_REPEATED_TOOL_FAILURES:
+                    _failed_tool, target, error = next(
+                        failure for failure in reversed(round_failures) if failure[0] == tool_name
+                    )
+                    async for event in self._finish_without_answer(
+                        messages, text, "repeated_tool_failure",
+                        failure=(tool_name, target, error),
+                    ):
+                        yield event
+                    return
             if (round_results and all(name == "read_file" and not failed
                                       and metadata.get("reused_from")
                                       for name, metadata, failed in round_results)):
@@ -282,15 +304,24 @@ class AgentLoop:
         return "\n".join(lines)
 
     async def _finish_without_answer(self, messages: list[dict[str, Any]], text: str,
-                                     reason: str) -> AsyncIterator[LoopEvent]:
+                                     reason: str, *,
+                                     failure: tuple[str, str, str] | None = None) -> AsyncIterator[LoopEvent]:
         """最多补充一次无工具总结；失败时明确告知缺少交付，不能静默结束。"""
         notices = {
             "max_iterations": "已达到本轮执行轮次上限，已停止继续调用工具；任务是否完成仍需依据执行结果确认。",
             "no_progress": "连续只读调用未产生新证据，已停止重复读取并根据已有结果整理结论。",
             "max_tokens": "模型输出达到长度上限，回答可能不完整。",
             "tool_use": "模型请求使用工具，但未提供有效工具调用。",
+            "repeated_tool_failure": (
+                f"工具 {failure[0]} 连续失败 {_MAX_REPEATED_TOOL_FAILURES} 次，已停止重复调用。"
+                if failure else "工具连续失败，已停止重复调用。"
+            ),
         }
         notice = notices.get(reason, "")
+        if failure:
+            tool_name, target, error = failure
+            notice += (f"\n最后一次失败：{tool_name}{f'（{target}）' if target else ''}：{error}"
+                       "\n请确认运行环境和目标路径后重试。")
         request_messages = list(messages)
         if request_messages and request_messages[-1].get("role") == "assistant":
             last_content = request_messages[-1].get("content")
@@ -307,20 +338,24 @@ class AgentLoop:
             "请使用用户的语言。" + notice
         )})
         answer = ""
-        try:
-            async with asyncio.timeout(self.final_answer_timeout), aclosing(
-                self._model_events(request_messages, False, final_only=True),
-            ) as events:
-                async for event in events:
-                    if event.type == "done":
-                        response = event.response
-                        if response.stop_reason == "end_turn" and not response.tool_use_blocks:
-                            answer = response.text.strip()
-                    elif event.type == "warning":
-                        yield event
-        except Exception:
-            logger.exception("补充最终答复失败")
-        generated = bool(answer)
+        generated = False
+        if reason == "repeated_tool_failure":
+            answer = "本轮未能完成文件检查，已停止继续尝试。请确认当前运行环境与目标路径可访问后重试。"
+        else:
+            try:
+                async with asyncio.timeout(self.final_answer_timeout), aclosing(
+                    self._model_events(request_messages, False, final_only=True),
+                ) as events:
+                    async for event in events:
+                        if event.type == "done":
+                            response = event.response
+                            if response.stop_reason == "end_turn" and not response.tool_use_blocks:
+                                answer = response.text.strip()
+                        elif event.type == "warning":
+                            yield event
+            except Exception:
+                logger.exception("补充最终答复失败")
+            generated = bool(answer)
         if not answer:
             answer = "未能自动生成本轮结果说明，不能确认任务已完整交付。请核对本轮工具执行记录与工作区改动。"
         delivery = "\n\n".join(part for part in (notice, answer) if part)
@@ -362,11 +397,14 @@ class AgentLoop:
                 completed, pending = await asyncio.wait(
                     pending, timeout=self.progress_interval, return_when=asyncio.FIRST_COMPLETED,
                 )
-                if not completed:
+                waiting_tasks = [task for task in pending if not (
+                    self.permissions and self.permissions.is_waiting_for_approval(task))]
+                if not completed and waiting_tasks:
                     waiting = [{"tool_name": blocks[indexes[task]]["name"],
-                                "tool_id": blocks[indexes[task]]["id"]} for task in tasks if task in pending]
+                                "tool_id": blocks[indexes[task]]["id"]} for task in tasks
+                               if task in waiting_tasks]
                     labels = ", ".join(f"{item['tool_name']} ({item['tool_id']})" for item in waiting[:5])
-                    yield LoopEvent(type="warning", text=f"仍在等待 {len(pending)} 个工具：{labels}；可取消当前请求。",
+                    yield LoopEvent(type="warning", text=f"仍在等待 {len(waiting_tasks)} 个工具：{labels}；可取消当前请求。",
                                     data={"phase": "tools", "pending_tools": waiting, "agent": self.agent_name})
                 for task in sorted(completed, key=indexes.__getitem__):
                     index = indexes[task]
@@ -616,13 +654,17 @@ class AgentLoop:
                                       params=tool_input, tool_id=tool_id, execution_id=execution_id)
             if blocked is not None:
                 raise PermissionError(f"工具被 Hook 阻止：{blocked}")
-            if self.permissions is not None:
-                verdict, reason = await self.permissions.check(tool_name, tool_input)
-                if verdict != Verdict.ALLOW:
-                    raise PermissionError(reason)
-            result = await self._reuse_read_result(messages, block, tool_id)
-            if result is None:
-                result = await self.registry.dispatch(tool_name, tool_input, tool_use_id=tool_id)
+            if self.permissions is None:
+                result = await self._reuse_read_result(messages, block, tool_id)
+                if result is None:
+                    result = await self.registry.dispatch(tool_name, tool_input, tool_use_id=tool_id)
+            else:
+                async with self.permissions.authorize(tool_name, tool_input) as (verdict, reason):
+                    if verdict != Verdict.ALLOW:
+                        raise PermissionError(reason)
+                    result = await self._reuse_read_result(messages, block, tool_id)
+                    if result is None:
+                        result = await self.registry.dispatch(tool_name, tool_input, tool_use_id=tool_id)
             output, error = result.content, result.error
             execution = result.execution
             metadata = result.metadata

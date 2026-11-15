@@ -364,11 +364,13 @@ class BashTool(Tool):
 class ReadFileTool(Tool):
     name = "read_file"
     repeat_policy = "fresh_read"
-    description = "读取 UTF-8 文件；start_line/end_line 为从 1 开始的闭区间。分段读取默认展示行号，limit 可限制行数。"
+    description = ("读取工作区内或经用户批准的工作区外 UTF-8 文件；path 可使用相对路径、"
+                   "当前宿主机绝对路径或 WSL 中可访问的 Windows 盘符路径。"
+                   "start_line/end_line 为从 1 开始的闭区间；limit 可限制行数。")
     input_schema = {
         "type": "object",
         "properties": {
-            "path": {"type": "string", "description": "文件的相对路径。"},
+            "path": {"type": "string", "description": "相对路径、宿主机绝对路径，或 WSL 可访问的 Windows 盘符路径。"},
             "limit": {"type": "integer", "description": "最大返回行数（可选）。"},
             "start_line": {"type": "integer", "minimum": 1},
             "end_line": {"type": "integer", "minimum": 1},
@@ -381,14 +383,17 @@ class ReadFileTool(Tool):
         self._workdir = Path(workdir) if workdir else Path.cwd()
 
     def repeat_key(self, arguments: dict[str, Any]) -> str | None:
-        path = _safe_path(self._workdir, arguments["path"])
+        from coding_agent.security.permission import approved_read_path
+
+        path = approved_read_path(self._workdir, arguments["path"])
         start_line = arguments.get("start_line")
         end_line = arguments.get("end_line")
         show_line_numbers = arguments.get("show_line_numbers")
         numbered = show_line_numbers if show_line_numbers is not None else (
             start_line is not None or end_line is not None)
         normalized = {
-            "path": path.relative_to(self._workdir.resolve()).as_posix(),
+            "path": (path.relative_to(self._workdir.resolve()).as_posix()
+                      if path.is_relative_to(self._workdir.resolve()) else str(path)),
             "limit": arguments.get("limit"),
             "start_line": start_line if start_line is not None else 1,
             "end_line": end_line,
@@ -397,7 +402,9 @@ class ReadFileTool(Tool):
         return json.dumps(normalized, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
 
     def freshness_token(self, arguments: dict[str, Any]) -> str:
-        path = _safe_path(self._workdir, arguments["path"])
+        from coding_agent.security.permission import approved_read_path
+
+        path = approved_read_path(self._workdir, arguments["path"])
         return hashlib.sha256(path.read_bytes()).hexdigest()
 
     def _read_file(self, path: str, limit: int | None = None, start_line: int | None = None,
@@ -409,7 +416,9 @@ class ReadFileTool(Tool):
         first = start_line or 1
         if end_line is not None and end_line < first:
             raise ValueError("end_line must be >= start_line")
-        file_path = _safe_path(self._workdir, path)
+        from coding_agent.security.permission import approved_read_path
+
+        file_path = approved_read_path(self._workdir, path)
         source = file_path.read_bytes()
         lines = source.decode("utf-8", errors="replace").splitlines()
         if first > len(lines) and first != 1:
@@ -443,7 +452,7 @@ class ReadFileTool(Tool):
                 self._read_file, path, limit, start_line, end_line, show_line_numbers,
             )
         except (OSError, ValueError) as exc:
-            return ToolResult(tool_use_id="", content=f"Error: {exc}")
+            return ToolResult(tool_use_id="", error=f"Error: {exc}")
         return ToolResult(tool_use_id="", content=output, metadata=metadata)
 
     def execute(self, path: str, limit: int | None = None, start_line: int | None = None,
@@ -455,7 +464,7 @@ class ReadFileTool(Tool):
         try:
             output, _metadata = self._read_file(path, limit, start_line, end_line, show_line_numbers)
             return output
-        except Exception as exc:
+        except (OSError, ValueError) as exc:
             return f"Error: {exc}"
 
 

@@ -75,6 +75,15 @@ def assemble_system_prompt(context: dict[str, Any]) -> str:
     if tools:
         names = ", ".join(tools)
         sections.append(f"Available tools: {names}.")
+        if "read_file" in tools:
+            sections.append(
+                "When the user provides a file path or asks to inspect a file, use read_file with the exact path first; "
+                "do not use bash or shell-specific commands such as Get-Content, type, cat, pwd, or ls to read it. "
+                "read_file accepts relative paths, host absolute paths, and accessible Windows drive paths under WSL; "
+                "an external path requires approval. The shell runs in the agent host environment, which may differ "
+                "from the user's interactive shell. After a tool error, do not repeat an equivalent failed command; "
+                "switch to the matching tool or explain the environment limitation."
+            )
         if "search_code" in tools:
             sections.append(
                 "Coding workflow: inspect git_status/git_diff before editing. Locate code with search_code "

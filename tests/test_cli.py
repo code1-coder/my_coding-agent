@@ -191,6 +191,31 @@ def test_chat_preserves_loop_and_history_across_turns(provider):
     assert provider.owner_loop.is_closed()
 
 
+def test_chat_completes_approved_external_file_read(tmp_path, monkeypatch):
+    from test_runtime import ScriptedProvider, text_response, tool_response
+
+    external_file = tmp_path.parent / f"{tmp_path.name}-outside.md"
+    external_file.write_text("外部文件内容", encoding="utf-8")
+    provider = ScriptedProvider([
+        tool_response("read_file", {"path": str(external_file)}, "external-read"),
+        text_response("已查看外部文件"),
+    ])
+    cfg = Config(workdir=str(tmp_path))
+    approvals = []
+    monkeypatch.setattr(main, "load_config", lambda _: cfg)
+    monkeypatch.setattr(main, "_build_provider", lambda _: provider)
+    monkeypatch.setattr(main.click, "confirm", lambda *args, **kwargs: approvals.append(True) or True)
+
+    result = CliRunner().invoke(main.cli, ["chat"], input="查看外部文件\nexit\n")
+
+    assert result.exit_code == 0, result.exception
+    assert len(approvals) == 1
+    assert "已查看外部文件" in result.output
+    assert "[工具失败]" not in result.output
+    assert "仍在等待" not in result.output
+    assert provider.closed
+
+
 @pytest.mark.parametrize("mode", ["run", "chat", "limit"])
 def test_cli_delivers_result_after_real_file_write(tmp_path, monkeypatch, mode):
     from test_runtime import ScriptedProvider, text_response, tool_response

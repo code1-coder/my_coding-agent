@@ -34,6 +34,12 @@ class TestSystemPrompt:
         assert "bash" in result
         assert "read_file" in result
 
+    def test_file_paths_prefer_read_tool_over_shell_commands(self):
+        result = assemble_system_prompt({"enabled_tools": ["bash", "read_file"]})
+        assert "use read_file with the exact path first" in result
+        assert "do not use bash" in result
+        assert "host absolute paths" in result
+
     def test_workspace_injected(self):
         ctx = {"workspace": "/home/user/project"}
         result = assemble_system_prompt(ctx)

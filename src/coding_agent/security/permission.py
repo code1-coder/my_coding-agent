@@ -26,11 +26,15 @@ Deny-list 模式从 YAML 文件加载（见 ``DenyListChecker.from_yaml``）
 from __future__ import annotations
 
 import asyncio
+from contextlib import asynccontextmanager
+from contextvars import ContextVar, Token
 import logging
+import os
+import re
 from abc import ABC, abstractmethod
 from enum import Enum
-from pathlib import Path
-from typing import Any, Callable, Awaitable
+from pathlib import Path, PureWindowsPath
+from typing import Any, AsyncIterator, Awaitable, Callable
 
 try:
     import yaml
@@ -38,6 +42,51 @@ except ImportError:
     yaml = None  # type: ignore[assignment]
 
 logger = logging.getLogger(__name__)
+_approved_external_read: ContextVar[tuple[Path, Path] | None] = ContextVar(
+    "approved_external_read", default=None,
+)
+_WINDOWS_DRIVE_PATH = re.compile(r"^([a-zA-Z]):[\\/]")
+
+
+def _wsl_drive_mount(drive: str) -> Path:
+    return Path("/mnt") / drive.lower()
+
+
+def _resolve_wsl_drive_path(path_text: str) -> Path:
+    windows_path = PureWindowsPath(path_text)
+    mount = _wsl_drive_mount(windows_path.drive[0])
+    if not mount.is_dir():
+        raise ValueError(
+            f"当前运行环境无法访问 Windows 盘符 {windows_path.drive[0]}:；"
+            f"未找到挂载目录 {mount}"
+        )
+    return mount.joinpath(*windows_path.parts[1:]).resolve()
+
+
+def resolve_read_path(workdir: Path, requested_path: str) -> Path:
+    """解析当前宿主机可访问的相对、绝对或 WSL Windows 盘符路径。"""
+    if not isinstance(requested_path, str) or not requested_path.strip():
+        raise ValueError("文件路径不能为空")
+
+    path_text = requested_path.strip()
+    drive_match = _WINDOWS_DRIVE_PATH.match(path_text)
+    if drive_match and os.name != "nt":
+        return _resolve_wsl_drive_path(path_text)
+    else:
+        path = Path(path_text)
+
+    return path.resolve() if path.is_absolute() else (workdir / path).resolve()
+
+
+def approved_read_path(workdir: Path, relative_path: str) -> Path:
+    """解析读取路径；工作区外仅允许当前审批上下文中的精确文件。"""
+    resolved_workdir = workdir.resolve()
+    resolved_path = resolve_read_path(resolved_workdir, relative_path)
+    if resolved_path.is_relative_to(resolved_workdir):
+        return resolved_path
+    if _approved_external_read.get() == (resolved_workdir, resolved_path):
+        return resolved_path
+    raise ValueError(f"路径逃逸工作区: {relative_path}")
 
 
 # ---------------------------------------------------------------------------
@@ -182,13 +231,16 @@ class WorkspaceChecker(BasePermissionChecker):
 
         rel = params.get("path") or "."
         try:
-            resolved = (self.workdir / rel).resolve()
-        except (OSError, ValueError):
+            resolved = (resolve_read_path(self.workdir, rel) if tool_name == "read_file"
+                        else (self.workdir / rel).resolve())
+        except (OSError, ValueError) as exc:
+            if tool_name == "read_file":
+                return Verdict.DENY, f"File path is not accessible from this runtime: {rel}: {exc}"
             return Verdict.NEEDS_APPROVAL, f"Invalid path: {rel}"
 
         if not resolved.is_relative_to(self.workdir):
             msg = f"Access outside workspace: {rel}"
-            logger.warning("WorkspaceChecker flagged: %s", msg)
+            logger.debug("WorkspaceChecker flagged: %s", msg)
             return Verdict.NEEDS_APPROVAL, msg
 
         return Verdict.ALLOW, ""
@@ -257,6 +309,10 @@ class PermissionPipeline:
     ) -> None:
         self.checkers: list[BasePermissionChecker] = checkers or []
         self.approval_handler = approval_handler
+        self._approval_tasks: set[asyncio.Task] = set()
+
+    def is_waiting_for_approval(self, task: asyncio.Task) -> bool:
+        return task in self._approval_tasks
 
     def add_checker(self, checker: BasePermissionChecker) -> None:
         """将检查器追加到链尾。"""
@@ -267,17 +323,43 @@ class PermissionPipeline:
         tool_name: str,
         params: dict[str, Any],
     ) -> tuple[Verdict, str]:
+        verdict, reason, _grant = await self._evaluate(tool_name, params)
+        return verdict, reason
+
+    @asynccontextmanager
+    async def authorize(
+        self,
+        tool_name: str,
+        params: dict[str, Any],
+    ) -> AsyncIterator[tuple[Verdict, str]]:
+        """把审批授权限制在一次工具调用和一个精确外部读取路径内。"""
+        verdict, reason, grant = await self._evaluate(tool_name, params)
+        token: Token[tuple[Path, Path] | None] | None = None
+        if verdict == Verdict.ALLOW and grant is not None:
+            token = _approved_external_read.set(grant)
+        try:
+            yield verdict, reason
+        finally:
+            if token is not None:
+                _approved_external_read.reset(token)
+
+    async def _evaluate(
+        self,
+        tool_name: str,
+        params: dict[str, Any],
+    ) -> tuple[Verdict, str, tuple[Path, Path] | None]:
         """运行权限管线。
 
         返回:
             ``(Verdict, reason)`` —— 第一个非 ALLOW 的裁决，
             或 ``(ALLOW, "")`` 如果所有检查器通过。
         """
+        approved_read: tuple[Path, Path] | None = None
         for checker in self.checkers:
             verdict, reason = await checker.check(tool_name, params)
 
             if verdict == Verdict.DENY:
-                return verdict, reason
+                return verdict, reason, None
 
             if verdict == Verdict.NEEDS_APPROVAL:
                 if self.approval_handler is None:
@@ -286,14 +368,27 @@ class PermissionPipeline:
                         "%s 需要审批但未配置 approval_handler —— 拒绝",
                         tool_name,
                     )
-                    return Verdict.DENY, f"Approval required but no handler: {reason}"
+                    return Verdict.DENY, f"Approval required but no handler: {reason}", None
 
-                approved = await self.approval_handler(tool_name, params, reason)
+                current_task = asyncio.current_task()
+                if current_task is not None:
+                    self._approval_tasks.add(current_task)
+                try:
+                    approved = await self.approval_handler(tool_name, params, reason)
+                finally:
+                    if current_task is not None:
+                        self._approval_tasks.discard(current_task)
                 if not approved:
-                    return Verdict.DENY, f"Permission denied by user: {reason}"
+                    return Verdict.DENY, f"Permission denied by user: {reason}", None
+                if tool_name == "read_file" and isinstance(checker, WorkspaceChecker):
+                    path = params.get("path")
+                    if isinstance(path, str):
+                        resolved_path = resolve_read_path(checker.workdir, path)
+                        if not resolved_path.is_relative_to(checker.workdir):
+                            approved_read = (checker.workdir, resolved_path)
                 # 用户同意 —— 继续走链中后续检查器
 
-        return Verdict.ALLOW, ""
+        return Verdict.ALLOW, "", approved_read
 
 
 # ---------------------------------------------------------------------------

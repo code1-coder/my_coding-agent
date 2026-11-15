@@ -8,7 +8,7 @@ import sys
 import pytest
 
 from coding_agent.agents.subagent import AgentPool
-from coding_agent.security.permission import Verdict, WorkspaceChecker
+from coding_agent.security.permission import Verdict, WorkspaceChecker, resolve_read_path
 from coding_agent.tools import (
     ApplyPatchTool, BashTool, CodeOutlineTool, GitDiffTool, GitStatusTool, ReadFileTool, SearchCodeTool,
 )
@@ -393,6 +393,37 @@ def test_read_file_segments_and_legacy_output(tmp_path):
                       {"start_line": 3, "end_line": 2}):
         assert tool.execute("source.py", **arguments).startswith("Error:")
     assert tool.execute("../outside").startswith("Error:")
+
+
+def test_read_path_resolves_host_absolute_path(tmp_path):
+    workdir = tmp_path / "workspace"
+    workdir.mkdir()
+    external_file = tmp_path / "outside.md"
+    external_file.write_text("outside", encoding="utf-8")
+    assert resolve_read_path(workdir, str(external_file)) == external_file.resolve()
+
+
+def test_read_path_maps_windows_drive_path_to_wsl_mount(tmp_path, monkeypatch):
+    from coding_agent.security.permission import _resolve_wsl_drive_path
+
+    mount = tmp_path / "drive-c"
+    external_file = mount / "Users" / "wang" / "Desktop" / "report.md"
+    external_file.parent.mkdir(parents=True)
+    external_file.write_text("mounted", encoding="utf-8")
+    monkeypatch.setattr("coding_agent.security.permission._wsl_drive_mount", lambda _drive: mount)
+
+    resolved = _resolve_wsl_drive_path(r"C:\Users\wang\Desktop\report.md")
+
+    assert resolved == external_file.resolve()
+
+
+def test_wsl_drive_path_rejects_unmounted_drive(tmp_path, monkeypatch):
+    from coding_agent.security.permission import _resolve_wsl_drive_path
+
+    monkeypatch.setattr("coding_agent.security.permission._wsl_drive_mount", lambda _drive: tmp_path / "missing")
+
+    with pytest.raises(ValueError, match="无法访问 Windows 盘符 C:"):
+        _resolve_wsl_drive_path(r"C:\Users\wang\Desktop\report.md")
 
 
 @pytest.mark.skipif(shutil.which("rg") is None, reason="requires ripgrep")

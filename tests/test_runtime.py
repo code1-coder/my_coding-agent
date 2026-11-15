@@ -147,6 +147,101 @@ async def test_runtime_blocks_tools_before_any_side_effect(tmp_path, blocked_by)
 
 
 @pytest.mark.asyncio
+async def test_runtime_reads_external_file_after_explicit_approval(tmp_path):
+    external_file = tmp_path.parent / f"{tmp_path.name}-approved.md"
+    external_file.write_text("审批后可读取", encoding="utf-8")
+    provider = ScriptedProvider([
+        tool_response("read_file", {"path": str(external_file)}, "external-read"),
+        text_response("已读取"),
+    ])
+    approvals = []
+    approval_pending = False
+    warnings_during_approval = []
+
+    async def approve(tool_name, params, reason):
+        nonlocal approval_pending
+        approvals.append((tool_name, params, reason))
+        approval_pending = True
+        try:
+            await asyncio.sleep(0.15)
+            return True
+        finally:
+            approval_pending = False
+
+    async with AgentRuntime(Config(workdir=str(tmp_path), progress_interval=0.05), provider=provider) as runtime:
+        runtime.permissions.approval_handler = approve
+        async def run_and_observe():
+            observed = []
+            async for event in runtime.run_turn("开始"):
+                observed.append(event)
+                if approval_pending and event.type == "warning":
+                    warnings_during_approval.append(event.text)
+            return observed
+
+        events = await asyncio.wait_for(run_and_observe(), timeout=2)
+        result = runtime.messages[2]["content"][0]
+        assert result["content"] == "审批后可读取"
+        assert not result.get("is_error")
+        assert events[-1].type == "done"
+        assert warnings_during_approval == []
+        assert len(approvals) == 1
+        assert approvals[0][0] == "read_file"
+        reused_grant = await runtime.registry.dispatch("read_file", {"path": str(external_file)})
+        assert reused_grant.error and "路径逃逸工作区" in reused_grant.error
+
+
+@pytest.mark.asyncio
+async def test_runtime_finishes_external_read_when_approval_is_rejected(tmp_path):
+    external_file = tmp_path.parent / f"{tmp_path.name}-rejected.md"
+    external_file.write_text("不可读取", encoding="utf-8")
+    provider = ScriptedProvider([
+        tool_response("read_file", {"path": str(external_file)}, "external-read"),
+        text_response("已说明无法读取"),
+    ])
+
+    async def reject(_tool_name, _params, _reason):
+        return False
+
+    async with AgentRuntime(Config(workdir=str(tmp_path)), provider=provider) as runtime:
+        runtime.permissions.approval_handler = reject
+        events = await asyncio.wait_for(collect(runtime), timeout=2)
+        result = runtime.messages[2]["content"][0]
+        assert result["is_error"] is True
+        assert "Permission denied by user" in result["content"]
+        assert "不可读取" not in result["content"]
+        assert events[-1].type == "done"
+
+
+@pytest.mark.asyncio
+async def test_runtime_stops_after_repeated_shell_failures(tmp_path):
+    def handle(messages, tools, system):
+        if tools == []:
+            return text_response("无法访问用户指定的文件路径。")
+        calls = [block for message in messages if message.get("role") == "assistant"
+                 for block in message.get("content", [])
+                 if isinstance(block, dict) and block.get("type") == "tool_use"]
+        return tool_response("bash", {"command": f"unsupported-command-{len(calls)}"},
+                             f"shell-{len(calls)}")
+
+    provider = ScriptedProvider(handler=handle)
+    async with AgentRuntime(Config(workdir=str(tmp_path)), provider=provider) as runtime:
+        from coding_agent.tools.base import ToolResult
+
+        runtime.registry.register_handler(
+            {"name": "bash", "description": "", "input_schema": {"type": "object"}},
+            lambda command: ToolResult("", error=f"Error: unsupported shell command: {command}"),
+        )
+        events = await asyncio.wait_for(collect(runtime), timeout=2)
+        model_calls = [call for call in provider.calls if call["tools"] is not None]
+        assert len(model_calls) == 3
+        assert events[-1].type == "done"
+        assert events[-1].data["stop_reason"] == "repeated_tool_failure"
+        assert "bash" in events[-1].text
+        assert "unsupported shell command" in events[-1].text
+        assert "停止重复调用" in events[-1].text
+
+
+@pytest.mark.asyncio
 async def test_runtime_applies_output_hook_and_prevents_prompt_call(tmp_path):
     from coding_agent.hooks.bus import OutputTruncateHook
 

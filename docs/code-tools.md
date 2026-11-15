@@ -30,6 +30,10 @@ CLI 的 chat 和 run 会在工具开始时显示文件路径；分段读取同�
 | git_diff | path="src", staged=false, stat=false, context_lines=3 | 默认未暂存；staged=true 查看暂存，stat=true 查看统计；路径为字面量；不显示未跟踪文件内容 |
 | apply_patch | patch="补丁文本" | 新增、精确上下文更新、移动及删除；JSON 参数需要正确编码换行 |
 
+read_file 可接收相对路径、当前宿主机绝对路径；WSL 环境也接受映射到 /mnt/<drive> 的 Windows 盘符路径。工作区外路径仍须逐次审批，授权只对本次读取和目标文件有效。目标盘符未挂载时明确拒绝，不进入审批等待。用户给出文件路径或要求查看文件时，系统提示要求优先调用 read_file，不使用与当前宿主机不匹配的 Shell 命令读取。
+
+工具失败会作为错误结果传回模型；同一种工具连续失败 3 次后停止重复请求，直接交付最后错误和环境排查提示，避免模型在无效 Shell 命令上持续循环。成功执行该工具会清除对应失败计数。
+
 search_code 需要 PATH 中存在 ripgrep (rg)，Git 工具需要 Git。未安装时返回明确错误；无需新增 Python 依赖。搜索遵循 ripgrep 默认忽略规则，目录遍历不跟随符号链接。文件大小限制 2 MiB，匹配行最长展示 2000 字符；最多 1000 行结果，原始搜索输出最多读取 2 MB。Git 输出最多 50000 字节。命令默认超时 120 秒；BashTool 可通过 timeout_seconds 调整超时时间。超时、启动失败、空命令和非零退出都会返回结构化失败结果，并保留 stdout、stderr、duration_ms、timed_out、cancelled、truncated 和 failure_stage 字段。结果截断时缩小路径或搜索范围。
 
 BashTool 的异步入口直接管理子进程。取消时先终止进程树、回收输出和进程，再传播取消异常；工具结束事件中的 cancelled=true、termination_confirmed=true 表示终止已确认，failure_stage=cancelled。超时也使用相同清理流程。清理失败时 termination_confirmed=false、cancelled=false，failure_stage 为 cleanup 或 supervision，不将取消请求已收到当作进程已停止；启动前失败时 termination_confirmed=null。同步 execute 复用相同执行逻辑，异步调用方应使用 aexecute，避免阻塞事件循环。
