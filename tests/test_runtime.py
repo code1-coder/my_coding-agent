@@ -166,6 +166,227 @@ async def test_runtime_applies_output_hook_and_prevents_prompt_call(tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_runtime_reuses_unchanged_read_result_without_repeating_full_output(tmp_path):
+    source = tmp_path / "note.txt"
+    source.write_text("证据内容" * 30, encoding="utf-8")
+    provider = ScriptedProvider([
+        tool_response("read_file", {"path": "note.txt"}, "read-first"),
+        tool_response("read_file", {"path": "note.txt"}, "read-again"),
+        text_response("证据已核对"),
+    ])
+    bus = EventBus()
+    observed = []
+
+    async def record(event):
+        observed.append((event.type, event.data.get("tool_id"), event.data.get("reused_result")))
+
+    bus.subscribe(EventType.PRE_TOOL_USE, record)
+    bus.subscribe(EventType.POST_TOOL_USE, record)
+    async with AgentRuntime(Config(workdir=str(tmp_path)), provider=provider, event_bus=bus) as runtime:
+        await collect(runtime, "检查 note.txt")
+        first_result = runtime.messages[2]["content"][0]["content"]
+        repeated_result = runtime.messages[4]["content"][0]["content"]
+        assert first_result == "证据内容" * 30
+        assert "read-first" in repeated_result
+        assert "与当前文件内容一致" in repeated_result
+        assert len(repeated_result) < len(first_result)
+        assert sum(item[0] == EventType.PRE_TOOL_USE for item in observed) == 2
+        assert sum(item[0] == EventType.POST_TOOL_USE for item in observed) == 2
+        assert observed[-1][2] is True
+        assert "metadata" not in provider.calls[1]["messages"][2]["content"][0]
+
+
+@pytest.mark.asyncio
+async def test_runtime_does_not_reuse_different_read_ranges(tmp_path):
+    (tmp_path / "note.txt").write_text("first\nsecond\n", encoding="utf-8")
+    provider = ScriptedProvider([
+        tool_response("read_file", {"path": "note.txt", "start_line": 1, "end_line": 1}, "line-one"),
+        tool_response("read_file", {"path": "note.txt", "start_line": 2, "end_line": 2}, "line-two"),
+        text_response(),
+    ])
+    async with AgentRuntime(Config(workdir=str(tmp_path)), provider=provider) as runtime:
+        await collect(runtime)
+        results = [message["content"][0]["content"] for message in runtime.messages
+                   if message.get("role") == "user" and isinstance(message.get("content"), list)
+                   and message["content"] and message["content"][0].get("type") == "tool_result"]
+        assert results[0].startswith("1: first\n")
+        assert results[1] == "2: second"
+        assert all("reused_from" not in result.get("metadata", {}) for message in runtime.messages
+                   if isinstance(message.get("content"), list) for result in message["content"]
+                   if isinstance(result, dict) and result.get("type") == "tool_result")
+
+
+@pytest.mark.asyncio
+async def test_runtime_does_not_reuse_hook_truncated_read_result(tmp_path):
+    from coding_agent.hooks.bus import OutputTruncateHook
+
+    (tmp_path / "note.txt").write_text("长内容" * 100, encoding="utf-8")
+    provider = ScriptedProvider([
+        tool_response("read_file", {"path": "note.txt"}, "truncated-first"),
+        tool_response("read_file", {"path": "note.txt"}, "truncated-again"),
+        text_response(),
+    ])
+    observed = []
+
+    async def record(event):
+        observed.append(event.data.get("reused_result"))
+
+    bus = EventBus()
+    bus.subscribe(EventType.POST_TOOL_USE, OutputTruncateHook(max_chars=20, truncate=True), priority=10)
+    bus.subscribe(EventType.POST_TOOL_USE, record)
+    async with AgentRuntime(Config(workdir=str(tmp_path)), provider=provider, event_bus=bus) as runtime:
+        await collect(runtime)
+        assert observed == [False, False]
+        assert all("truncated at 20" in message["content"][0]["content"]
+                   for message in runtime.messages if message.get("role") == "user"
+                   and isinstance(message.get("content"), list)
+                   and message["content"] and message["content"][0].get("type") == "tool_result")
+
+
+@pytest.mark.asyncio
+async def test_runtime_never_reuses_repeated_write_tools(tmp_path):
+    provider = ScriptedProvider([
+        tool_response("write_file", {"path": "note.txt", "content": "value"}, "write-first"),
+        tool_response("write_file", {"path": "note.txt", "content": "value"}, "write-again"),
+        text_response(),
+    ])
+    post_calls = []
+
+    async def record(event):
+        post_calls.append(event.data["tool_name"])
+
+    bus = EventBus()
+    bus.subscribe(EventType.POST_TOOL_USE, record)
+    async with AgentRuntime(Config(workdir=str(tmp_path)), provider=provider, event_bus=bus) as runtime:
+        await collect(runtime)
+        assert (tmp_path / "note.txt").read_text(encoding="utf-8") == "value"
+        assert post_calls == ["write_file", "write_file"]
+        assert all(not result.get("metadata", {}).get("reused_from")
+                   for message in runtime.messages if isinstance(message.get("content"), list)
+                   for result in message["content"] if isinstance(result, dict)
+                   and result.get("type") == "tool_result")
+
+
+@pytest.mark.asyncio
+async def test_runtime_rereads_file_when_contents_change_between_calls(tmp_path):
+    source = tmp_path / "note.txt"
+    source.write_text("旧内容", encoding="utf-8")
+    tool_calls = 0
+
+    def handle(messages, tools, system):
+        nonlocal tool_calls
+        if tools is None:
+            return text_response("维护完成")
+        if tool_calls == 0:
+            tool_calls += 1
+            return tool_response("read_file", {"path": "note.txt"}, "read-old")
+        if tool_calls == 1:
+            source.write_text("新内容", encoding="utf-8")
+            tool_calls += 1
+            return tool_response("read_file", {"path": "note.txt"}, "read-new")
+        return text_response("已读取更新内容")
+
+    provider = ScriptedProvider(handler=handle)
+    async with AgentRuntime(Config(workdir=str(tmp_path)), provider=provider) as runtime:
+        await collect(runtime, "检查 note.txt")
+
+    results = [message["content"][0]["content"] for message in runtime.messages
+               if message.get("role") == "user" and isinstance(message.get("content"), list)
+               and message["content"] and message["content"][0].get("type") == "tool_result"]
+    assert results == ["旧内容", "新内容"]
+
+
+@pytest.mark.asyncio
+async def test_runtime_reuses_read_evidence_across_user_turns(tmp_path):
+    (tmp_path / "note.txt").write_text("跨轮证据", encoding="utf-8")
+    provider = ScriptedProvider([
+        tool_response("read_file", {"path": "note.txt"}, "turn-one-read"),
+        text_response("第一轮完成"),
+        tool_response("read_file", {"path": "note.txt"}, "turn-two-read"),
+        text_response("第二轮完成"),
+    ])
+    async with AgentRuntime(Config(workdir=str(tmp_path)), provider=provider) as runtime:
+        await collect(runtime, "读取 note.txt")
+        await collect(runtime, "再次检查 note.txt")
+        repeated = next(message["content"][0]["content"] for message in reversed(runtime.messages)
+                        if message.get("role") == "user" and isinstance(message.get("content"), list)
+                        and message["content"] and message["content"][0].get("tool_use_id") == "turn-two-read")
+        assert "turn-one-read" in repeated
+        assert "跨轮证据" not in repeated
+        assert "与当前文件内容一致" in repeated
+
+
+@pytest.mark.asyncio
+async def test_runtime_does_not_reuse_failed_file_read_result(tmp_path):
+    read_count = 0
+
+    def handle(messages, tools, system):
+        nonlocal read_count
+        read_count += 1
+        if read_count == 1:
+            return tool_response("read_file", {"path": "later.txt"}, "missing-read")
+        if read_count == 2:
+            (tmp_path / "later.txt").write_text("现在可读", encoding="utf-8")
+            return tool_response("read_file", {"path": "later.txt"}, "recovered-read")
+        return text_response()
+
+    provider = ScriptedProvider(handler=handle)
+    async with AgentRuntime(Config(workdir=str(tmp_path)), provider=provider) as runtime:
+        await collect(runtime)
+        results = [message["content"][0] for message in runtime.messages
+                   if message.get("role") == "user" and isinstance(message.get("content"), list)
+                   and message["content"] and message["content"][0].get("type") == "tool_result"]
+        assert len(results) == 2
+        assert results[0]["content"].startswith("Error:")
+        assert "metadata" not in results[0]
+        assert results[1]["content"] == "现在可读"
+        assert results[1]["metadata"]["repeat_policy"] == "fresh_read"
+
+
+@pytest.mark.asyncio
+async def test_runtime_tracks_cross_turn_reuse_without_stopping_new_requests(tmp_path):
+    (tmp_path / "note.txt").write_text("跨轮稳定证据", encoding="utf-8")
+    provider = ScriptedProvider([
+        tool_response("read_file", {"path": "note.txt"}, "cross-turn-1"), text_response("第一轮"),
+        tool_response("read_file", {"path": "note.txt"}, "cross-turn-2"), text_response("第二轮"),
+        tool_response("read_file", {"path": "note.txt"}, "cross-turn-3"), text_response("第三轮"),
+    ])
+    async with AgentRuntime(Config(workdir=str(tmp_path), max_iterations=10), provider=provider) as runtime:
+        for turn in range(3):
+            events = await collect(runtime, f"第 {turn + 1} 次检查 note.txt")
+        reads = [message["content"][0] for message in runtime.messages
+                 if message.get("role") == "user" and isinstance(message.get("content"), list)
+                 and message["content"] and message["content"][0].get("type") == "tool_result"]
+        assert len(reads) == 3
+        assert reads[-1]["metadata"]["repeat_count"] == 2
+        assert events[-1].data["stop_reason"] == "end_turn"
+
+
+@pytest.mark.asyncio
+async def test_runtime_stops_after_three_read_only_rounds_without_new_evidence(tmp_path):
+    (tmp_path / "note.txt").write_text("稳定证据", encoding="utf-8")
+
+    def handle(messages, tools, system):
+        if tools == []:
+            return text_response("根据已有证据，文件内容为稳定证据。")
+        call_number = sum(1 for message in messages if message.get("role") == "assistant"
+                          for block in message.get("content", [])
+                          if isinstance(block, dict) and block.get("type") == "tool_use")
+        return tool_response("read_file", {"path": "note.txt"}, f"repeat-{call_number}")
+
+    provider = ScriptedProvider(handler=handle)
+    async with AgentRuntime(Config(workdir=str(tmp_path), max_iterations=10), provider=provider) as runtime:
+        events = await collect(runtime, "读取 note.txt 并总结")
+        tool_calls = [block for message in runtime.messages if message.get("role") == "assistant"
+                      for block in message.get("content", [])
+                      if isinstance(block, dict) and block.get("type") == "tool_use"]
+        assert len(tool_calls) == 4
+        assert events[-1].data["stop_reason"] == "no_progress"
+        assert "连续只读调用未产生新证据" in events[-1].text
+        assert "稳定证据" in events[-1].text
+
+
+@pytest.mark.asyncio
 async def test_runtime_compacts_real_history_before_model_call(tmp_path):
     provider = ScriptedProvider([text_response()])
     cfg = Config(workdir=str(tmp_path), context_limit=40, max_messages=10)

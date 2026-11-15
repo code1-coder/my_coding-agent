@@ -29,6 +29,7 @@ Agent 主循环 —— 编码智能体的核心大脑。
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import logging
 import uuid
 from contextlib import aclosing
@@ -45,6 +46,7 @@ from coding_agent.providers.base import ModelIdleTimeout, ModelRequestError, Str
 from coding_agent.providers.activity import RequestActivity, _current_request_activity
 
 logger = logging.getLogger(__name__)
+_MAX_NO_PROGRESS_READ_ROUNDS = 3
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -164,6 +166,7 @@ class AgentLoop:
         self.recovery_state = RecoveryState(current_model=self.provider.model_id)
         text = ""
         tool_outcomes: dict[tuple[str, str, bool], int] = {}
+        no_progress_read_rounds = 0
         for iteration in range(self.max_iterations):
             if self.compaction is not None:
                 async with aclosing(self.wait_events(
@@ -226,6 +229,7 @@ class AgentLoop:
                 yield LoopEvent(type="tool_start", tool_name=block["name"],
                                 tool_id=block["id"], data={"input": block.get("input", {}),
                                 "execution_id": execution_id, "agent": self.agent_name})
+            round_results = []
             async with aclosing(self._tool_events(messages, blocks, execution_ids)) as events:
                 async for event in events:
                     if event.type == "tool_done":
@@ -234,7 +238,19 @@ class AgentLoop:
                         target = target if isinstance(target, str) else ""
                         outcome = (event.tool_name, target, bool(event.data.get("is_error")))
                         tool_outcomes[outcome] = tool_outcomes.get(outcome, 0) + 1
+                        round_results.append((event.tool_name, event.data.get("metadata", {}),
+                                              bool(event.data.get("is_error"))))
                     yield event
+            if (round_results and all(name == "read_file" and not failed
+                                      and metadata.get("reused_from")
+                                      for name, metadata, failed in round_results)):
+                no_progress_read_rounds += 1
+            else:
+                no_progress_read_rounds = 0
+            if no_progress_read_rounds >= _MAX_NO_PROGRESS_READ_ROUNDS:
+                async for event in self._finish_without_answer(messages, text, "no_progress"):
+                    yield event
+                return
 
         async for event in self._finish_without_answer(messages, text, "max_iterations"):
             yield event
@@ -270,6 +286,7 @@ class AgentLoop:
         """最多补充一次无工具总结；失败时明确告知缺少交付，不能静默结束。"""
         notices = {
             "max_iterations": "已达到本轮执行轮次上限，已停止继续调用工具；任务是否完成仍需依据执行结果确认。",
+            "no_progress": "连续只读调用未产生新证据，已停止重复读取并根据已有结果整理结论。",
             "max_tokens": "模型输出达到长度上限，回答可能不完整。",
             "tool_use": "模型请求使用工具，但未提供有效工具调用。",
         }
@@ -336,7 +353,7 @@ class AgentLoop:
             await asyncio.gather(task, return_exceptions=True)
 
     async def _tool_events(self, messages, blocks, execution_ids) -> AsyncIterator[LoopEvent]:
-        tasks = [asyncio.create_task(self._execute_one(block, execution_id=execution_id))
+        tasks = [asyncio.create_task(self._execute_one(block, messages, execution_id=execution_id))
                  for block, execution_id in zip(blocks, execution_ids)]
         indexes = {task: index for index, task in enumerate(tasks)}
         pending = set(tasks)
@@ -358,6 +375,9 @@ class AgentLoop:
                                     tool_id=block["id"], tool_output=result.error or result.content,
                                     data={"input": block.get("input", {}), "is_error": bool(result.error),
                                           "execution": result.execution,
+                                          "metadata": {key: result.metadata[key]
+                                                       for key in ("reused_from", "repeat_count")
+                                                       if key in result.metadata},
                                           "execution_id": execution_ids[index], "agent": self.agent_name})
         finally:
             for task in tasks:
@@ -394,7 +414,17 @@ class AgentLoop:
                                           purpose="agent", model=provider.model_id)
                 if blocked is not None:
                     raise PermissionError(f"模型调用被 Hook 阻止：{blocked}")
-                kwargs = dict(messages=messages, tools=[] if final_only else self.registry.list_tools(),
+                # 内部新鲜度指纹只保存在会话历史，不能扩展 Provider 的工具协议。
+                provider_messages = [dict(message) for message in messages]
+                for message in provider_messages:
+                    content = message.get("content")
+                    if isinstance(content, list):
+                        message["content"] = [
+                            {key: value for key, value in block.items() if key != "metadata"}
+                            if isinstance(block, dict) and block.get("type") == "tool_result" else block
+                            for block in content
+                        ]
+                kwargs = dict(messages=provider_messages, tools=[] if final_only else self.registry.list_tools(),
                               system=self.system_prompt, max_tokens=(
                                   self.recovery.current_max_tokens(self.recovery_state)
                                   if self.recovery else self.max_tokens))
@@ -565,7 +595,8 @@ class AgentLoop:
 
     # ── 内部辅助方法 ────────────────────────────────────
 
-    async def _execute_one(self, block: dict[str, Any], *, execution_id: str = "") -> ToolResult:
+    async def _execute_one(self, block: dict[str, Any], messages: list[dict[str, Any]],
+                           *, execution_id: str = "") -> ToolResult:
         """执行单个 tool_use 块，保留执行信息与原调用 ID。
 
         未注册的工具和执行异常均转换为错误结果，交由模型在后续轮次
@@ -578,6 +609,7 @@ class AgentLoop:
         error = None
         output = ""
         execution = {}
+        metadata: dict[str, Any] = {}
         cancellation = None
         try:
             blocked = await self.emit(EventType.PRE_TOOL_USE, tool_name=tool_name,
@@ -588,9 +620,12 @@ class AgentLoop:
                 verdict, reason = await self.permissions.check(tool_name, tool_input)
                 if verdict != Verdict.ALLOW:
                     raise PermissionError(reason)
-            result = await self.registry.dispatch(tool_name, tool_input, tool_use_id=tool_id)
+            result = await self._reuse_read_result(messages, block, tool_id)
+            if result is None:
+                result = await self.registry.dispatch(tool_name, tool_input, tool_use_id=tool_id)
             output, error = result.content, result.error
             execution = result.execution
+            metadata = result.metadata
         except ToolCancelledError as exc:
             cancellation = exc
             output, error = exc.result.content, exc.result.error
@@ -604,9 +639,72 @@ class AgentLoop:
             "execution_id": execution_id,
             "output": error or output, "error": error,
             "execution": execution,
+            "metadata": {key: metadata[key] for key in ("reused_from", "repeat_count")
+                         if key in metadata},
+            "reused_result": bool(metadata.get("reused_from")),
         }, context=self.event_context)
         await self.event_bus.emit(event)
         if cancellation is not None:
             raise cancellation
         return ToolResult(tool_id, content=str(event.data["output"]),
-                          error=str(event.data["output"]) if error else None, execution=execution)
+                          error=str(event.data["output"]) if error else None, execution=execution,
+                          metadata=metadata)
+
+    async def _reuse_read_result(self, messages: list[dict[str, Any]], block: dict[str, Any],
+                                 tool_id: str) -> ToolResult | None:
+        """只复用当前会话中仍完整且文件内容未变的 read_file 结果。"""
+        entry = self.registry.get(block.get("name", ""))
+        if (entry is None or entry.repeat_policy != "fresh_read"
+                or entry.repeat_key is None or entry.freshness_token is None):
+            return None
+        arguments = block.get("input", {})
+        if not isinstance(arguments, dict):
+            return None
+        try:
+            repeat_key = entry.repeat_key(arguments)
+            if repeat_key is None:
+                return None
+            freshness = await asyncio.to_thread(entry.freshness_token, arguments)
+        except (OSError, ValueError, KeyError, TypeError):
+            return None
+
+        results: dict[str, dict[str, Any]] = {}
+        for message in reversed(messages):
+            content = message.get("content")
+            if not isinstance(content, list):
+                continue
+            if message.get("role") == "user":
+                for item in reversed(content):
+                    if isinstance(item, dict) and item.get("type") == "tool_result":
+                        results[item.get("tool_use_id", "")] = item
+                continue
+            if message.get("role") != "assistant":
+                continue
+            for item in reversed(content):
+                if (not isinstance(item, dict) or item.get("type") != "tool_use"
+                        or item.get("name") != block.get("name") or item.get("id") == tool_id):
+                    continue
+                source_id = item.get("id", "")
+                prior_result = results.get(source_id)
+                if prior_result is None or prior_result.get("is_error"):
+                    continue
+                metadata = prior_result.get("metadata", {})
+                output = str(prior_result.get("content", ""))
+                if (not isinstance(metadata, dict) or metadata.get("repeat_policy") != "fresh_read"
+                        or metadata.get("repeat_key") != repeat_key
+                        or metadata.get("freshness_token") != freshness
+                        or hashlib.sha256(output.encode("utf-8")).hexdigest() != metadata.get("output_digest")
+                        or metadata.get("reused_from")):
+                    continue
+                repeat_count = 1 + sum(
+                    1 for prior_result in results.values()
+                    if isinstance(prior_result.get("metadata"), dict)
+                    and prior_result["metadata"].get("reused_from") == source_id
+                )
+                return ToolResult(
+                    tool_use_id=tool_id,
+                    content=(f"已复用同一会话中工具调用 {source_id} 的文件读取结果；"
+                             "该结果与当前文件内容一致。若需要不同范围，请明确新的读取范围。"),
+                    metadata={**metadata, "reused_from": source_id, "repeat_count": repeat_count},
+                )
+        return None

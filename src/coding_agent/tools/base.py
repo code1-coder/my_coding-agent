@@ -22,12 +22,14 @@ class ToolResult:
         content: 工具的输出文本（未处理错误时为空字符串）。
         error: 如果不为 None，表示工具以此错误消息失败。
         execution: 命令退出码、输出、耗时等执行信息；不直接添加到模型协议字段。
+        metadata: 用于会话内证据校验的本地元数据；发送模型前由 AgentLoop 移除。
     """
 
     tool_use_id: str
     content: str = ""
     error: str | None = None
     execution: dict[str, Any] = field(default_factory=dict)
+    metadata: dict[str, Any] = field(default_factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
         """转换为模型协议所需的工具结果，失败时附上 is_error 标记。"""
@@ -39,6 +41,8 @@ class ToolResult:
         }
         if self.error:
             d["is_error"] = True
+        if self.metadata:
+            d["metadata"] = dict(self.metadata)
         return d
 
 

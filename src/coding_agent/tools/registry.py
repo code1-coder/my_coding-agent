@@ -58,6 +58,9 @@ class ToolEntry:
     permission: str = "read"          # 权限类型：读取、写入或执行
     risk_level: str = "low"           # 风险等级：低、中、高或严重
     input_schema: dict[str, Any] = field(default_factory=dict)
+    repeat_policy: str = "never"
+    repeat_key: Callable[[dict[str, Any]], str | None] | None = None
+    freshness_token: Callable[[dict[str, Any]], str | None] | None = None
 
 
 # ---------------------------------------------------------------------------
@@ -129,6 +132,9 @@ class ToolRegistry:
             permission="write",
             risk_level="moderate",
             input_schema=tool.input_schema,
+            repeat_policy=getattr(tool, "repeat_policy", "never"),
+            repeat_key=getattr(tool, "repeat_key", None),
+            freshness_token=getattr(tool, "freshness_token", None),
         )
         self._tools[tool.name] = entry
         return entry

@@ -110,6 +110,21 @@ class TestToolRegistry:
         result = await reg.dispatch("fake", {"x": 42})
         assert result.content == "got 42"
 
+    async def test_repeat_policy_defaults_to_disabled(self, registry):
+        assert registry.get("echo").repeat_policy == "never"
+
+    async def test_builtin_read_tool_explicitly_opts_into_fresh_result_checks(self, tmp_path):
+        from coding_agent.tools.builtin import ReadFileTool
+
+        entry = ToolRegistry()
+        entry.register_tool(ReadFileTool(tmp_path))
+        read = entry.get("read_file")
+        assert read.repeat_policy == "fresh_read"
+        assert read.repeat_key({"path": "note.txt"}) == read.repeat_key(
+            {"path": "./note.txt", "start_line": 1, "show_line_numbers": False})
+        assert read.repeat_key({"path": "note.txt", "start_line": 0}) != read.repeat_key(
+            {"path": "note.txt"})
+
     def test_sync_function(self, registry):
         """同步函数应直接调用，不通过 to_thread 转发。"""
         reg = ToolRegistry()
