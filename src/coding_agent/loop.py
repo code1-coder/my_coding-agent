@@ -184,6 +184,9 @@ class AgentLoop:
                         if ev.type == "text_delta":
                             text += ev.text
                             yield LoopEvent(type="text_delta", text=ev.text)
+                        elif ev.type == "text_reset":
+                            text = prefix + ev.text
+                            yield LoopEvent(type="text_reset", text=text, data=ev.data)
                         elif ev.type == "done":
                             response = ev.response
                         elif ev.type == "warning":
@@ -439,6 +442,10 @@ class AgentLoop:
         async def attempt():
             nonlocal request_attempts
             sent_text = False
+            delivered_text = ""
+            # 正文出现前的纯空白可能只是传输占位，正常完成后再与完整响应核对。
+            pending_whitespace = ""
+            has_visible_text = False
             request_attempts += 1
             provider = (self.provider_for_model(self.recovery_state.current_model)
                         if self.provider_for_model else self.provider)
@@ -476,21 +483,49 @@ class AgentLoop:
                     if stream:
                         async with aclosing(provider.stream_message(**kwargs)) as events:
                             async for event in events:
-                                if event.type != "done":
-                                    request_activity.mark_model_event(event.type)
-                                    queue.put_nowait(event)
-                                if event.type == "text_delta":
-                                    sent_text = sent_text or bool(event.text)
-                                elif event.type == "done":
+                                if event.type == "done":
                                     response = event.response
+                                    continue
+                                request_activity.mark_model_event(event.type)
+                                if event.type != "text_delta":
+                                    queue.put_nowait(event)
+                                    continue
+                                delta = event.text or ""
+                                if not delta:
+                                    continue
+                                if not has_visible_text and not delta.strip():
+                                    pending_whitespace += delta
+                                    continue
+                                output = pending_whitespace + delta
+                                pending_whitespace = ""
+                                has_visible_text = True
+                                delivered_text += output
+                                sent_text = sent_text or bool(output)
+                                queue.put_nowait(StreamEvent(type="text_delta", text=output))
                     else:
                         response = await provider.create_message(**kwargs)
                         if response.text:
                             queue.put_nowait(StreamEvent(type="text_delta", text=response.text))
                 if response is None:
                     raise RuntimeError("模型响应流未正常结束")
-                if stream and not sent_text and response.text:
-                    queue.put_nowait(StreamEvent(type="text_delta", text=response.text))
+                if stream:
+                    # 最终响应是完整文本的权威值，只补前缀差额，分歧则走 reset。
+                    final_text = response.text or ""
+                    if not has_visible_text:
+                        if final_text.strip():
+                            queue.put_nowait(StreamEvent(type="text_delta", text=final_text))
+                            delivered_text = final_text
+                            sent_text = True
+                    elif final_text.startswith(delivered_text):
+                        suffix = final_text[len(delivered_text):]
+                        if suffix:
+                            queue.put_nowait(StreamEvent(type="text_delta", text=suffix))
+                            delivered_text += suffix
+                    elif final_text.strip() and final_text != delivered_text:
+                        queue.put_nowait(LoopEvent(
+                            type="text_reset", text=final_text,
+                            data={"reason": "response_reconciliation"},
+                        ))
                 await self.emit(EventType.POST_LLM_CALL, response=response,
                                 usage=response.usage, purpose="agent")
                 return response
@@ -622,6 +657,8 @@ class AgentLoop:
                 if event is sentinel:
                     break
                 if event.type == "text_delta":
+                    yield event
+                elif event.type == "text_reset":
                     yield event
                 elif event.type == "done":
                     yield event

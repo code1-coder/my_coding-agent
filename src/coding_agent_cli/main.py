@@ -133,7 +133,10 @@ def _print_event(event: LoopEvent, *, color: bool = True) -> None:
     if event.type == "text_delta":
         click.echo(event.text, nl=False)
     elif event.type == "text_reset":
-        click.echo("\n[输出达到上限，正在重新生成]\n")
+        if event.data.get("reason") == "response_reconciliation":
+            click.echo("\n[已按完整响应校准输出]\n" + event.text, nl=False)
+        else:
+            click.echo("\n[输出达到上限，正在重新生成]\n")
     elif event.type == "tool_start":
         label = f"> {_terminal_text(event.tool_name)}"
         details = _tool_summary(event.tool_name, event.data.get("input"))

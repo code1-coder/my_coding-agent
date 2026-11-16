@@ -684,6 +684,64 @@ async def test_stream_failure_after_text_is_not_replayed(tmp_path):
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(("deltas", "final_text", "expected_text", "expected_events"), [
+    (["  ", "\n"], "answer", "answer", [("text_delta", "answer")]),
+    (["  \n", "answer\n", "  code"], "  \nanswer\n  code", "  \nanswer\n  code",
+     [("text_delta", "  \nanswer\n"), ("text_delta", "  code")]),
+    (["answer"], "answer extended", "answer extended",
+     [("text_delta", "answer"), ("text_delta", " extended")]),
+    (["answer"], "answer", "answer", [("text_delta", "answer")]),
+    (["partial"], "authoritative", "authoritative",
+     [("text_delta", "partial"), ("text_reset", "authoritative")]),
+])
+async def test_stream_reconciles_deltas_with_final_response(
+        tmp_path, deltas, final_text, expected_text, expected_events):
+    class ChunkedProvider(ScriptedProvider):
+        async def stream_message(self, *args, **kwargs):
+            response = text_response(final_text)
+            for delta in deltas:
+                yield StreamEvent(type="text_delta", text=delta)
+            yield StreamEvent(type="done", response=response)
+
+    provider = ChunkedProvider()
+    async with AgentRuntime(Config(workdir=str(tmp_path)), provider=provider) as runtime:
+        events = await collect(runtime, "检查流式正文")
+
+    actual_events = [(event.type, event.text) for event in events
+                     if event.type in {"text_delta", "text_reset"}]
+    assert actual_events == expected_events
+    assert events[-1].type == "done"
+    assert events[-1].text == expected_text
+    if expected_events[-1][0] == "text_reset":
+        reset_event = next(event for event in events if event.type == "text_reset")
+        assert reset_event.data["reason"] == "response_reconciliation"
+
+
+@pytest.mark.asyncio
+async def test_whitespace_only_stream_uses_nonblank_final_delivery(tmp_path):
+    class WhitespaceProvider(ScriptedProvider):
+        async def stream_message(self, *args, **kwargs):
+            response = text_response("  \n")
+            yield StreamEvent(type="text_delta", text="  ")
+            yield StreamEvent(type="text_delta", text="\n")
+            yield StreamEvent(type="done", response=response)
+
+        async def create_message(self, messages, tools=None, system="", max_tokens=8000):
+            if tools == []:
+                return text_response("空白响应未作为正文显示。")
+            return await super().create_message(messages, tools, system, max_tokens)
+
+    async with AgentRuntime(Config(workdir=str(tmp_path)), provider=WhitespaceProvider()) as runtime:
+        events = await collect(runtime, "检查空白响应")
+
+    text_events = [event.text for event in events if event.type == "text_delta"]
+    assert len(text_events) == 1
+    assert text_events[0].strip()
+    assert "空白响应未作为正文显示。" in text_events[0]
+    assert events[-1].type == "done"
+
+
+@pytest.mark.asyncio
 async def test_connection_retry_discards_partial_tool_call_and_executes_once(tmp_path, monkeypatch):
     import httpx
     import openai

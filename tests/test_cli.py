@@ -45,6 +45,18 @@ def test_tool_start_shows_target_without_file_content(capsys, name, parameters, 
     assert "PRIVATE_BODY" not in output
 
 
+def test_text_reset_displays_reconciled_final_response(capsys):
+    event = main.LoopEvent(type="text_reset", text="权威完整正文", data={
+        "reason": "response_reconciliation",
+    })
+
+    main._print_event(event, color=False)
+
+    output = capsys.readouterr().out
+    assert "权威完整正文" in output
+    assert "已按完整响应校准输出" in output
+
+
 def test_patch_display_lists_all_operations_without_body(capsys):
     patch = ("*** Begin Patch\n*** Add File: added.py\n+PRIVATE_BODY\n"
              "*** Update File: source.py\n@@\n-old\n+new\n"
