@@ -19,6 +19,7 @@ dependencies = [
     "uvicorn>=0.30",
     "websockets>=12",
     "tiktoken>=0.7",
+    "ripgrep-bin>=15.2,<16",
 ]
 
 [project.optional-dependencies]

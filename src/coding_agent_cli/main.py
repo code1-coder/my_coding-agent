@@ -171,6 +171,16 @@ def _print_event(event: LoopEvent, *, color: bool = True) -> None:
         execution = event.data["execution"]
         click.echo(f"[bash 完成] 退出码: {execution['exit_code']}，耗时: {execution['duration_ms']} ms"
                    + ("，输出已截断" if execution.get("truncated") else ""))
+    elif event.type == "tool_done" and event.tool_name == "search_code":
+        try:
+            result = json.loads(event.tool_output)
+        except json.JSONDecodeError:
+            return
+        if isinstance(result, dict) and result.get("fallback_reason") == "rg_unavailable":
+            details = _tool_summary(event.tool_name, event.data.get("input"))
+            label = "[搜索降级] " + (details[0] if details else ".")
+            click.echo(label + "：" + _terminal_text(str(result.get("backend", "python")))
+                       + ("，范围未完整搜索，请检查结果限制" if result.get("truncated") else ""))
     elif event.type == "memory_saved":
         click.echo(f"\n[记忆] 已保存 {event.data['count']} 条到 {event.data['path']}\n")
     elif event.type == "warning":

@@ -128,6 +128,18 @@ def test_tool_success_does_not_print_file_content(capsys):
     assert not captured.out and not captured.err
 
 
+def test_search_fallback_displays_backend_and_incomplete_scope(capsys):
+    main._print_event(main.LoopEvent(
+        type="tool_done", tool_name="search_code",
+        tool_output=json.dumps({"backend": "python_git", "fallback_reason": "rg_unavailable",
+                                "truncated": True, "results": [{"text": "PRIVATE_BODY"}]}),
+        data={"input": {"path": "src", "pattern": "value"}},
+    ), color=False)
+    output = capsys.readouterr().out
+    assert "[搜索降级] src" in output and "python_git" in output
+    assert "范围未完整搜索" in output and "PRIVATE_BODY" not in output
+
+
 class LoopBoundProvider(LLMProvider):
     """模拟持有连接池的客户端，要求所有请求和关闭操作使用同一事件循环。"""
 

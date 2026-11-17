@@ -150,7 +150,17 @@ macOS / Linux 将解释器路径替换为 `.venv/bin/python`。激活虚拟环�
 
 ## 统一运行流程
 
-代码工具现已支持 search_code、read_file 分段读取、apply_patch、git_status、git_diff 和 Python code_outline。参见[代码工具参数与补丁格式](docs/code-tools.md)。搜索需要 PATH 中的 ripgrep (rg)，Git 查看需要 Git；无需新增 Python 依赖。
+代码工具现已支持 search_code、read_file 分段读取、apply_patch、git_status、git_diff 和 Python code_outline。参见[代码工具参数与补丁格式](docs/code-tools.md)。项目依赖 ripgrep-bin 将 rg 可执行文件安装到 Python 环境，激活虚拟环境后即可使用；不依赖 Codex 附带版本。搜索优先使用 rg，缺失时可由 Git 筛选文件并用 Python 完成受限字面量搜索，Git 也不可用时须指定文件。正则和复杂 glob 仍需要 rg，备用差异与不完整范围会在结果中说明。
+
+Windows 在项目根目录安装及验证搜索依赖：
+
+```powershell
+.\.venv\Scripts\python.exe -m pip install -r requirements.txt
+.\.venv\Scripts\Activate.ps1
+rg --version
+```
+
+Linux/macOS 对应使用 `.venv/bin/python -m pip install -r requirements.txt`，然后 `source .venv/bin/activate`。直接使用虚拟环境解释器但未激活环境时，需要将该环境的可执行文件目录加入启动服务的 PATH，搜索工具不会扫描开发机的其他软件目录。
 
 CLI 的 `chat`、`run` 和网页 `/chat` 均通过 `AgentRuntime` 调用项目已有模块。入口负责终端交互或 HTTP/SSE 编码，实际处理流程保持一致：会话开始 → 提交用户输入 → 读取记忆、技能与队友回信 → 组装系统提示词 → 压缩上下文 → 调用模型 → 检查并执行工具 → 保存记忆 → 本轮结束。退出 CLI 或关闭网页服务时，会取消后台队友并关闭模型连接。
 

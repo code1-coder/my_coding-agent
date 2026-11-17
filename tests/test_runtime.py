@@ -57,6 +57,59 @@ async def collect(runtime, prompt="开始", **kwargs):
 
 
 @pytest.mark.asyncio
+async def test_search_fallback_runtime_delivers_results_and_final_answer(tmp_path, monkeypatch):
+    monkeypatch.setenv("PATH", "")
+    (tmp_path / "example.py").write_text("first = 1\nsecond = 2\n", encoding="utf-8")
+    provider = ScriptedProvider([
+        tool_response("search_code", {"path": "example.py", "pattern": "first"}, "search-1"),
+        tool_response("search_code", {"path": "example.py", "pattern": "second"}, "search-2"),
+        text_response("两个定义已找到"),
+    ])
+    async with AgentRuntime(Config(workdir=str(tmp_path)), provider=provider) as runtime:
+        events = await collect(runtime)
+        completed = [event for event in events if event.type == "tool_done"]
+        assert len(completed) == 2
+        assert all(not event.data["is_error"] for event in completed)
+        assert [json.loads(event.tool_output)["results"][0]["line"] for event in completed] == [1, 2]
+        assert all(json.loads(event.tool_output)["backend"] == "python_file" for event in completed)
+        assert events[-1].type == "done" and events[-1].text == "两个定义已找到"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("blocked_by", ["hook", "permission"])
+async def test_search_fallback_is_blocked_before_reading(tmp_path, monkeypatch, blocked_by):
+    from coding_agent.security.permission import BasePermissionChecker, Verdict
+    from coding_agent.tools.code import SearchCodeTool
+
+    monkeypatch.setenv("PATH", "")
+    (tmp_path / "private.py").write_text("private_value\n", encoding="utf-8")
+    read = False
+    original = SearchCodeTool._read_search_file
+
+    def observe(*args, **kwargs):
+        nonlocal read
+        read = True
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(SearchCodeTool, "_read_search_file", observe)
+    provider = ScriptedProvider([
+        tool_response("search_code", {"path": "private.py", "pattern": "private_value"}), text_response()])
+    bus = EventBus()
+    if blocked_by == "hook":
+        bus.subscribe(EventType.PRE_TOOL_USE, AsyncMock(return_value="禁止读取"))
+    async with AgentRuntime(Config(workdir=str(tmp_path)), provider=provider, event_bus=bus) as runtime:
+        if blocked_by == "permission":
+            class Deny(BasePermissionChecker):
+                async def check(self, tool_name, params):
+                    return Verdict.DENY, "禁止读取"
+
+            runtime.permissions.add_checker(Deny())
+        events = await collect(runtime)
+        assert any(event.type == "tool_done" and event.data["is_error"] for event in events)
+        assert not read
+
+
+@pytest.mark.asyncio
 async def test_code_tools_runtime_round_trip(tmp_path):
     (tmp_path / "example.py").write_text("def value():\n    return 1\n", encoding="utf-8")
     patch = ("*** Begin Patch\n*** Update File: example.py\n@@\n def value():\n"

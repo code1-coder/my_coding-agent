@@ -3,10 +3,16 @@
 from __future__ import annotations
 
 import ast
+import asyncio
+import fnmatch
 import json
+import os
 import shutil
+import stat
 import subprocess
 import tempfile
+import threading
+import time
 import tokenize
 from pathlib import Path
 
@@ -35,10 +41,60 @@ class WorkspaceTool(Tool):
         self._workdir = Path(workdir or Path.cwd()).resolve()
 
 
+class _SearchRun:
+    """每次搜索独立持有预算和取消信号，不能在并发调用间共享。"""
+
+    def __init__(self) -> None:
+        self.stopped = threading.Event()
+        self.deadline = time.monotonic() + 30
+
+    def check(self) -> None:
+        if self.stopped.is_set():
+            raise asyncio.CancelledError()
+        if time.monotonic() >= self.deadline:
+            raise TimeoutError("search_code exceeded its 30-second total budget")
+
+    def command(self, arguments: list[str], workdir: Path, *, data: bytes = b"",
+                max_bytes: int = 2000000) -> tuple[int, bytes, str, bool]:
+        # 仅启动受控的 rg/Git；轮询预算并回收进程，不把取消等待当成停止执行。
+        self.check()
+        with tempfile.TemporaryFile() as stdin, tempfile.TemporaryFile() as stdout, tempfile.TemporaryFile() as stderr:
+            stdin.write(data)
+            stdin.seek(0)
+            process = subprocess.Popen(arguments, cwd=workdir, stdin=stdin, stdout=stdout, stderr=stderr)
+            clipped = False
+            try:
+                while process.poll() is None:
+                    self.check()
+                    if os.fstat(stdout.fileno()).st_size > max_bytes:
+                        clipped = True
+                        break
+                    if os.fstat(stderr.fileno()).st_size > 2000000:
+                        raise RuntimeError("Search subprocess error output exceeded its limit")
+                    try:
+                        process.wait(timeout=0.05)
+                    except subprocess.TimeoutExpired:
+                        continue
+            finally:
+                if process.poll() is None:
+                    process.kill()
+                process.wait()
+            self.check()
+            stdout.seek(0)
+            output = stdout.read(max_bytes + 1)
+            stderr.seek(0)
+            error = stderr.read(4000).decode("utf-8", errors="replace")
+        return (0 if clipped else process.returncode), output[:max_bytes], error, clipped or len(output) > max_bytes
+
+
 class SearchCodeTool(WorkspaceTool):
     name = "search_code"
-    description = ("用 ripgrep 搜索工作区，返回 JSON：路径、1-based 行号、匹配和上下文。"
-                   "默认按字面量搜索，遵循 .gitignore，跳过隐藏、二进制文件和符号链接；regex=true 启用正则。")
+    description = ("搜索工作区，返回 JSON：路径、1-based 行号、匹配和上下文。优先 ripgrep，"
+                   "缺失时用 Git 筛选文件并用 Python 字面量搜索；Git 也缺失时须指定文件。"
+                   "跳过隐藏、二进制文件和符号链接；regex 和复杂 glob 需要 rg。备用限制见 warnings。")
+    _MAX_FILES = 5000
+    _MAX_READ_BYTES = 20 * 1024 * 1024
+    _MAX_OUTPUT_BYTES = 2000000
     input_schema = {
         "type": "object",
         "properties": {
@@ -53,23 +109,84 @@ class SearchCodeTool(WorkspaceTool):
         "required": ["pattern"],
     }
 
+    def __init__(self, workdir: Path | str | None = None) -> None:
+        super().__init__(workdir)
+        self._capability_lock = threading.Lock()
+        self._capability_key: tuple[str, str] | None = None
+        self._capability_time = 0.0
+        self._executables: dict[str, str | None] = {}
+        self._capabilities()
+
+    def _capabilities(self) -> dict[str, str | None]:
+        key = (os.environ.get("PATH", os.defpath), os.environ.get("PATHEXT", ""))
+        with self._capability_lock:
+            if key != self._capability_key or time.monotonic() - self._capability_time >= 30:
+                # 将相对 PATH 项按子进程 cwd 解析，避免查找环境与执行环境不一致。
+                directories = [self._workdir / item.strip(chr(34)) for item in key[0].split(os.pathsep)]
+                extensions = [""] + (key[1].split(os.pathsep) if os.name == "nt" else [])
+                self._executables = {}
+                for name in ("rg", "git"):
+                    self._executables[name] = next((found for directory in directories
+                                                    for extension in extensions
+                                                    if (found := shutil.which(str(directory / (name + extension))))), None)
+                self._capability_key, self._capability_time = key, time.monotonic()
+            return dict(self._executables)
+
+    def _checked_path(self, path: str) -> Path:
+        target = _safe_path(self._workdir, path)
+        requested = self._workdir / path
+        for candidate in (requested, *requested.parents):
+            if candidate == self._workdir:
+                break
+            info = candidate.lstat()
+            if stat.S_ISLNK(info.st_mode) or getattr(info, "st_file_attributes", 0) & 0x400:
+                raise ValueError("Searching through symlinks or junctions is not supported")
+        if any(part.casefold() == ".git" for part in target.relative_to(self._workdir).parts):
+            raise ValueError("Searching .git metadata is not supported")
+        return target
+
     def execute(self, pattern: str, path: str = ".", file_glob: str | None = None,
                 regex: bool = False, case_sensitive: bool = True, context_lines: int = 0,
                 max_results: int = 100) -> str:
+        return self._execute(_SearchRun(), pattern, path, file_glob, regex, case_sensitive,
+                             context_lines, max_results)
+
+    async def aexecute(self, **kwargs) -> str:
+        run = _SearchRun()
+        worker = asyncio.create_task(asyncio.to_thread(self._execute, run, **kwargs))
+        try:
+            return await asyncio.shield(worker)
+        except asyncio.CancelledError:
+            run.stopped.set()
+            finishing = asyncio.gather(worker, return_exceptions=True)
+            # 重复取消也必须等待本次扫描和受控子进程释放资源。
+            while not finishing.done():
+                try:
+                    await asyncio.shield(finishing)
+                except asyncio.CancelledError:
+                    continue
+            raise
+
+    def _execute(self, run: _SearchRun, pattern: str, path: str = ".", file_glob: str | None = None,
+                 regex: bool = False, case_sensitive: bool = True, context_lines: int = 0,
+                 max_results: int = 100) -> str:
         _integer(context_lines, "context_lines", 0, 10)
         _integer(max_results, "max_results", 1, 500)
-        if not isinstance(pattern, str) or not pattern or "\n" in pattern:
+        if not isinstance(pattern, str) or not pattern or "\n" in pattern or "\r" in pattern:
             raise ValueError("pattern must be a non-empty single-line string")
-        target = _safe_path(self._workdir, path)
+        target = self._checked_path(path)
         if not target.exists():
             raise FileNotFoundError(path)
-        requested = self._workdir / path
-        if any(candidate.is_symlink() for candidate in (requested, *requested.parents)
-               if candidate != self._workdir):
-            raise ValueError("Searching through symlinks is not supported")
-        executable = shutil.which("rg")
-        if executable is None:
-            raise RuntimeError("search_code requires ripgrep (rg) on PATH")
+        executable = self._capabilities()["rg"]
+        if executable is not None:
+            return self._ripgrep(run, executable, target, pattern, file_glob, regex,
+                                 case_sensitive, context_lines, max_results)
+        return self._python_search(run, target, pattern, file_glob, regex, case_sensitive,
+                                   context_lines, max_results)
+
+    def _ripgrep(self, run: _SearchRun, executable: str, target: Path, pattern: str,
+                 file_glob: str | None, regex: bool, case_sensitive: bool,
+                 context_lines: int, max_results: int) -> str:
         command = [executable, "--no-config", "--json", "--color=never", "--sort=path",
                    "--max-filesize=2M", f"--max-count={max_results + 1}",
                    f"--context={context_lines}", "--glob=!.git/**"]
@@ -81,12 +198,23 @@ class SearchCodeTool(WorkspaceTool):
             command.extend(["--type-add", f"agentfilter:{file_glob}", "--type", "agentfilter"])
         command.append("--glob=!.*")
         command.extend(["--", pattern, str(target.relative_to(self._workdir))])
-        returncode, output, error, truncated = _run_command(command, self._workdir, 2000000)
+        try:
+            returncode, raw, error, truncated = run.command(command, self._workdir)
+        except FileNotFoundError:
+            # 仅恢复启动时消失的依赖，不将结果文件消失或解析错误误判成缺少 rg。
+            if not self._workdir.exists():
+                raise
+            with self._capability_lock:
+                self._executables["rg"] = None
+            return self._python_search(run, target, pattern, file_glob, regex, case_sensitive,
+                                       context_lines, max_results)
+        output = raw.decode("utf-8", errors="replace")
         if returncode not in (0, 1):
             raise RuntimeError(f"ripgrep failed ({returncode}): {error.strip()}")
         rows = []
         matches = 0
         for line in output.splitlines():
+            run.check()
             try:
                 event = json.loads(line)
             except json.JSONDecodeError:
@@ -104,7 +232,7 @@ class SearchCodeTool(WorkspaceTool):
             source_text = data["lines"].get("text")
             if source_path is None or source_text is None:
                 continue
-            if not _safe_path(self._workdir, source_path).is_file():
+            if not self._checked_path(source_path).is_file():
                 continue
             rows.append({"path": Path(source_path).as_posix(), "line": data["line_number"],
                          "text": source_text.rstrip("\r\n")[:2000],
@@ -113,8 +241,229 @@ class SearchCodeTool(WorkspaceTool):
             if len(rows) >= 1000:
                 truncated = True
                 break
-        return json.dumps({"results": rows, "match_count": matches, "truncated": truncated,
+        return json.dumps({"backend": "rg", "results": rows, "match_count": matches, "truncated": truncated,
                            "limits": "Files <= 2 MiB; lines <= 2000 chars; <= 1000 rows. Narrow path or pattern if truncated."},
+                          ensure_ascii=False)
+
+
+    def _git(self, run: _SearchRun, executable: str, arguments: list[str], *, data: bytes = b""):
+        command = [executable, "--no-optional-locks", "--no-pager", "-c", "core.fsmonitor=false",
+                   "-c", "core.quotePath=false", *arguments]
+        return run.command(command, self._workdir, data=data)
+
+    def _preflight(self, run: _SearchRun, target: Path, executable: str) -> list[Path]:
+        """只检查目录元数据；不能忽视 rg 专属忽略文件后直接扩大读取范围。"""
+        scope = target if target.is_dir() else target.parent
+        for parent in (scope, *scope.parents):
+            run.check()
+            for name in (".ignore", ".rgignore"):
+                if (parent / name).exists():
+                    raise RuntimeError(f"ripgrep unavailable: fallback cannot apply {name}; install rg")
+        if not target.is_dir():
+            return []
+        excluded = []
+        entries = 0
+        pending = [target]
+        while pending:
+            run.check()
+            current = pending.pop()
+            if current != self._workdir and ((current / ".git").exists()):
+                excluded.append(current)
+                continue
+            directories = []
+            with os.scandir(current) as children:
+                for child in children:
+                    run.check()
+                    entries += 1
+                    if entries > self._MAX_FILES:
+                        raise RuntimeError("ripgrep unavailable: fallback metadata limit reached; narrow path")
+                    if child.name in (".ignore", ".rgignore"):
+                        raise RuntimeError(f"ripgrep unavailable: fallback cannot apply {child.name}; install rg")
+                    if child.name.startswith("."):
+                        continue
+                    info = child.stat(follow_symlinks=False)
+                    if stat.S_ISDIR(info.st_mode) and not getattr(info, "st_file_attributes", 0) & 0x400:
+                        directories.append(Path(child.path))
+            if directories:
+                # 预检也按 Git 规则裁剪，避免扫描已忽略的依赖目录耗尽元数据预算。
+                data = b"\0".join(os.fsencode(item.relative_to(self._workdir)) for item in directories) + b"\0"
+                code, output, error, clipped = self._git(run, executable,
+                    ["check-ignore", "--no-index", "-z", "--stdin"], data=data)
+                if code not in (0, 1) or clipped:
+                    raise RuntimeError(f"Git ignore check failed ({code}): {error.strip()}")
+                ignored = set(output.split(b"\0")[:-1])
+                pending.extend(item for item in directories
+                               if os.fsencode(item.relative_to(self._workdir)) not in ignored)
+        return excluded
+
+    def _candidates(self, run: _SearchRun, target: Path, reasons: set[str], warnings: list[str]) -> tuple[str, list[Path]]:
+        executable = self._capabilities()["git"]
+        if executable is None:
+            if target.is_file():
+                warnings.append("Git 不可用：仅搜索指定文件，未检查 Git 忽略规则")
+                return "python_file", [target]
+            raise RuntimeError("ripgrep (rg) and Git unavailable: specify a file path or install rg")
+        try:
+            code, output, error, clipped = self._git(run, executable, ["rev-parse", "--is-inside-work-tree"])
+        except FileNotFoundError:
+            if not self._workdir.exists():
+                raise
+            with self._capability_lock:
+                self._executables["git"] = None
+            if target.is_file():
+                warnings.append("Git 已不可用：仅搜索指定文件，未检查 Git 忽略规则")
+                return "python_file", [target]
+            raise RuntimeError("ripgrep and Git unavailable: specify a file path or install rg") from None
+        if code != 0:
+            if "not a git repository" not in error.lower():
+                raise RuntimeError(f"Git failed ({code}): {error.strip()}")
+            if target.is_file():
+                warnings.append("不在 Git 工作树中：仅搜索指定文件，未检查 Git 忽略规则")
+                return "python_file", [target]
+            raise RuntimeError("ripgrep unavailable: directory fallback requires a Git worktree; specify a file")
+        if clipped or output.strip() != b"true":
+            raise RuntimeError("ripgrep unavailable: cannot confirm Git worktree")
+        excluded = self._preflight(run, target, executable)
+        if excluded:
+            reasons.add("nested_repository")
+        selected = target.relative_to(self._workdir).as_posix()
+        code, output, error, clipped = self._git(run, executable, [
+            "ls-files", "-z", "--cached", "--others", "--exclude-standard", "--", f":(literal){selected}"])
+        if code != 0:
+            raise RuntimeError(f"Git failed ({code}): {error.strip()}")
+        if clipped:
+            reasons.add("candidate_output")
+        # 截断时最后一个 NUL 后的片段不是完整文件名，绝不能据此读取。
+        names = sorted(set(output.split(b"\0")[:-1]))
+        if len(names) > self._MAX_FILES:
+            names = names[:self._MAX_FILES]
+            reasons.add("candidate_count")
+        if not names:
+            return "python_git", []
+        data = b"\0".join(names) + b"\0"
+        code, ignored, error, clipped = self._git(run, executable,
+            ["check-ignore", "--no-index", "-z", "--stdin"], data=data)
+        if code not in (0, 1) or clipped:
+            raise RuntimeError(f"Git ignore check failed ({code}): {error.strip()}")
+        ignored_names = set(ignored.split(b"\0")[:-1])
+        candidates = []
+        for name in names:
+            run.check()
+            if name in ignored_names:
+                continue
+            candidate = self._workdir / os.fsdecode(name)
+            if not candidate.is_relative_to(target if target.is_dir() else target.parent):
+                raise ValueError("Git returned a path outside the requested search scope")
+            if any(candidate.is_relative_to(root) for root in excluded):
+                continue
+            candidates.append(candidate)
+        return "python_git", candidates
+
+    def _read_search_file(self, run: _SearchRun, target: Path, remaining: int) -> bytes:
+        chunks = bytearray()
+        with target.open("rb") as source:
+            while len(chunks) <= min(2 * 1024 * 1024, remaining):
+                run.check()
+                block = source.read(min(65536, 2 * 1024 * 1024 + 1 - len(chunks), remaining + 1 - len(chunks)))
+                if not block:
+                    break
+                chunks.extend(block)
+        return bytes(chunks)
+
+    def _python_search(self, run: _SearchRun, target: Path, pattern: str, file_glob: str | None,
+                       regex: bool, case_sensitive: bool, context_lines: int, max_results: int) -> str:
+        if regex:
+            raise ValueError("ripgrep unavailable: regex=true is unsupported by literal fallback; install rg")
+        if file_glob and (any(char in file_glob for char in "/\\{}") or file_glob.startswith("!")):
+            raise ValueError("ripgrep unavailable: file_glob supports simple filename patterns only, such as *.py")
+        rows = []
+        reasons: set[str] = set()
+        skipped: dict[str, int] = {}
+        warnings = ["rg 不可用，已降级为 Python 字面量搜索；不支持正则和复杂 glob；"
+                    "仅解码 UTF-8，忽略大小写使用 Unicode casefold，与 rg 可能不同"]
+        backend = "python_git" if target.is_dir() else "python_file"
+        read_bytes, output_bytes, matches = 0, 2048, 0
+        needle = pattern if case_sensitive else pattern.casefold()
+        try:
+            backend, candidates = self._candidates(run, target, reasons, warnings)
+            for candidate in candidates:
+                run.check()
+                relative = candidate.relative_to(self._workdir)
+                if any(part.startswith(".") for part in relative.parts):
+                    continue
+                if file_glob and not fnmatch.fnmatchcase(candidate.name, file_glob):
+                    continue
+                try:
+                    checked = self._checked_path(str(relative))
+                except (ValueError, FileNotFoundError):
+                    skipped["unsafe_path"] = skipped.get("unsafe_path", 0) + 1
+                    continue
+                if not checked.is_file():
+                    skipped["not_regular_file"] = skipped.get("not_regular_file", 0) + 1
+                    continue
+                if checked.stat().st_size > 2 * 1024 * 1024:
+                    skipped["file_size"] = skipped.get("file_size", 0) + 1
+                    continue
+                if read_bytes >= self._MAX_READ_BYTES:
+                    reasons.add("read_bytes")
+                    break
+                data = self._read_search_file(run, checked, self._MAX_READ_BYTES - read_bytes)
+                read_bytes += len(data)
+                if read_bytes > self._MAX_READ_BYTES:
+                    reasons.add("read_bytes")
+                    break
+                if len(data) > 2 * 1024 * 1024 or b"\0" in data:
+                    skipped["binary_or_large"] = skipped.get("binary_or_large", 0) + 1
+                    continue
+                try:
+                    text = data.decode("utf-8-sig")
+                except UnicodeDecodeError:
+                    skipped["encoding"] = skipped.get("encoding", 0) + 1
+                    continue
+                lines = text.split("\n")
+                if text.endswith("\n"):
+                    lines.pop()
+                hits = []
+                extra_line = len(lines)
+                for index, line in enumerate(lines):
+                    run.check()
+                    if needle in (line if case_sensitive else line.casefold()):
+                        if len(hits) == max_results - matches:
+                            reasons.add("max_results")
+                            extra_line = index
+                            break
+                        hits.append(index)
+                selected = set()
+                for index in hits:
+                    selected.update(range(max(0, index - context_lines),
+                                          min(len(lines), index + context_lines + 1, extra_line)))
+                hit_set = set(hits)
+                for index in sorted(selected):
+                    run.check()
+                    line = lines[index].rstrip("\r")
+                    row = {"path": relative.as_posix(), "line": index + 1, "text": line[:2000],
+                           "line_truncated": len(line) > 2000, "is_match": index in hit_set}
+                    size = len(json.dumps(row, ensure_ascii=False).encode("utf-8")) + 2
+                    if len(rows) == 1000 or output_bytes + size > self._MAX_OUTPUT_BYTES:
+                        reasons.add("result_output")
+                        break
+                    rows.append(row)
+                    output_bytes += size
+                    matches += int(row["is_match"])
+                if reasons.intersection({"max_results", "result_output"}):
+                    break
+        except TimeoutError:
+            reasons.add("time_budget")
+        if skipped:
+            reasons.add("skipped_files")
+            warnings.append("部分文件因类型、大小、编码或路径限制未搜索，不能据空结果认定整个范围无匹配")
+        # 状态先于正文，已有界面截断和上下文预览仍能识别降级与不完整覆盖。
+        return json.dumps({"backend": backend, "fallback_reason": "rg_unavailable", "truncated": bool(reasons),
+                           "truncation_reasons": sorted(reasons), "warnings": warnings, "skipped": skipped,
+                           "match_count": matches,
+                           "limits": "UTF-8 literal search; files <= 2 MiB; <= 5000 entries; reads <= 20 MiB; "
+                                     "<= 1000 rows; lines <= 2000 chars; output <= 2 MB; total budget 30 s.",
+                           "results": rows},
                           ensure_ascii=False)
 
 
