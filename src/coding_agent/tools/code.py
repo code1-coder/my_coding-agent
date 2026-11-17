@@ -16,6 +16,7 @@ import time
 import tokenize
 from pathlib import Path
 
+from coding_agent.security.permission import approved_search_path, resolve_search_path
 from coding_agent.tools.base import Tool
 from coding_agent.tools.builtin import _safe_path
 
@@ -47,6 +48,10 @@ class _SearchRun:
     def __init__(self) -> None:
         self.stopped = threading.Event()
         self.deadline = time.monotonic() + 30
+        self.workdir = Path.cwd()
+        self.target = self.workdir
+        self.target_is_directory = True
+        self.external = False
 
     def check(self) -> None:
         if self.stopped.is_set():
@@ -89,7 +94,7 @@ class _SearchRun:
 
 class SearchCodeTool(WorkspaceTool):
     name = "search_code"
-    description = ("搜索工作区，返回 JSON：路径、1-based 行号、匹配和上下文。优先 ripgrep，"
+    description = ("搜索工作区或经用户单次批准的外部文件/目录，返回 JSON：路径、1-based 行号、匹配和上下文。优先 ripgrep，"
                    "缺失时用 Git 筛选文件并用 Python 字面量搜索；Git 也缺失时须指定文件。"
                    "跳过隐藏、二进制文件和符号链接；regex 和复杂 glob 需要 rg。备用限制见 warnings。")
     _MAX_FILES = 5000
@@ -132,17 +137,11 @@ class SearchCodeTool(WorkspaceTool):
                 self._capability_key, self._capability_time = key, time.monotonic()
             return dict(self._executables)
 
-    def _checked_path(self, path: str) -> Path:
-        target = _safe_path(self._workdir, path)
-        requested = self._workdir / path
-        for candidate in (requested, *requested.parents):
-            if candidate == self._workdir:
-                break
-            info = candidate.lstat()
-            if stat.S_ISLNK(info.st_mode) or getattr(info, "st_file_attributes", 0) & 0x400:
-                raise ValueError("Searching through symlinks or junctions is not supported")
-        if any(part.casefold() == ".git" for part in target.relative_to(self._workdir).parts):
-            raise ValueError("Searching .git metadata is not supported")
+    def _checked_path(self, run: _SearchRun, path: str) -> Path:
+        target = resolve_search_path(run.workdir, path)
+        if (not target.is_relative_to(run.workdir)
+                or (target != run.target and not (run.target_is_directory and target.is_relative_to(run.target)))):
+            raise ValueError("Path outside the requested search scope")
         return target
 
     def execute(self, pattern: str, path: str = ".", file_glob: str | None = None,
@@ -174,9 +173,15 @@ class SearchCodeTool(WorkspaceTool):
         _integer(max_results, "max_results", 1, 500)
         if not isinstance(pattern, str) or not pattern or "\n" in pattern or "\r" in pattern:
             raise ValueError("pattern must be a non-empty single-line string")
-        target = self._checked_path(path)
+        target = approved_search_path(self._workdir, path)
         if not target.exists():
             raise FileNotFoundError(path)
+        # 搜索根与结果路径属于单次调用；不能修改共享工具的工作区或依赖查找环境。
+        run.target = target
+        run.target_is_directory = target.is_dir()
+        run.external = not target.is_relative_to(self._workdir)
+        run.workdir = (target if run.target_is_directory else target.parent) if run.external else self._workdir
+        self._checked_path(run, str(target))
         executable = self._capabilities()["rg"]
         if executable is not None:
             return self._ripgrep(run, executable, target, pattern, file_glob, regex,
@@ -197,12 +202,12 @@ class SearchCodeTool(WorkspaceTool):
         if file_glob:
             command.extend(["--type-add", f"agentfilter:{file_glob}", "--type", "agentfilter"])
         command.append("--glob=!.*")
-        command.extend(["--", pattern, str(target.relative_to(self._workdir))])
+        command.extend(["--", pattern, str(target.relative_to(run.workdir))])
         try:
-            returncode, raw, error, truncated = run.command(command, self._workdir)
+            returncode, raw, error, truncated = run.command(command, run.workdir)
         except FileNotFoundError:
             # 仅恢复启动时消失的依赖，不将结果文件消失或解析错误误判成缺少 rg。
-            if not self._workdir.exists():
+            if not run.workdir.exists():
                 raise
             with self._capability_lock:
                 self._executables["rg"] = None
@@ -232,9 +237,11 @@ class SearchCodeTool(WorkspaceTool):
             source_text = data["lines"].get("text")
             if source_path is None or source_text is None:
                 continue
-            if not self._checked_path(source_path).is_file():
+            checked = self._checked_path(run, source_path)
+            if not checked.is_file():
                 continue
-            rows.append({"path": Path(source_path).as_posix(), "line": data["line_number"],
+            rows.append({"path": (checked if run.external else checked.relative_to(self._workdir)).as_posix(),
+                         "line": data["line_number"],
                          "text": source_text.rstrip("\r\n")[:2000],
                          "line_truncated": len(source_text.rstrip("\r\n")) > 2000,
                          "is_match": event["type"] == "match"})
@@ -249,7 +256,7 @@ class SearchCodeTool(WorkspaceTool):
     def _git(self, run: _SearchRun, executable: str, arguments: list[str], *, data: bytes = b""):
         command = [executable, "--no-optional-locks", "--no-pager", "-c", "core.fsmonitor=false",
                    "-c", "core.quotePath=false", *arguments]
-        return run.command(command, self._workdir, data=data)
+        return run.command(command, run.workdir, data=data)
 
     def _preflight(self, run: _SearchRun, target: Path, executable: str) -> list[Path]:
         """只检查目录元数据；不能忽视 rg 专属忽略文件后直接扩大读取范围。"""
@@ -267,7 +274,7 @@ class SearchCodeTool(WorkspaceTool):
         while pending:
             run.check()
             current = pending.pop()
-            if current != self._workdir and ((current / ".git").exists()):
+            if current != run.workdir and ((current / ".git").exists()):
                 excluded.append(current)
                 continue
             directories = []
@@ -286,14 +293,14 @@ class SearchCodeTool(WorkspaceTool):
                         directories.append(Path(child.path))
             if directories:
                 # 预检也按 Git 规则裁剪，避免扫描已忽略的依赖目录耗尽元数据预算。
-                data = b"\0".join(os.fsencode(item.relative_to(self._workdir)) for item in directories) + b"\0"
+                data = b"\0".join(os.fsencode(item.relative_to(run.workdir)) for item in directories) + b"\0"
                 code, output, error, clipped = self._git(run, executable,
                     ["check-ignore", "--no-index", "-z", "--stdin"], data=data)
                 if code not in (0, 1) or clipped:
                     raise RuntimeError(f"Git ignore check failed ({code}): {error.strip()}")
                 ignored = set(output.split(b"\0")[:-1])
                 pending.extend(item for item in directories
-                               if os.fsencode(item.relative_to(self._workdir)) not in ignored)
+                               if os.fsencode(item.relative_to(run.workdir)) not in ignored)
         return excluded
 
     def _candidates(self, run: _SearchRun, target: Path, reasons: set[str], warnings: list[str]) -> tuple[str, list[Path]]:
@@ -306,7 +313,7 @@ class SearchCodeTool(WorkspaceTool):
         try:
             code, output, error, clipped = self._git(run, executable, ["rev-parse", "--is-inside-work-tree"])
         except FileNotFoundError:
-            if not self._workdir.exists():
+            if not run.workdir.exists():
                 raise
             with self._capability_lock:
                 self._executables["git"] = None
@@ -326,7 +333,7 @@ class SearchCodeTool(WorkspaceTool):
         excluded = self._preflight(run, target, executable)
         if excluded:
             reasons.add("nested_repository")
-        selected = target.relative_to(self._workdir).as_posix()
+        selected = target.relative_to(run.workdir).as_posix()
         code, output, error, clipped = self._git(run, executable, [
             "ls-files", "-z", "--cached", "--others", "--exclude-standard", "--", f":(literal){selected}"])
         if code != 0:
@@ -351,7 +358,7 @@ class SearchCodeTool(WorkspaceTool):
             run.check()
             if name in ignored_names:
                 continue
-            candidate = self._workdir / os.fsdecode(name)
+            candidate = run.workdir / os.fsdecode(name)
             if not candidate.is_relative_to(target if target.is_dir() else target.parent):
                 raise ValueError("Git returned a path outside the requested search scope")
             if any(candidate.is_relative_to(root) for root in excluded):
@@ -388,13 +395,13 @@ class SearchCodeTool(WorkspaceTool):
             backend, candidates = self._candidates(run, target, reasons, warnings)
             for candidate in candidates:
                 run.check()
-                relative = candidate.relative_to(self._workdir)
+                relative = candidate.relative_to(run.workdir)
                 if any(part.startswith(".") for part in relative.parts):
                     continue
                 if file_glob and not fnmatch.fnmatchcase(candidate.name, file_glob):
                     continue
                 try:
-                    checked = self._checked_path(str(relative))
+                    checked = self._checked_path(run, str(relative))
                 except (ValueError, FileNotFoundError):
                     skipped["unsafe_path"] = skipped.get("unsafe_path", 0) + 1
                     continue
@@ -441,7 +448,8 @@ class SearchCodeTool(WorkspaceTool):
                 for index in sorted(selected):
                     run.check()
                     line = lines[index].rstrip("\r")
-                    row = {"path": relative.as_posix(), "line": index + 1, "text": line[:2000],
+                    row = {"path": (checked if run.external else relative).as_posix(),
+                           "line": index + 1, "text": line[:2000],
                            "line_truncated": len(line) > 2000, "is_match": index in hit_set}
                     size = len(json.dumps(row, ensure_ascii=False).encode("utf-8")) + 2
                     if len(rows) == 1000 or output_bytes + size > self._MAX_OUTPUT_BYTES:

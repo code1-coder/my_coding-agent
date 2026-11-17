@@ -240,6 +240,38 @@ def test_chat_completes_approved_external_file_read(tmp_path, monkeypatch):
     assert provider.closed
 
 
+def test_chat_searches_external_directory_after_terminal_confirmation(tmp_path, monkeypatch):
+    from test_runtime import ScriptedProvider, text_response, tool_response
+
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    directory = tmp_path / "外部 文档"
+    directory.mkdir()
+    source = directory / "report.md"
+    source.write_text("before\n4.7 search approval\n", encoding="utf-8")
+    observed_results = []
+
+    def respond(messages, _tools, _system):
+        if len(messages) == 1:
+            return tool_response("search_code", {"pattern": "4.7", "path": str(directory)})
+        result = messages[-1]["content"][0]
+        assert not result.get("is_error"), result
+        observed_results.append(json.loads(result["content"]))
+        return text_response("已找到批准目录中的第 2 行")
+
+    provider = ScriptedProvider(handler=respond)
+    monkeypatch.setattr(main, "load_config", lambda _: Config(workdir=str(workspace)))
+    monkeypatch.setattr(main, "_build_provider", lambda _: provider)
+    result = CliRunner().invoke(main.cli, ["chat"], input="搜索外部目录\ny\nexit\n")
+    assert result.exit_code == 0, result.exception
+    assert result.output.count("允许执行？") == 1
+    assert "[工具失败]" not in result.output
+    assert "已找到批准目录中的第 2 行" in result.output
+    assert observed_results[0]["results"][0]["path"] == source.as_posix()
+    assert observed_results[0]["results"][0]["line"] == 2
+    assert provider.closed
+
+
 @pytest.mark.parametrize("mode", ["run", "chat", "limit"])
 def test_cli_delivers_result_after_real_file_write(tmp_path, monkeypatch, mode):
     from test_runtime import ScriptedProvider, text_response, tool_response

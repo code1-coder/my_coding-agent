@@ -2,6 +2,9 @@
 
 import asyncio
 import json
+import os
+import shutil
+import subprocess
 from copy import deepcopy
 from unittest.mock import AsyncMock
 
@@ -241,6 +244,82 @@ async def test_runtime_reads_external_file_after_explicit_approval(tmp_path):
         assert approvals[0][0] == "read_file"
         reused_grant = await runtime.registry.dispatch("read_file", {"path": str(external_file)})
         assert reused_grant.error and "路径逃逸工作区" in reused_grant.error
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(("backend", "scope"), [
+    ("rg", "directory"), ("rg", "file"),
+    ("git", "directory"), ("git", "file"), ("git", "subdirectory"), ("file", "file"),
+])
+async def test_runtime_searches_external_scope_after_explicit_approval(tmp_path, monkeypatch, backend, scope):
+    executable = shutil.which("rg" if backend == "rg" else "git")
+    if backend != "file" and executable is None:
+        pytest.skip(f"requires {backend}")
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    external = tmp_path / "外部 文档"
+    external.mkdir()
+    directory = external / "子目录" if scope == "subdirectory" else external
+    directory.mkdir(exist_ok=True)
+    source = directory / "report.md"
+    source.write_text("before\n4.7 approved scope\nafter\n", encoding="utf-8")
+    (external / "ignored.md").write_text("4.7 private\n", encoding="utf-8")
+    if backend == "git":
+        subprocess.run([executable, "init", "-q"], cwd=external, check=True, capture_output=True)
+        (external / ".gitignore").write_text("ignored.md\n", encoding="utf-8")
+    elif backend == "rg":
+        (external / "ignored.md").unlink()
+    monkeypatch.setenv("PATH", os.path.dirname(executable) if backend != "file" else "")
+    target = source if scope == "file" else directory
+    provider = ScriptedProvider([
+        tool_response("search_code", {"pattern": "4.7", "path": str(target)}, "approved-search"),
+        text_response("已找到批准范围内的内容"),
+    ])
+    approvals = []
+
+    async def approve(tool_name, params, reason):
+        approvals.append((tool_name, params["path"]))
+        return True
+
+    async with AgentRuntime(Config(workdir=str(workspace)), provider=provider) as runtime:
+        runtime.permissions.approval_handler = approve
+        events = await collect(runtime)
+        completed = next(event for event in events if event.type == "tool_done")
+        assert not completed.data["is_error"], completed.tool_output
+        result = json.loads(completed.tool_output)
+        assert result["match_count"] == 1
+        assert result["results"][0]["path"] == source.as_posix()
+        assert result["results"][0]["line"] == 2
+        assert approvals == [("search_code", str(target))]
+        assert events[-1].type == "done"
+        reused = await runtime.registry.dispatch("search_code", {"pattern": "4.7", "path": str(target)})
+        assert reused.error and "路径逃逸工作区" in reused.error
+        assert runtime.workdir == workspace.resolve()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("approval", ["reject", "no_handler"])
+async def test_runtime_denies_external_search_without_approval(tmp_path, approval):
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    external = tmp_path / "outside.md"
+    external.write_text("unapproved value\n", encoding="utf-8")
+    provider = ScriptedProvider([
+        tool_response("search_code", {"pattern": "value", "path": str(external)}),
+        text_response("没有批准，未搜索外部文件"),
+    ])
+
+    async def reject(*_args):
+        return False
+
+    async with AgentRuntime(Config(workdir=str(workspace)), provider=provider) as runtime:
+        runtime.permissions.approval_handler = reject if approval == "reject" else None
+        events = await collect(runtime)
+        result = next(event for event in events if event.type == "tool_done")
+        assert result.data["is_error"]
+        assert ("Permission denied by user" if approval == "reject" else "no handler") in result.tool_output
+        assert "unapproved value" not in result.tool_output
+        assert events[-1].type == "done"
 
 
 @pytest.mark.asyncio

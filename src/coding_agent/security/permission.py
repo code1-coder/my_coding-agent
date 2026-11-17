@@ -28,9 +28,11 @@ from __future__ import annotations
 import asyncio
 from contextlib import asynccontextmanager
 from contextvars import ContextVar, Token
+from dataclasses import dataclass
 import logging
 import os
 import re
+import stat
 from abc import ABC, abstractmethod
 from enum import Enum
 from pathlib import Path, PureWindowsPath
@@ -42,8 +44,20 @@ except ImportError:
     yaml = None  # type: ignore[assignment]
 
 logger = logging.getLogger(__name__)
-_approved_external_read: ContextVar[tuple[Path, Path] | None] = ContextVar(
+
+
+@dataclass(frozen=True)
+class _ExternalPathGrant:
+    workdir: Path
+    path: Path
+    is_directory: bool = False
+
+
+_approved_external_read: ContextVar[_ExternalPathGrant | None] = ContextVar(
     "approved_external_read", default=None,
+)
+_approved_external_search: ContextVar[_ExternalPathGrant | None] = ContextVar(
+    "approved_external_search", default=None,
 )
 _WINDOWS_DRIVE_PATH = re.compile(r"^([a-zA-Z]):[\\/]")
 
@@ -84,9 +98,42 @@ def approved_read_path(workdir: Path, relative_path: str) -> Path:
     resolved_path = resolve_read_path(resolved_workdir, relative_path)
     if resolved_path.is_relative_to(resolved_workdir):
         return resolved_path
-    if _approved_external_read.get() == (resolved_workdir, resolved_path):
+    if _approved_external_read.get() == _ExternalPathGrant(resolved_workdir, resolved_path):
         return resolved_path
     raise ValueError(f"路径逃逸工作区: {relative_path}")
+
+
+def resolve_search_path(workdir: Path, requested_path: str) -> Path:
+    """搜索不跟随链接；解析后的安全检查不能丢失原始路径中的链接信息。"""
+    resolved = resolve_read_path(workdir, requested_path)
+    path_text = requested_path.strip()
+    if _WINDOWS_DRIVE_PATH.match(path_text) and os.name != "nt":
+        windows_path = PureWindowsPath(path_text)
+        requested = _wsl_drive_mount(windows_path.drive[0]).joinpath(*windows_path.parts[1:])
+    else:
+        requested = workdir / path_text
+    for candidate in (requested, *requested.parents):
+        if candidate == workdir:
+            break
+        info = candidate.lstat()
+        if stat.S_ISLNK(info.st_mode) or getattr(info, "st_file_attributes", 0) & 0x400:
+            raise ValueError("Searching through symlinks or junctions is not supported")
+    parts = resolved.relative_to(workdir).parts if resolved.is_relative_to(workdir) else resolved.parts
+    if any(part.casefold() == ".git" for part in parts):
+        raise ValueError("Searching .git metadata is not supported")
+    return resolved
+
+
+def approved_search_path(workdir: Path, requested_path: str) -> Path:
+    """只接受当前搜索审批的精确目标，后代文件由本次搜索范围约束。"""
+    workdir = workdir.resolve()
+    resolved = resolve_read_path(workdir, requested_path)
+    if (not resolved.is_relative_to(workdir)
+            and _approved_external_search.get() != _ExternalPathGrant(workdir, resolved, resolved.is_dir())):
+        raise ValueError(f"路径逃逸工作区: {requested_path}")
+    if resolve_search_path(workdir, requested_path) != resolved:
+        raise ValueError("搜索路径在校验期间发生变化，请重新审批")
+    return resolved
 
 
 # ---------------------------------------------------------------------------
@@ -231,10 +278,10 @@ class WorkspaceChecker(BasePermissionChecker):
 
         rel = params.get("path") or "."
         try:
-            resolved = (resolve_read_path(self.workdir, rel) if tool_name == "read_file"
+            resolved = (resolve_read_path(self.workdir, rel) if tool_name in ("read_file", "search_code")
                         else (self.workdir / rel).resolve())
         except (OSError, ValueError) as exc:
-            if tool_name == "read_file":
+            if tool_name in ("read_file", "search_code"):
                 return Verdict.DENY, f"File path is not accessible from this runtime: {rel}: {exc}"
             return Verdict.NEEDS_APPROVAL, f"Invalid path: {rel}"
 
@@ -332,29 +379,29 @@ class PermissionPipeline:
         tool_name: str,
         params: dict[str, Any],
     ) -> AsyncIterator[tuple[Verdict, str]]:
-        """把审批授权限制在一次工具调用和一个精确外部读取路径内。"""
+        """读取与搜索分别持有单次授权，不能互用或改变工作区根目录。"""
         verdict, reason, grant = await self._evaluate(tool_name, params)
-        token: Token[tuple[Path, Path] | None] | None = None
+        token: Token[_ExternalPathGrant | None] | None = None
+        approved_scope = _approved_external_search if tool_name == "search_code" else _approved_external_read
         if verdict == Verdict.ALLOW and grant is not None:
-            token = _approved_external_read.set(grant)
+            token = approved_scope.set(grant)
         try:
             yield verdict, reason
         finally:
             if token is not None:
-                _approved_external_read.reset(token)
+                approved_scope.reset(token)
 
     async def _evaluate(
         self,
         tool_name: str,
         params: dict[str, Any],
-    ) -> tuple[Verdict, str, tuple[Path, Path] | None]:
+    ) -> tuple[Verdict, str, _ExternalPathGrant | None]:
         """运行权限管线。
 
         返回:
-            ``(Verdict, reason)`` —— 第一个非 ALLOW 的裁决，
-            或 ``(ALLOW, "")`` 如果所有检查器通过。
+            ``(Verdict, reason, grant)``，只有全部检查通过才返回本次外部路径授权。
         """
-        approved_read: tuple[Path, Path] | None = None
+        approved_path: _ExternalPathGrant | None = None
         for checker in self.checkers:
             verdict, reason = await checker.check(tool_name, params)
 
@@ -370,6 +417,19 @@ class PermissionPipeline:
                     )
                     return Verdict.DENY, f"Approval required but no handler: {reason}", None
 
+                pending_grant = None
+                if tool_name in ("read_file", "search_code") and isinstance(checker, WorkspaceChecker):
+                    # 在等待用户之前绑定目标；审批期间改路径或重定向链接不能扩大授权。
+                    resolver = resolve_search_path if tool_name == "search_code" else resolve_read_path
+                    try:
+                        resolved_path = resolver(checker.workdir, params.get("path") or ".")
+                    except (OSError, ValueError) as exc:
+                        return Verdict.DENY, str(exc), None
+                    if not resolved_path.is_relative_to(checker.workdir):
+                        pending_grant = _ExternalPathGrant(
+                            checker.workdir, resolved_path,
+                            is_directory=tool_name == "search_code" and resolved_path.is_dir(),
+                        )
                 current_task = asyncio.current_task()
                 if current_task is not None:
                     self._approval_tasks.add(current_task)
@@ -380,15 +440,11 @@ class PermissionPipeline:
                         self._approval_tasks.discard(current_task)
                 if not approved:
                     return Verdict.DENY, f"Permission denied by user: {reason}", None
-                if tool_name == "read_file" and isinstance(checker, WorkspaceChecker):
-                    path = params.get("path")
-                    if isinstance(path, str):
-                        resolved_path = resolve_read_path(checker.workdir, path)
-                        if not resolved_path.is_relative_to(checker.workdir):
-                            approved_read = (checker.workdir, resolved_path)
+                if pending_grant is not None:
+                    approved_path = pending_grant
                 # 用户同意 —— 继续走链中后续检查器
 
-        return Verdict.ALLOW, "", approved_read
+        return Verdict.ALLOW, "", approved_path
 
 
 # ---------------------------------------------------------------------------
