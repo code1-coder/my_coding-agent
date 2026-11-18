@@ -957,12 +957,17 @@ async def test_stream_reconciles_deltas_with_final_response(
 
 
 @pytest.mark.asyncio
-async def test_whitespace_only_stream_uses_nonblank_final_delivery(tmp_path):
+@pytest.mark.parametrize("deltas, final_text", [
+    (["  ", "\n"], "  \n"),
+    (["旧正文"], ""),
+    (["旧正文"], "  \n"),
+])
+async def test_blank_final_response_uses_nonblank_final_delivery(tmp_path, deltas, final_text):
     class WhitespaceProvider(ScriptedProvider):
         async def stream_message(self, *args, **kwargs):
-            response = text_response("  \n")
-            yield StreamEvent(type="text_delta", text="  ")
-            yield StreamEvent(type="text_delta", text="\n")
+            for delta in deltas:
+                yield StreamEvent(type="text_delta", text=delta)
+            response = text_response(final_text)
             yield StreamEvent(type="done", response=response)
 
         async def create_message(self, messages, tools=None, system="", max_tokens=8000):
@@ -973,11 +978,14 @@ async def test_whitespace_only_stream_uses_nonblank_final_delivery(tmp_path):
     async with AgentRuntime(Config(workdir=str(tmp_path)), provider=WhitespaceProvider()) as runtime:
         events = await collect(runtime, "检查空白响应")
 
-    text_events = [event.text for event in events if event.type == "text_delta"]
-    assert len(text_events) == 1
-    assert text_events[0].strip()
-    assert "空白响应未作为正文显示。" in text_events[0]
+    visible_events = [(event.type, event.text) for event in events
+                      if event.type in {"text_delta", "text_reset"}]
+    expected = [("text_delta", "空白响应未作为正文显示。")]
+    if any(delta.strip() for delta in deltas):
+        expected[:0] = [("text_delta", "旧正文"), ("text_reset", "")]
+    assert visible_events == expected
     assert events[-1].type == "done"
+    assert events[-1].text == "空白响应未作为正文显示。"
 
 
 @pytest.mark.asyncio

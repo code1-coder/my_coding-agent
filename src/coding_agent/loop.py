@@ -589,9 +589,9 @@ class AgentLoop:
                         if suffix:
                             queue.put_nowait(StreamEvent(type="text_delta", text=suffix))
                             delivered_text += suffix
-                    elif final_text.strip() and final_text != delivered_text:
+                    else:
                         queue.put_nowait(LoopEvent(
-                            type="text_reset", text=final_text,
+                            type="text_reset", text=final_text if final_text.strip() else "",
                             data={"reason": "response_reconciliation"},
                         ))
                 await self.emit(EventType.POST_LLM_CALL, response=response,
