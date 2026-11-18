@@ -17,10 +17,10 @@
     2. 重试一次。仍然失败则追加错误消息并返回。
 
 **路径 3 — 429/529 和连接中断（瞬时错误）**
-    1. 指数退避：``500ms × 2^attempt``（最大 32s）+ 0–25% 随机抖动。
+    1. 指数退避从 2 秒起步，最大 30 秒，遵守服务端冷却时间。
     2. 529 过载：跟踪连续 529 次数。连续 3 次后切换
-       fallback 模型（若已配置）。最多 10 次总重试。
-    3. 连接中断、超时和不完整流最多尝试 3 次；调用方阻止已显示文本的重放。
+       fallback 模型（若已配置），不重置预算。
+    3. 瞬时错误默认共享 5 次总尝试；调用方阻止已显示文本的重放。
     4. 非瞬时错误立即向上抛出。
 
 ``RecoveryState`` 追踪所有恢复计数器（has_escalated、
@@ -32,19 +32,30 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import math
 import random
-import re
+import ssl
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass
+from email.utils import parsedate_to_datetime
 from typing import Any, Callable, Awaitable
 
 import anthropic
 import httpx
 import openai
 
-from coding_agent.providers.base import IncompleteStreamError, ModelRequestError
+from coding_agent.providers.activity import _sdk_http_module
+from coding_agent.providers.base import (
+    IncompleteStreamError, ModelIdleTimeout, ModelRequestError, RecoverableModelRequestError,
+)
 
 logger = logging.getLogger(__name__)
+_HTTP_MODULES = (httpx, _sdk_http_module("openai"), _sdk_http_module("anthropic"))
+_TRANSPORT_ERRORS = tuple(module.TransportError for module in _HTTP_MODULES)
+_CONFIG_ERRORS = (ssl.SSLError,) + tuple(
+    kind for module in _HTTP_MODULES for kind in (module.UnsupportedProtocol, module.LocalProtocolError)
+)
+_STATUS_ERRORS = (openai.APIStatusError, anthropic.APIStatusError)
 
 # ---------------------------------------------------------------------------
 #  错误恢复常量
@@ -53,9 +64,7 @@ logger = logging.getLogger(__name__)
 DEFAULT_MAX_TOKENS = 8000
 ESCALATED_MAX_TOKENS = 64000
 MAX_RECOVERY_RETRIES = 3           # 续写提示词的最大次数（路径 1）
-MAX_RETRIES = 10                   # 退避重试的最大次数（路径 3）
-MAX_CONNECTION_ATTEMPTS = 3
-BASE_DELAY_MS = 500                # 退避起始延迟
+DEFAULT_MODEL_ATTEMPTS = 5
 MAX_CONSECUTIVE_529 = 3            # 连续 529 超过此次数后切换模型
 
 CONTINUATION_PROMPT = (
@@ -97,16 +106,38 @@ class RecoveryState:
 # ---------------------------------------------------------------------------
 
 
-def _retry_delay(attempt: int, retry_after: float | None = None) -> float:
-    """指数退避 + 随机抖动。
+@dataclass
+class RetryBudget:
+    maximum: int = DEFAULT_MODEL_ATTEMPTS
+    deadline: float = math.inf
+    attempts: int = 0
+    on_wait: Callable[[str, int | None, float], None] | None = None
 
-    ``retry_after``（来自 ``Retry-After`` header）优先使用。
-    """
-    if retry_after is not None:
-        return float(retry_after)
-    base = min(BASE_DELAY_MS * (2 ** attempt), 32000) / 1000.0
-    jitter = random.uniform(0, base * 0.25)
-    return base + jitter
+
+def _retry_delay(attempt: int) -> float:
+    base = min(2 ** attempt, 30)
+    return min(30, base + random.uniform(0, base * 0.25))
+
+
+def retry_after_deadline(exc: Exception, now: float) -> float | None:
+    value = exc.response.headers.get("retry-after") if isinstance(exc, _STATUS_ERRORS) else None
+    if value is None:
+        return None
+    value = value.strip()
+    try:
+        if value.isascii() and value.isdecimal():
+            delay = float(value)
+        else:
+            date = parsedate_to_datetime(value)
+            if date.tzinfo is None:
+                raise ValueError("HTTP 日期缺少时区")
+            delay = date.timestamp() - time.time()
+        if not math.isfinite(delay):
+            raise ValueError("等待时间不是有限值")
+    except (ValueError, OverflowError, OSError):
+        logger.debug("模型服务返回了无效的 Retry-After")
+        return None
+    return now + max(0., delay)
 
 
 # ---------------------------------------------------------------------------
@@ -144,14 +175,61 @@ LLMCall = Callable[[], Awaitable[Any]]
 
 def is_connection_error(exc: Exception) -> bool:
     """识别 SDK 连接错误和超时，避免依赖异常文案进行重试。"""
-    return isinstance(exc, (openai.APIConnectionError, anthropic.APIConnectionError,
-                            httpx.TransportError, ConnectionError, TimeoutError, IncompleteStreamError))
+    if not isinstance(exc, (openai.APIConnectionError, anthropic.APIConnectionError,
+                            ConnectionError, TimeoutError, IncompleteStreamError) + _TRANSPORT_ERRORS):
+        return False
+    cause: BaseException | None = exc
+    seen: set[int] = set()
+    while cause is not None and id(cause) not in seen:
+        seen.add(id(cause))
+        if isinstance(cause, _CONFIG_ERRORS):
+            return False
+        cause = cause.__cause__ or cause.__context__
+    return True
+
+
+RETRY_LABELS = {
+    "connection": "模型连接中断或超时",
+    "idle_timeout": "模型流空闲超时",
+    "rate_limit": "模型服务限流",
+    "overload": "模型服务过载",
+    "server": "模型服务暂时不可用",
+}
+
+
+def retry_category(exc: Exception) -> tuple[str | None, int | None]:
+    if isinstance(exc, ModelIdleTimeout):
+        return "idle_timeout", None
+    if is_connection_error(exc):
+        return "connection", None
+    if not isinstance(exc, (openai.APIError, anthropic.APIError)):
+        return None, None
+    if isinstance(exc, _STATUS_ERRORS) and exc.response.headers.get("x-should-retry") == "false":
+        return None, None
+    status = getattr(exc, "status_code", None)
+    if status is None or status == 200:
+        body = exc.body
+        if isinstance(body, dict):
+            error = body.get("error", body)
+            if isinstance(error, dict):
+                status = {"overloaded_error": 529, "rate_limit_error": 429,
+                          "rate_limit_exceeded": 429, "server_error": 500}.get(
+                    str(error.get("type") or error.get("code")),
+                )
+    if status == 429:
+        return "rate_limit", status
+    if status == 529:
+        return "overload", status
+    # 两个 SDK 均把 408/409 纳入重试条件，但 408/409 不适用于普通业务异常。
+    if status in (408, 409, 500, 502, 503, 504):
+        return "server", status
+    return None, None
 
 
 def is_model_request_failure(exc: Exception) -> bool:
     """识别可安全转为失败终态的模型请求异常，不包含程序缺陷和取消。"""
     return isinstance(exc, (ModelRequestError, openai.APIError, anthropic.APIError,
-                            httpx.TransportError, ConnectionError, TimeoutError))
+                            ConnectionError, TimeoutError) + _TRANSPORT_ERRORS)
 
 
 async def with_retry(
@@ -159,6 +237,7 @@ async def with_retry(
     state: RecoveryState,
     *,
     fallback_model: str | None = None,
+    budget: RetryBudget | None = None,
 ) -> Any:
     """对限流、过载、连接中断和超时做有界指数退避。
 
@@ -174,90 +253,45 @@ async def with_retry(
         成功时的 LLM 响应。
 
     异常:
-        如果不是 429/529 错误，或 ``MAX_RETRIES`` 用尽后，
-        抛出原始异常。
+        非瞬时错误保持原样；预算耗尽时保留最后一次失败的 cause。
     """
-    connection_attempts = 0
-    server_attempts = 0
-    for attempt in range(MAX_RETRIES):
+    budget = budget or RetryBudget()
+    clock = asyncio.get_running_loop().time
+    while budget.attempts < budget.maximum:
+        budget.attempts += 1
         try:
             result = await fn()
             state.reset_transient()
             return result
         except Exception as exc:
-            if is_connection_error(exc):
-                connection_attempts += 1
-                if connection_attempts >= MAX_CONNECTION_ATTEMPTS:
-                    raise ModelRequestError(
-                        f"模型连接中断或超时，重试后仍失败（{connection_attempts} 次尝试）。"
-                        "请检查网络和模型接口后重试。"
-                    ) from exc
-                delay = _retry_delay(connection_attempts - 1)
-                logger.warning("[连接中断] 重试 %d/%d，等待 %.1fs",
-                               connection_attempts, MAX_CONNECTION_ATTEMPTS - 1, delay)
-                await asyncio.sleep(delay)
-                continue
-            ename = type(exc).__name__.lower()
-            emsg = str(exc).lower()
-            status = getattr(exc, "status_code", None)
+            category, status = retry_category(exc)
+            if status != 529:
+                state.reset_transient()
+            if category is None:
+                raise
 
-            if status in (408, 409) or (status is not None and 500 <= status < 600 and status != 529):
-                server_attempts += 1
-                if server_attempts >= MAX_CONNECTION_ATTEMPTS:
-                    raise ModelRequestError(
-                        f"模型服务连续返回 HTTP {status}（{server_attempts} 次尝试），已停止重试。"
-                    ) from exc
-                delay = _retry_delay(server_attempts - 1)
-                logger.warning(
-                    "[HTTP %s] 重试 %d/%d，等待 %.1fs",
-                    status, server_attempts, MAX_CONNECTION_ATTEMPTS - 1, delay,
-                )
-                await asyncio.sleep(delay)
-                continue
-
-            # ── 429 限流 ──────────────────────────────────
-            if status == 429 or "ratelimit" in ename or re.search(r"\b429\b", emsg) or "rate limit" in emsg or "rate_limit" in emsg:
+            if status == 429:
                 state.total_429_retries += 1
-                delay = _retry_delay(attempt)
-                logger.warning(
-                    "[429 限流] 重试 %d/%d，等待 %.1fs",
-                    attempt + 1, MAX_RETRIES, delay,
-                )
-                await asyncio.sleep(delay)
-                continue
-
-            # ── 529 过载 ──────────────────────────────────
-            if status == 529 or "overloaded" in ename or re.search(r"\b529\b", emsg) or "overloaded" in emsg:
+            elif status == 529:
                 state.consecutive_529 += 1
                 state.total_529_retries += 1
-
-                if state.consecutive_529 >= MAX_CONSECUTIVE_529:
-                    if fallback_model:
-                        state.current_model = fallback_model
-                        state.consecutive_529 = 0
-                        logger.warning(
-                            "[529 overload x%d] switching to %s",
-                            MAX_CONSECUTIVE_529, fallback_model,
-                        )
-                    else:
-                        state.consecutive_529 = 0
-                        logger.warning(
-                            "[529 overload x%d] no fallback configured, continuing",
-                            MAX_CONSECUTIVE_529,
-                        )
-
-                delay = _retry_delay(attempt)
-                logger.warning(
-                    "[529 overload] retry %d/%d, wait %.1fs",
-                    attempt + 1, MAX_RETRIES, delay,
-                )
-                await asyncio.sleep(delay)
-                continue
-
-            # ── 非瞬时错误 → 向上抛出，由外层处理器处理 ──
-            raise
-
-    raise RuntimeError(f"Max retries ({MAX_RETRIES}) exceeded")
+            now = clock()
+            retry_at = retry_after_deadline(exc, now)
+            delay = max(_retry_delay(budget.attempts), (retry_at or now) - now)
+            if budget.attempts == budget.maximum or now + delay >= budget.deadline:
+                reason = "已达到尝试上限" if budget.attempts == budget.maximum else "剩余总预算不足以等待重试"
+                label = f"模型服务返回 HTTP {status}" if status else RETRY_LABELS[category]
+                raise RecoverableModelRequestError(
+                    f"{label}，{reason}（{budget.attempts} 次尝试）。",
+                    category=category, status=status, retry_at=retry_at,
+                ) from exc
+            if fallback_model and state.consecutive_529 >= MAX_CONSECUTIVE_529:
+                state.current_model = fallback_model
+                state.reset_transient()
+            if budget.on_wait:
+                budget.on_wait(category, status, delay)
+            await asyncio.sleep(delay)
+    raise ValueError("重试预算必须包含至少一次可用尝试")
 
 
 # ---------------------------------------------------------------------------
@@ -313,6 +347,7 @@ class RecoveryManager:
         messages: list[dict[str, Any]],
         *,
         max_tokens: int = DEFAULT_MAX_TOKENS,
+        budget: RetryBudget | None = None,
     ) -> Any | None:
         """包装一次 LLM 调用，提供完整的三路径恢复。
 
@@ -331,19 +366,24 @@ class RecoveryManager:
         messages，使调用闭包仍能访问同一个列表。输出被截断的响应
         需要调用方另行交给 handle_max_tokens 处理；其他异常继续抛出。
         """
+        budget = budget or RetryBudget()
         while True:
             try:
                 response = await with_retry(
                     llm_fn,
                     state,
                     fallback_model=self._fallback_model,
+                    budget=budget,
                 )
                 # 成功 —— 重置路径 1 状态
                 return response
 
             except Exception as exc:
                 # ── 路径 2: prompt_too_long ─────────────────
-                if is_prompt_too_long_error(exc):
+                if (isinstance(exc, _STATUS_ERRORS) and exc.status_code in (400, 413, 422)
+                        and is_prompt_too_long_error(exc)):
+                    if budget.attempts >= budget.maximum:
+                        return None
                     if not state.has_attempted_reactive_compact:
                         if self._compact_fn is None:
                             logger.warning(

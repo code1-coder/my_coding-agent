@@ -336,17 +336,17 @@ def test_chat_survives_exhausted_connection_failure(provider, monkeypatch):
 
     async def interrupted(*args, **kwargs):
         attempts.append(1)
-        if len(attempts) <= 3:
+        if len(attempts) <= 5:
             raise openai.APIConnectionError(request=httpx.Request("POST", "https://example.invalid"))
         async for event in original(*args, **kwargs):
             yield event
 
     monkeypatch.setattr(provider, "stream_message", interrupted)
-    result = CliRunner().invoke(main.cli, ["chat"], input="你好\n再试一次\nexit\n")
+    result = CliRunner().invoke(main.cli, ["chat"], input="你好\n/retry\nexit\n")
     assert result.exit_code == 0, result.exception
-    assert "3 次尝试" in result.output and "会话已保留" in result.output
+    assert "5 次尝试" in result.output and "会话已保留" in result.output
     assert "我叫李华。" in result.output
-    assert len(attempts) == 4 and provider.closed
+    assert len(attempts) == 6 and provider.closed
 
 
 @pytest.mark.parametrize("command", ["chat", "run"])

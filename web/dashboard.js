@@ -437,6 +437,32 @@ async function submitApproval(approvalId, approved) {
   }
 }
 
+function addRetryButton(node, data) {
+  const button = document.createElement('button');
+  button.type = 'button';
+  button.className = 'button secondary retry-request';
+  const icon = document.createElement('i');
+  icon.dataset.icon = 'refresh-cw';
+  button.append(icon, document.createTextNode('重试本次请求'));
+  node.append(button);
+  renderIcons(node);
+  const delay = Math.max(0, data.retry_after_seconds || 0);
+  const readyAt = Date.now() + delay * 1000;
+  button.disabled = true;
+  button.title = delay ? '模型服务要求冷却' : '等待本轮结束';
+  const enable = () => {
+    if (!button.isConnected) return;
+    if (state.sending || Date.now() < readyAt) {
+      setTimeout(enable, 500);
+      return;
+    }
+    button.disabled = false;
+    button.title = '';
+  };
+  enable();
+  button.addEventListener('click', () => send(data.recovery_id));
+}
+
 function handleEvent(data) {
   const content = state.assistant?.querySelector('.content');
   if (data.type === 'text_delta' && content) {
@@ -451,24 +477,32 @@ function handleEvent(data) {
   } else if (data.type === 'memory_saved') {
     appendMessage('system', '已将 ' + data.count + ' 条信息保存到项目记忆。', 'success');
   } else if (data.type === 'warning' || data.type === 'error') {
-    appendMessage('system', data.text || data.message || '执行出现问题，请重试。', data.type === 'error' ? 'error' : '');
+    const node = appendMessage('system', data.text || data.message || '执行出现问题，请重试。', data.type === 'error' ? 'error' : '');
+    if (data.partial_output && content?.textContent) {
+      state.assistant.querySelector('.role').append('（输出未完成）');
+    }
+    if (data.phase === 'retry_wait') setAgentState('等待重试', true);
+    if (data.phase === 'requesting') setAgentState('正在请求模型', true);
+    if (data.recovery_id) addRetryButton(node, data);
   } else if (data.type === 'approval_required') showApproval(data);
   else if (data.type === 'approval_finished') finishApproval(data.approval_id);
   scrollChat();
 }
 
 // 按完整 SSE 数据帧解析，正确保留跨网络分片的中文字符和未结束的帧。
-async function send() {
+async function send(recoveryId = null) {
   const prompt = $('prompt-input').value.trim();
-  if (!prompt || state.sending) return;
+  if ((!prompt && !recoveryId) || state.sending) return;
+  const readyButtons = document.querySelectorAll('.retry-request:not(:disabled)');
+  readyButtons.forEach(button => { button.disabled = true; });
   state.sending = true;
   state.controller = new AbortController();
   $('send-btn').disabled = true;
   $('stop-btn').hidden = false;
-  $('prompt-input').value = '';
+  if (!recoveryId) $('prompt-input').value = '';
   openAssistant();
   setTab('conversation');
-  appendMessage('user', prompt);
+  if (!recoveryId) appendMessage('user', prompt);
   state.assistant = appendMessage('assistant', '');
   const assistant = state.assistant;
   scrollChat(true);
@@ -485,10 +519,17 @@ async function send() {
     }
   };
   try {
-    const response = await fetch('/chat', {
-      ...jsonOptions('POST', { prompt, session_id: sessionId }), signal: state.controller.signal,
+    const payload = recoveryId ? { recovery_id: recoveryId } : { prompt };
+    const response = await fetch(recoveryId ? '/chat/retry' : '/chat', {
+      ...jsonOptions('POST', { ...payload, session_id: sessionId }), signal: state.controller.signal,
     });
-    if (!response.ok) throw new Error('聊天请求失败（' + response.status + '）');
+    if (!response.ok) {
+      const error = await response.json().catch(() => null);
+      streamFailed = true;
+      appendMessage('system', error?.detail || '聊天请求失败（' + response.status + '）', 'error');
+      return;
+    }
+    document.querySelectorAll('.retry-request').forEach(button => button.remove());
     const reader = response.body.getReader();
     const decoder = new TextDecoder();
     let buffer = '';
@@ -510,6 +551,7 @@ async function send() {
     state.assistant = null;
     state.sending = false;
     state.controller = null;
+    readyButtons.forEach(button => { button.disabled = false; });
     $('send-btn').disabled = false;
     $('stop-btn').hidden = true;
     setAgentState(streamFailed ? '本轮已结束' : '准备就绪');
@@ -558,7 +600,7 @@ document.addEventListener('click', event => {
 $('task-form').addEventListener('submit', createTask);
 $('task-search').addEventListener('input', renderTasks);
 $('memory-search').addEventListener('input', renderMemories);
-$('send-btn').addEventListener('click', send);
+$('send-btn').addEventListener('click', () => send());
 $('stop-btn').addEventListener('click', () => state.controller?.abort());
 $('prompt-input').addEventListener('keydown', event => {
   if (event.key === 'Enter' && !event.shiftKey && !event.isComposing) { event.preventDefault(); send(); }

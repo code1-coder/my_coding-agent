@@ -27,15 +27,15 @@ class FakeStream:
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("with_tool", [False, True])
-async def test_openai_rejects_silently_truncated_stream(with_tool):
+@pytest.mark.parametrize("with_tool, finish_reason", [(False, None), (True, None), (True, "tool_calls")])
+async def test_openai_rejects_silently_truncated_stream(with_tool, finish_reason):
     from openai.types.chat import ChatCompletionChunk
     from coding_agent.providers.base import IncompleteStreamError
 
     delta = {"tool_calls": [{"index": 0, "id": "call-1", "type": "function",
                              "function": {"name": "write_file", "arguments": '{"path":'}}]} if with_tool else {"content": "partial"}
     chunk = ChatCompletionChunk(id="reply", created=0, object="chat.completion.chunk", model="mock",
-                                choices=[{"index": 0, "delta": delta, "finish_reason": None}])
+                                choices=[{"index": 0, "delta": delta, "finish_reason": finish_reason}])
     stream = FakeStream([chunk])
     provider = OpenAICompatProvider(api_key="test-key")
     await provider.aclose()
@@ -50,8 +50,32 @@ async def test_openai_rejects_silently_truncated_stream(with_tool):
 
 
 @pytest.mark.asyncio
+async def test_anthropic_rejects_partial_json_even_when_message_stops():
+    from anthropic.types import RawContentBlockStartEvent, RawContentBlockDeltaEvent, RawMessageStopEvent
+    from coding_agent.providers.base import IncompleteStreamError
+
+    stream = FakeStream([
+        RawContentBlockStartEvent(type="content_block_start", index=0,
+                                  content_block={"type": "tool_use", "id": "tool-1", "name": "write_file", "input": {}}),
+        RawContentBlockDeltaEvent(type="content_block_delta", index=0,
+                                  delta={"type": "input_json_delta", "partial_json": '{"path":"a.txt",'}),
+        RawMessageStopEvent(type="message_stop"),
+    ])
+    stream.get_final_message = AsyncMock(return_value=SimpleNamespace(stop_reason="tool_use"))
+    provider = AnthropicProvider(api_key="test-key")
+    await provider.aclose()
+    provider._client = SimpleNamespace(messages=SimpleNamespace(stream=lambda **kwargs: stream))
+    events = []
+    with pytest.raises(IncompleteStreamError, match="工具参数不完整"):
+        async for event in provider.stream_message([{"role": "user", "content": "写入文件"}]):
+            events.append(event)
+    assert not any(event.type == "done" for event in events)
+    assert stream.closed
+
+
+@pytest.mark.asyncio
 async def test_anthropic_stream_uses_raw_sdk_deltas_and_awaits_final_message():
-    from anthropic.types import RawContentBlockStartEvent, RawContentBlockDeltaEvent
+    from anthropic.types import RawContentBlockStartEvent, RawContentBlockDeltaEvent, RawMessageStopEvent
 
     stream = FakeStream([
         RawContentBlockStartEvent(type="content_block_start", index=0,
@@ -62,6 +86,7 @@ async def test_anthropic_stream_uses_raw_sdk_deltas_and_awaits_final_message():
                                   content_block={"type": "tool_use", "id": "tool-1", "name": "read_file", "input": {}}),
         RawContentBlockDeltaEvent(type="content_block_delta", index=1,
                                   delta={"type": "input_json_delta", "partial_json": '{"path":"a.txt"}'}),
+        RawMessageStopEvent(type="message_stop"),
     ])
     stream.get_final_message = AsyncMock(return_value=SimpleNamespace(
         content=[SimpleNamespace(type="text", text="你好")], stop_reason="end_turn",

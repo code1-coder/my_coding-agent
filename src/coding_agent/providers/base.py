@@ -24,6 +24,17 @@ class IncompleteStreamError(ModelRequestError):
     """模型流未提供完整结束标记。"""
 
 
+class RecoverableModelRequestError(ModelRequestError):
+    """不能继续自动重试、但可以由当前会话显式续接的请求失败。"""
+
+    def __init__(self, message: str, *, category: str, status: int | None = None,
+                 retry_at: float | None = None) -> None:
+        super().__init__(message)
+        self.category = category
+        self.status = status
+        self.retry_at = retry_at
+
+
 # ═══════════════════════════════════════════════════════════════
 #  响应类型（跨 Provider 统一格式）
 # ═══════════════════════════════════════════════════════════════

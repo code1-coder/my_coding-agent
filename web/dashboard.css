@@ -219,6 +219,8 @@ input::placeholder, textarea::placeholder { color: #828599; }
 .message.system .content { font-size: 11px; color: var(--muted); padding: 8px 10px; border-left: 2px solid #796192; background: #221d2a; white-space: pre-wrap; }
 .message.system.error .content { border-color: #bd6c78; color: #edb1bc; background: #2c1e25; }
 .message.system.success .content { border-color: #539c80; color: #9cccb7; background: #1d2b25; }
+.retry-request { margin-top: 8px; }
+.retry-request:disabled { opacity: .65; cursor: not-allowed; }
 .message pre { font: 12px/1.8 'Cascadia Code', Consolas, monospace; background: #101116; border: 1px solid #333542; padding: 12px; border-radius: 7px; overflow-x: auto; white-space: pre; margin: 12px 0; }
 .message .code-language { color: var(--dim); font: 10px monospace; margin-bottom: 8px; display: block; }
 .message-copy { font-size: 10px; color: var(--dim); background: none; padding: 6px 0; }

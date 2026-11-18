@@ -56,6 +56,7 @@ class Config:
     fallback_model: str | None = None
     escalated_max_tokens: int = 64000
     model_timeout: float = 900.0
+    model_max_attempts: int = 5
     model_connect_timeout: float = 20.0
     model_idle_timeout: float = 120.0
     final_answer_timeout: float = 30.0
@@ -104,6 +105,8 @@ def validate_config(cfg: Config) -> None:
         value = getattr(cfg, name)
         if type(value) is not int or value <= 0:
             raise ValueError(f"配置 {name} 必须是正整数")
+    if type(cfg.model_max_attempts) is not int or not 1 <= cfg.model_max_attempts <= 20:
+        raise ValueError("配置 model_max_attempts 必须是 1 到 20 的整数（含首次）")
     if type(cfg.max_messages) is not int or cfg.max_messages < 5:
         raise ValueError("配置 max_messages 必须是大于等于 5 的整数")
     if type(cfg.keep_recent) is not int or cfg.keep_recent < 0:

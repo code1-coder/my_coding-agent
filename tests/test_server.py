@@ -98,13 +98,29 @@ def test_web_uses_skills_memory_context_hooks_and_task_board(configured_server, 
         assert any(t["name"] == "mcp__docs__search" for t in agent_call["tools"])
 
 
-def test_web_reports_model_errors_and_cleans_up(configured_server, monkeypatch):
+def test_web_reports_model_errors_and_cleans_up(configured_server, monkeypatch, caplog):
     provider = ScriptedProvider([RuntimeError("模拟模型请求失败")])
     monkeypatch.setattr(server, "_get_provider", lambda _: provider)
     with TestClient(server.app) as client:
         response = client.post("/chat", json={"prompt": "你好"})
-        assert decode_events(response)[-1] == {"type": "error", "message": "模拟模型请求失败"}
+        assert decode_events(response)[-1] == {"type": "error", "message": "会话执行异常，请查看服务端日志。"}
+        assert "RuntimeError: 模拟模型请求失败" in caplog.text
     assert provider.closed
+
+
+def test_web_resume_rejects_other_sessions_and_consumed_ids(configured_server, monkeypatch):
+    cfg, _ = configured_server
+    cfg.model_max_attempts = 1
+    provider = ScriptedProvider([ConnectionError("断开"), text_response("续接完成")])
+    monkeypatch.setattr(server, "_get_provider", lambda _: provider)
+    with TestClient(server.app) as client:
+        failed = decode_events(client.post("/chat", json={"prompt": "继续检查", "session_id": "owner"}))[-1]
+        recovery_id = failed["recovery_id"]
+        assert client.post("/chat/retry", json={"session_id": "other", "recovery_id": recovery_id}).status_code == 404
+        body = {"session_id": "owner", "recovery_id": recovery_id}
+        resumed = decode_events(client.post("/chat/retry", json=body))
+        assert resumed[-1]["type"] == "done" and resumed[-1]["text"] == "续接完成"
+        assert client.post("/chat/retry", json=body).status_code == 409
 
 
 def test_web_delivers_model_request_failure_without_success_done(configured_server, monkeypatch):

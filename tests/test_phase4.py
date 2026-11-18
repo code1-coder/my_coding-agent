@@ -7,9 +7,13 @@ from __future__ import annotations
 import asyncio
 import json
 import tempfile
+from datetime import datetime, timedelta, timezone
+from email.utils import format_datetime
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock
 
+import httpx
+import openai
 import pytest
 
 # ====================================================================
@@ -20,9 +24,18 @@ from coding_agent.context.recovery import (
     CONTINUATION_PROMPT,
     RecoveryManager,
     RecoveryState,
+    RetryBudget,
     is_prompt_too_long_error,
+    retry_after_deadline,
     with_retry,
 )
+from coding_agent.providers.base import RecoverableModelRequestError
+
+
+def http_status_error(status, headers=None, message=None):
+    request = httpx.Request("POST", "https://example.invalid/v1/chat/completions")
+    response = httpx.Response(status, request=request, headers=headers)
+    return openai.APIStatusError(message or f"HTTP {status}", response=response, body=None)
 
 
 class TestIsPromptTooLong:
@@ -73,10 +86,10 @@ class TestWithRetry:
         monkeypatch.setattr("coding_agent.context.recovery.asyncio.sleep", sleep)
         error = openai.APIConnectionError(request=httpx.Request("POST", "https://example.invalid"))
         call = AsyncMock(side_effect=error)
-        with pytest.raises(ModelRequestError, match="3 次尝试") as failure:
+        with pytest.raises(ModelRequestError, match="5 次尝试") as failure:
             await with_retry(call, RecoveryState())
         assert failure.value.__cause__ is error
-        assert call.await_count == 3 and sleep.await_count == 2
+        assert call.await_count == 5 and sleep.await_count == 4
 
     @pytest.mark.asyncio
     async def test_cancellation_is_not_retried(self, monkeypatch):
@@ -87,6 +100,28 @@ class TestWithRetry:
             await with_retry(call, RecoveryState())
         assert call.await_count == 1
         sleep.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_mixed_failures_and_context_repair_share_attempt_limit(self, monkeypatch):
+        sleep = AsyncMock()
+        monkeypatch.setattr("coding_agent.context.recovery.asyncio.sleep", sleep)
+        compact = AsyncMock(return_value=[{"role": "user", "content": "compacted"}])
+        call = AsyncMock(side_effect=[
+            http_status_error(429), http_status_error(503),
+            http_status_error(400, message="context_length_exceeded"), ConnectionError("disconnected"),
+        ])
+        with pytest.raises(RecoverableModelRequestError, match="4 次尝试"):
+            await RecoveryManager(compact_fn=compact).call(
+                call, RecoveryState(), [{"role": "user", "content": "goal"}], budget=RetryBudget(4),
+            )
+        assert call.await_count == 4
+        assert sleep.await_count == 2
+        compact.assert_awaited_once()
+
+    def test_retry_after_http_date_and_malformed_value(self):
+        future = format_datetime(datetime.now(timezone.utc) + timedelta(seconds=45), usegmt=True)
+        assert 143 <= retry_after_deadline(http_status_error(429, {"Retry-After": future}), 100) <= 145
+        assert retry_after_deadline(http_status_error(429, {"Retry-After": "invalid"}), 100) is None
 
     @pytest.mark.asyncio
     async def test_success_first_try(self, monkeypatch):
@@ -107,7 +142,7 @@ class TestWithRetry:
             nonlocal call_count
             call_count += 1
             if call_count < 3:
-                raise Exception("429 rate limit exceeded")
+                raise http_status_error(429)
             return "ok"
 
         result = await with_retry(flaky, state)
@@ -116,7 +151,7 @@ class TestWithRetry:
         assert state.total_429_retries == 2
 
     @pytest.mark.asyncio
-    @pytest.mark.parametrize("status", [408, 409, 500, 503, 599])
+    @pytest.mark.parametrize("status", [408, 409, 500, 502, 503, 504])
     async def test_retries_transient_http_statuses_with_a_bound(self, monkeypatch, status):
         from unittest.mock import AsyncMock
         from coding_agent.providers.base import ModelRequestError
@@ -124,18 +159,25 @@ class TestWithRetry:
         sleep = AsyncMock()
         monkeypatch.setattr("coding_agent.context.recovery.asyncio.sleep", sleep)
 
-        class StatusError(Exception):
-            status_code = status
-
-        call = AsyncMock(side_effect=[StatusError(f"HTTP {status}"), "ok"])
+        call = AsyncMock(side_effect=[http_status_error(status), "ok"])
         assert await with_retry(call, RecoveryState()) == "ok"
         assert call.await_count == 2
         sleep.assert_awaited_once()
 
-        failing_call = AsyncMock(side_effect=StatusError(f"HTTP {status}"))
+        failing_call = AsyncMock(side_effect=http_status_error(status))
         with pytest.raises(ModelRequestError, match=f"HTTP {status}"):
             await with_retry(failing_call, RecoveryState())
-        assert failing_call.await_count == 3
+        assert failing_call.await_count == 5
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("status", [401, 403, 599])
+    async def test_unconfirmed_http_errors_are_not_retried(self, status):
+        error = http_status_error(status)
+        call = AsyncMock(side_effect=error)
+        with pytest.raises(openai.APIStatusError) as failure:
+            await with_retry(call, RecoveryState())
+        assert failure.value is error
+        assert call.await_count == 1
 
     @pytest.mark.asyncio
     async def test_529_fallback_model(self, monkeypatch):
@@ -143,9 +185,9 @@ class TestWithRetry:
         state = RecoveryState(current_model="primary")
 
         async def always_overloaded():
-            raise Exception("529 overloaded")
+            raise http_status_error(529)
 
-        with pytest.raises(RuntimeError, match="Max retries"):
+        with pytest.raises(RecoverableModelRequestError, match="HTTP 529.*5 次尝试"):
             await with_retry(always_overloaded, state, fallback_model="fallback")
 
         # 连续出现 3 次 529 错误后，应切换模型
@@ -176,7 +218,7 @@ class TestRecoveryManager:
             nonlocal call_count
             call_count += 1
             if call_count == 1:
-                raise Exception("prompt_is_too_long: too many tokens")
+                raise http_status_error(400, message="prompt_is_too_long: too many tokens")
             return "ok"
 
         result = await mgr.call(llm, state, [{"role": "user", "content": "x" * 10000}])
@@ -190,11 +232,20 @@ class TestRecoveryManager:
         state = RecoveryState(current_model="test")
 
         async def always_long():
-            raise Exception("prompt_is_too_long")
+            raise http_status_error(400, message="prompt_is_too_long")
 
         result = await mgr.call(always_long, state, [{"role": "user", "content": "x"}])
         # 首次调用时执行压缩；再次调用仍失败时，应判定为不可恢复。
         assert result is None
+
+    @pytest.mark.asyncio
+    async def test_programming_error_is_not_treated_as_context_overflow(self):
+        compact = AsyncMock()
+        error = RuntimeError("context_length_exceeded")
+        with pytest.raises(RuntimeError) as failure:
+            await RecoveryManager(compact_fn=compact).call(AsyncMock(side_effect=error), RecoveryState(), [])
+        assert failure.value is error
+        compact.assert_not_awaited()
 
     def test_path1_escalation(self):
         mgr = RecoveryManager()

@@ -9,11 +9,19 @@ from copy import deepcopy
 from unittest.mock import AsyncMock
 
 import pytest
+import httpx
+import openai
 
 from coding_agent.config import Config
 from coding_agent.hooks.bus import EventBus, EventType
 from coding_agent.providers.base import LLMProvider, ModelRequestError, ProviderResponse, StreamEvent
-from coding_agent.runtime import AgentRuntime
+from coding_agent.runtime import AgentRuntime, RetryUnavailable
+
+
+def model_http_error(status, headers=None, message=None):
+    response = httpx.Response(status, headers=headers,
+                              request=httpx.Request("POST", "https://example.invalid"))
+    return openai.APIStatusError(message or f"HTTP {status}", response=response, body=None)
 
 
 def text_response(text="完成", reason="end_turn"):
@@ -632,7 +640,7 @@ async def test_runtime_compacts_real_history_before_model_call(tmp_path):
 async def test_runtime_retries_rate_limit_and_reactively_compacts(tmp_path, monkeypatch, stream):
     monkeypatch.setattr("coding_agent.context.recovery.asyncio.sleep", AsyncMock())
     provider = ScriptedProvider([
-        RuntimeError("429 rate limit"), RuntimeError("context_length_exceeded"), text_response(),
+        model_http_error(429), model_http_error(400, message="context_length_exceeded"), text_response(),
     ])
     async with AgentRuntime(Config(workdir=str(tmp_path)), provider=provider) as runtime:
         runtime.messages.extend({"role": "user", "content": "历史"} for _ in range(8))
@@ -640,6 +648,105 @@ async def test_runtime_retries_rate_limit_and_reactively_compacts(tmp_path, monk
         assert events[-1].text == "完成"
         assert any("[Reactive compact]" in str(call["messages"]) for call in provider.calls)
         assert sum(event.type == "text_delta" for event in events) == 1
+
+
+@pytest.mark.asyncio
+async def test_connection_recovers_on_fourth_model_attempt(tmp_path, monkeypatch):
+    monkeypatch.setattr("coding_agent.context.recovery.asyncio.sleep", AsyncMock())
+    provider = ScriptedProvider([ConnectionError("断开")] * 3 + [text_response("已恢复")])
+    async with AgentRuntime(Config(workdir=str(tmp_path)), provider=provider) as runtime:
+        events = await collect(runtime)
+    assert all(event.type != "error" for event in events)
+    assert events[-1].type == "done" and events[-1].text == "已恢复"
+    waits = [event.data for event in events if event.data.get("phase") == "retry_wait"]
+    assert [data["next_attempt"] for data in waits] == [2, 3, 4]
+
+
+@pytest.mark.asyncio
+async def test_resume_uses_completed_results_and_remaining_iterations(tmp_path):
+    provider = ScriptedProvider([
+        tool_response("write_file", {"path": "once.txt", "content": "first"}, "write-once"),
+        ConnectionError("断开"),
+        text_response("已核对写入"),
+    ])
+    cfg = Config(workdir=str(tmp_path), model_max_attempts=1, max_iterations=2)
+    async with AgentRuntime(cfg, provider=provider) as runtime:
+        events = await collect(runtime, "写入并核对")
+        failed = events[-1]
+        assert failed.type == "error" and failed.data["attempt"] == 1
+        assert (tmp_path / "once.txt").read_text(encoding="utf-8") == "first"
+        resumed = [event async for event in runtime.retry_turn(failed.data["recovery_id"])]
+        assert not any(event.type == "tool_start" for event in resumed)
+        assert resumed[-1].type == "done" and resumed[-1].text == "已核对写入"
+        request_history = [call["messages"] for call in provider.calls if call["tools"] is not None][-1]
+        assert request_history[0]["content"] == "写入并核对"
+        assert request_history[-1]["content"][0]["tool_use_id"] == "write-once"
+        assert "本轮未完成" not in str(request_history)
+        with pytest.raises(RetryUnavailable):
+            await anext(runtime.retry_turn(failed.data["recovery_id"]))
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("field, new_value", [("model_id", "new-model"), ("base_url", "https://example.invalid")])
+async def test_resume_rejects_changed_provider(tmp_path, field, new_value):
+    provider = ScriptedProvider([ConnectionError("断开")])
+    async with AgentRuntime(Config(workdir=str(tmp_path), model_max_attempts=1), provider=provider) as runtime:
+        recovery_id = (await collect(runtime))[-1].data["recovery_id"]
+        setattr(provider, field, new_value)
+        with pytest.raises(RetryUnavailable, match="历史或配置已变化"):
+            await anext(runtime.retry_turn(recovery_id))
+        assert len(provider.calls) == 1
+
+
+@pytest.mark.asyncio
+async def test_resume_rejects_parallel_claim_and_stale_history(tmp_path):
+    started = asyncio.Event()
+    release = asyncio.Event()
+
+    class WaitingProvider(ScriptedProvider):
+        async def stream_message(self, *args, **kwargs):
+            if len(self.calls) == 1:
+                started.set()
+                await release.wait()
+            async for event in super().stream_message(*args, **kwargs):
+                yield event
+
+    provider = WaitingProvider([ConnectionError("断开"), ConnectionError("再次断开")])
+    async with AgentRuntime(Config(workdir=str(tmp_path), model_max_attempts=1), provider=provider) as runtime:
+        first_id = (await collect(runtime))[-1].data["recovery_id"]
+
+        async def resume():
+            return [event async for event in runtime.retry_turn(first_id)]
+
+        resumed = asyncio.create_task(resume())
+        try:
+            await asyncio.wait_for(started.wait(), timeout=2)
+            with pytest.raises(RetryUnavailable, match="仍在执行"):
+                await anext(runtime.retry_turn(first_id))
+        finally:
+            release.set()
+            events = await resumed
+        second_id = events[-1].data["recovery_id"]
+        assert second_id != first_id
+        runtime.messages[0]["content"] = "会话历史已被更新"
+        with pytest.raises(RetryUnavailable, match="历史或配置已变化"):
+            await anext(runtime.retry_turn(second_id))
+        assert len(provider.calls) == 2
+
+
+@pytest.mark.asyncio
+async def test_cooldown_prevents_resume_and_new_turn_invalidates_id(tmp_path):
+    provider = ScriptedProvider([model_http_error(429, {"Retry-After": "25"}), text_response()])
+    cfg = Config(workdir=str(tmp_path), model_timeout=3)
+    async with AgentRuntime(cfg, provider=provider) as runtime:
+        failed = (await collect(runtime))[-1]
+        assert failed.type == "error" and failed.data["retry_after_seconds"] >= 24
+        with pytest.raises(RetryUnavailable, match="冷却"):
+            await anext(runtime.retry_turn(failed.data["recovery_id"]))
+        assert len(provider.calls) == 1
+        assert (await collect(runtime, "新任务"))[-1].type == "done"
+        with pytest.raises(RetryUnavailable, match="没有匹配"):
+            await anext(runtime.retry_turn(failed.data["recovery_id"]))
 
 
 @pytest.mark.asyncio
@@ -728,7 +835,7 @@ async def test_invalid_consolidation_preserves_existing_memories(tmp_path, respo
 @pytest.mark.asyncio
 async def test_runtime_switches_to_fallback_and_closes_both_clients(tmp_path, monkeypatch):
     monkeypatch.setattr("coding_agent.context.recovery.asyncio.sleep", AsyncMock())
-    primary = ScriptedProvider([RuntimeError("529 overloaded")] * 3)
+    primary = ScriptedProvider([model_http_error(529)] * 3)
     fallback = ScriptedProvider([text_response("备用模型的回复")])
     fallback.model_id = "backup"
     cfg = Config(workdir=str(tmp_path), fallback_model="backup")
@@ -974,6 +1081,7 @@ async def test_runtime_keeps_persisted_output_reference_after_micro_compaction(t
     {"model_timeout": 0}, {"model_idle_timeout": 0}, {"model_connect_timeout": float("inf")},
     {"final_answer_timeout": float("nan")}, {"maintenance_timeout": float("inf")},
     {"progress_interval": float("nan")}, {"model_timeout": True},
+    {"model_max_attempts": True}, {"model_max_attempts": 0}, {"model_max_attempts": 21},
 ])
 def test_invalid_runtime_options_fail_before_creating_provider(tmp_path, changes):
     from unittest.mock import Mock

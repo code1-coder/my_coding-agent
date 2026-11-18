@@ -16,7 +16,7 @@ import openai
 from coding_agent.config import Config, load_config
 from coding_agent.loop import LoopEvent
 from coding_agent.providers.base import LLMProvider, ModelRequestError
-from coding_agent.runtime import AgentRuntime, build_provider
+from coding_agent.runtime import AgentRuntime, RetryUnavailable, build_provider
 from coding_agent.security.permission import create_terminal_pipeline
 from coding_agent.tools.patch import parse_patch
 
@@ -186,7 +186,10 @@ def _print_event(event: LoopEvent, *, color: bool = True) -> None:
     elif event.type == "warning":
         click.echo("\n" + event.text, err=True)
     elif event.type == "error":
-        click.echo("\n" + event.text + "\n本次失败，会话已保留，可继续输入。", err=True)
+        hint = ("本次失败，会话已保留；输入 /retry 可续接本次请求，已完成工具不会重放。"
+                if event.data.get("recovery_id") else "本次失败，会话已保留，可继续输入。")
+        delivery = "\n".join(_terminal_text(line) for line in event.text.split("\n"))
+        click.echo("\n" + delivery + "\n" + hint, err=True)
 
 
 async def _run_agent_loop(prompt: str, cfg: Config, *, stream: bool = True, color: bool = True) -> str:
@@ -252,9 +255,12 @@ async def _chat_session(cfg: Config) -> None:
                 break
             click.echo()
             try:
-                async with aclosing(runtime.run_turn(query)) as events:
+                operation = runtime.retry_turn() if query.strip() == "/retry" else runtime.run_turn(query)
+                async with aclosing(operation) as events:
                     async for event in events:
                         _print_event(event)
+            except (RetryUnavailable, PermissionError) as exc:
+                click.echo(f"\n[无法续接] {exc}", err=True)
             except REQUEST_ERRORS as exc:
                 click.echo(f"\n[请求失败] {exc}\n会话已保留，可继续输入或重试。", err=True)
             click.echo("\n")

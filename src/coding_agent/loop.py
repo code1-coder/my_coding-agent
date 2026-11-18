@@ -33,6 +33,7 @@ import hashlib
 import logging
 import uuid
 from contextlib import aclosing
+from dataclasses import dataclass, field
 from typing import Any, AsyncIterator, Callable
 
 from coding_agent.providers.base import LLMProvider, ProviderResponse
@@ -41,8 +42,13 @@ from coding_agent.tools.registry import ToolRegistry
 from coding_agent.hooks.bus import Event, EventBus, EventType
 from coding_agent.security.permission import PermissionPipeline, Verdict
 from coding_agent.context.compaction import CompactionPipeline
-from coding_agent.context.recovery import RecoveryManager, RecoveryState, is_model_request_failure
-from coding_agent.providers.base import ModelIdleTimeout, ModelRequestError, StreamEvent
+from coding_agent.context.recovery import (
+    DEFAULT_MODEL_ATTEMPTS, RETRY_LABELS, RecoveryManager, RecoveryState, RetryBudget,
+    is_model_request_failure, retry_after_deadline, retry_category,
+)
+from coding_agent.providers.base import (
+    IncompleteStreamError, ModelIdleTimeout, ModelRequestError, RecoverableModelRequestError, StreamEvent,
+)
 from coding_agent.providers.activity import RequestActivity, _current_request_activity
 
 logger = logging.getLogger(__name__)
@@ -76,6 +82,17 @@ class LoopEvent:
 
 # ═══════════════════════════════════════════════════════════════
 
+@dataclass
+class TurnProgress:
+    recovery: RecoveryState
+    turn_id: str = field(default_factory=lambda: uuid.uuid4().hex)
+    iteration: int = 0
+    tool_outcomes: dict[tuple[str, str, bool], int] = field(default_factory=dict)
+    tool_failure_streaks: dict[str, int] = field(default_factory=dict)
+    no_progress_read_rounds: int = 0
+    uncertain_tools: bool = False
+
+
 class AgentLoop:
     """编排智能体循环：LLM → 工具 → LLM → … 。
 
@@ -102,6 +119,7 @@ class AgentLoop:
         model_idle_timeout: float = 120.0,
         final_answer_timeout: float = 30.0,
         progress_interval: float = 10.0,
+        model_max_attempts: int = DEFAULT_MODEL_ATTEMPTS,
     ) -> None:
         self.provider = provider
         self.system_prompt = system_prompt
@@ -123,15 +141,16 @@ class AgentLoop:
         self.model_idle_timeout = model_idle_timeout
         self.final_answer_timeout = final_answer_timeout
         self.progress_interval = progress_interval
+        self.model_max_attempts = model_max_attempts
 
     # ── 公共 API ──────────────────────────────────────────
 
     async def run(
-        self, messages: list[dict[str, Any]], *, stream: bool = True,
+        self, messages: list[dict[str, Any]], *, stream: bool = True, resume: TurnProgress | None = None,
     ) -> AsyncIterator[LoopEvent]:
         """执行本轮循环，并在取消或中断时修复尚未配对的工具结果。"""
         try:
-            async with aclosing(self._run_impl(messages, stream=stream)) as events:
+            async with aclosing(self._run_impl(messages, stream=stream, resume=resume)) as events:
                 async for event in events:
                     yield event
         finally:
@@ -149,6 +168,7 @@ class AgentLoop:
         messages: list[dict[str, Any]],
         *,
         stream: bool = True,
+        resume: TurnProgress | None = None,
     ) -> AsyncIterator[LoopEvent]:
         """执行智能体循环。
 
@@ -164,18 +184,22 @@ class AgentLoop:
         工具结果作为用户消息写回。仅工具调用会触发下一轮；达到
         max_iterations 后也会产出 done，以防模型持续调用工具。
         """
-        self.recovery_state = RecoveryState(current_model=self.provider.model_id)
+        self.progress = progress = resume or TurnProgress(RecoveryState(current_model=self.provider.model_id))
+        self.request_failure: RecoverableModelRequestError | None = None
+        self.resuming_request = resume is not None
+        self.recovery_state = progress.recovery
         text = ""
-        tool_outcomes: dict[tuple[str, str, bool], int] = {}
-        tool_failure_streaks: dict[str, int] = {}
-        no_progress_read_rounds = 0
-        for iteration in range(self.max_iterations):
-            if self.compaction is not None:
+        tool_outcomes = progress.tool_outcomes
+        tool_failure_streaks = progress.tool_failure_streaks
+        for iteration in range(progress.iteration, self.max_iterations):
+            progress.iteration = iteration
+            if self.compaction is not None and resume is None:
                 async with aclosing(self.wait_events(
                     self.compaction.run(messages), "整理工具输出和压缩上下文",
                 )) as events:
                     async for event in events:
                         yield event
+            resume = None
             response = None
             prefix = text
             try:
@@ -194,15 +218,21 @@ class AgentLoop:
             except Exception as exc:
                 if not is_model_request_failure(exc):
                     raise
-                delivery = self._request_failure_delivery(exc, tool_outcomes)
+                if isinstance(exc, RecoverableModelRequestError):
+                    self.request_failure = exc
+                delivery = self._request_failure_delivery(exc, tool_outcomes, progress.uncertain_tools)
                 history_text = (f"模型中断前的未完成输出：\n{text}\n\n" if text else "") + delivery
                 messages.append({"role": "assistant", "content": [{"type": "text", "text": history_text}]})
                 yield LoopEvent(type="error", text=delivery, data={
                     "failed": True, "failure_type": type(exc).__name__,
+                    "partial_output": bool(text), **self.request_details,
+                    "error_category": getattr(exc, "category", "request"),
+                    "http_status": getattr(exc, "status", getattr(exc, "status_code", None)),
                 })
                 return
             if response is None:
                 raise RuntimeError("模型未返回完整响应")
+            self.resuming_request = False
 
             if response.stop_reason == "max_tokens" and self.recovery is not None:
                 escalated = self.recovery_state.has_escalated
@@ -239,6 +269,11 @@ class AgentLoop:
             async with aclosing(self._tool_events(messages, blocks, execution_ids)) as events:
                 async for event in events:
                     if event.type == "tool_done":
+                        execution = event.data.get("execution") or {}
+                        if execution.get("termination_confirmed") is False and execution.get("failure_stage") in (
+                            "cleanup", "supervision",
+                        ):
+                            progress.uncertain_tools = True
                         arguments = event.data.get("input")
                         target = arguments.get("path", "") if isinstance(arguments, dict) else ""
                         target = target if isinstance(target, str) else ""
@@ -269,10 +304,10 @@ class AgentLoop:
             if (round_results and all(name == "read_file" and not failed
                                       and metadata.get("reused_from")
                                       for name, metadata, failed in round_results)):
-                no_progress_read_rounds += 1
+                progress.no_progress_read_rounds += 1
             else:
-                no_progress_read_rounds = 0
-            if no_progress_read_rounds >= _MAX_NO_PROGRESS_READ_ROUNDS:
+                progress.no_progress_read_rounds = 0
+            if progress.no_progress_read_rounds >= _MAX_NO_PROGRESS_READ_ROUNDS:
                 async for event in self._finish_without_answer(messages, text, "no_progress"):
                     yield event
                 return
@@ -280,8 +315,8 @@ class AgentLoop:
         async for event in self._finish_without_answer(messages, text, "max_iterations"):
             yield event
 
-    @staticmethod
-    def _request_failure_delivery(exc: Exception, tool_outcomes: dict[tuple[str, str, bool], int]) -> str:
+    def _request_failure_delivery(self, exc: Exception, tool_outcomes: dict[tuple[str, str, bool], int],
+                                  uncertain_tools: bool) -> str:
         if isinstance(exc, ModelRequestError):
             reason = str(exc)
         else:
@@ -293,17 +328,22 @@ class AgentLoop:
             else:
                 reason = "模型服务 API 请求失败"
 
-        lines = [f"模型请求失败，本轮未完成。失败原因：{reason}"]
+        lines = [f"模型请求失败，本轮未完成。失败原因：{reason}",
+                 f"失败阶段：模型请求，已发起 {self.request_details['attempt']} 次应用层尝试。"]
         if tool_outcomes:
             lines.append("本轮已记录的工具执行：")
             lines.extend(
                 f"- {name}{f'（{target}）' if target else ''}："
                 f"{'执行失败' if failed else '执行成功'}（{count} 次）"
-                for (name, target, failed), count in sorted(tool_outcomes.items())
+                for (name, target, failed), count in list(tool_outcomes.items())[-8:]
             )
+            if len(tool_outcomes) > 8:
+                lines.append(f"另有 {len(tool_outcomes) - 8} 项工具统计未展示。")
         else:
             lines.append("本轮没有已完成的工具执行。")
         lines.append("未完成事项：模型没有确认任务结果，请核对上述执行记录后再判断是否完成。")
+        if uncertain_tools:
+            lines.append("部分工具的停止状态未确认；请先核对工作区或外部状态，不能直接续接。")
         return "\n".join(lines)
 
     async def _finish_without_answer(self, messages: list[dict[str, Any]], text: str,
@@ -438,15 +478,34 @@ class AgentLoop:
         request_started_at = loop.time()
         request_attempts = 0
         request_activity = RequestActivity()
+        deadline = request_started_at + self.model_timeout
+        retry_until = None
+        self.request_details = {"attempt": 0, "max_attempts": 1 if final_only else self.model_max_attempts,
+                                "turn_id": self.progress.turn_id}
+
+        def retry_wait(category: str, status: int | None, delay: float) -> None:
+            nonlocal retry_until
+            now = loop.time()
+            retry_until = now + delay
+            label = f"HTTP {status}" if status else RETRY_LABELS[category]
+            queue.put_nowait(LoopEvent(type="warning", text=(
+                f"{label}；将在 {delay:.1f} 秒后尝试第 {request_attempts + 1}/{budget.maximum} 次，"
+                f"总预算剩余 {max(0., deadline - now):.1f} 秒，可取消。"
+            ), data={**self.request_details, "phase": "retry_wait", "next_attempt": request_attempts + 1,
+                     "delay_seconds": delay, "remaining_total_seconds": max(0., deadline - now),
+                     "error_category": category, "http_status": status, "retryable": True}))
+
+        budget = RetryBudget(self.request_details["max_attempts"], deadline, on_wait=retry_wait)
+        response_submitted = False
 
         async def attempt():
-            nonlocal request_attempts
+            nonlocal request_attempts, retry_until, response_submitted
             sent_text = False
             delivered_text = ""
             # 正文出现前的纯空白可能只是传输占位，正常完成后再与完整响应核对。
             pending_whitespace = ""
             has_visible_text = False
-            request_attempts += 1
+            retry_until = None
             provider = (self.provider_for_model(self.recovery_state.current_model)
                         if self.provider_for_model else self.provider)
             request_activity.begin_provider_attempt(
@@ -480,6 +539,12 @@ class AgentLoop:
                         wait_for_http_request=bool(getattr(provider, "http_activity_supported", False)),
                     )
                     request_activity.mark_request_started()
+                    request_attempts += 1
+                    self.request_details.update(attempt=request_attempts, request_id=uuid.uuid4().hex)
+                    if request_attempts > 1 or self.resuming_request:
+                        queue.put_nowait(LoopEvent(type="warning", text=(
+                            f"已开始第 {request_attempts}/{budget.maximum} 次模型调用，尚未确认响应。"
+                        ), data={**self.request_details, "phase": "requesting"}))
                     if stream:
                         async with aclosing(provider.stream_message(**kwargs)) as events:
                             async for event in events:
@@ -501,13 +566,15 @@ class AgentLoop:
                                 has_visible_text = True
                                 delivered_text += output
                                 sent_text = sent_text or bool(output)
+                                response_submitted = sent_text
                                 queue.put_nowait(StreamEvent(type="text_delta", text=output))
                     else:
                         response = await provider.create_message(**kwargs)
                         if response.text:
+                            sent_text = response_submitted = True
                             queue.put_nowait(StreamEvent(type="text_delta", text=response.text))
                 if response is None:
-                    raise RuntimeError("模型响应流未正常结束")
+                    raise IncompleteStreamError("模型响应流未正常结束")
                 if stream:
                     # 最终响应是完整文本的权威值，只补前缀差额，分歧则走 reset。
                     final_text = response.text or ""
@@ -516,6 +583,7 @@ class AgentLoop:
                             queue.put_nowait(StreamEvent(type="text_delta", text=final_text))
                             delivered_text = final_text
                             sent_text = True
+                            response_submitted = True
                     elif final_text.startswith(delivered_text):
                         suffix = final_text[len(delivered_text):]
                         if suffix:
@@ -534,15 +602,17 @@ class AgentLoop:
                     f"模型请求空闲超时：连续 {self.model_idle_timeout:g} 秒没有可观测活动，"
                     "单次尝试已停止。"
                 ) if idle_timeout.expired() and isinstance(exc, TimeoutError) else exc
-                await self.emit(EventType.ERROR, error=str(error), purpose="agent")
-                if sent_text:
-                    # 已显示的增量无法安全重放，避免重试后产生重复文本。
-                    if isinstance(error, ModelIdleTimeout):
-                        raise error from exc
-                    if is_model_request_failure(error):
-                        raise ModelRequestError(
-                            "流式响应中断，已显示部分内容，未自动重放。请重试本轮请求。"
-                        ) from error
+                category, status = retry_category(error)
+                await self.emit(EventType.ERROR, error=type(error).__name__, purpose="agent")
+                if sent_text and category is not None:
+                    raise RecoverableModelRequestError(
+                        f"{RETRY_LABELS[category]}，已显示部分内容，未自动重放。",
+                        category=category, status=status, retry_at=retry_after_deadline(error, loop.time()),
+                    ) from error
+                if sent_text and is_model_request_failure(error):
+                    status = getattr(error, "status_code", None)
+                    reason = f"模型服务返回 HTTP {status}" if isinstance(status, int) else "模型请求失败"
+                    raise ModelRequestError(f"{reason}，已显示部分内容，未自动重放。") from error
                 if error is not exc:
                     raise error from exc
                 raise
@@ -551,22 +621,27 @@ class AgentLoop:
                 _current_request_activity.reset(activity_token)
 
         async def request():
+            overall = asyncio.timeout_at(deadline)
             try:
                 try:
-                    async with asyncio.timeout(self.model_timeout):
+                    async with overall:
                         if self.recovery is not None and not final_only:
                             response = await self.recovery.call(
                                 attempt, self.recovery_state, messages, max_tokens=self.max_tokens,
+                                budget=budget,
                             )
                         else:
                             response = await attempt()
                 except TimeoutError as exc:
-                    raise ModelRequestError(
+                    if not overall.expired():
+                        raise
+                    raise RecoverableModelRequestError(
                         f"模型请求超过总时限 {self.model_timeout:g} 秒（含重试与恢复），已停止等待。"
-                        "请检查模型服务或调整 model_timeout 后重试。"
+                        + ("部分正文已显示，未自动重放。" if response_submitted else ""),
+                        category="total_timeout",
                     ) from exc
                 if response is None:
-                    raise RuntimeError("上下文压缩后请求仍超出模型限制")
+                    raise ModelRequestError("模型上下文超出限制，无法在剩余尝试内恢复。")
                 queue.put_nowait(StreamEvent(type="done", response=response))
             finally:
                 queue.put_nowait(sentinel)
@@ -578,6 +653,13 @@ class AgentLoop:
                     event = await asyncio.wait_for(queue.get(), timeout=self.progress_interval)
                 except TimeoutError:
                     now = loop.time()
+                    if retry_until is not None:
+                        yield LoopEvent(type="warning", text=(
+                            f"正在等待重试，预计还需 {max(0., retry_until - now):.1f} 秒，可取消。"
+                        ), data={**self.request_details, "phase": "retry_wait",
+                                 "remaining_total_seconds": max(0., deadline - now),
+                                 "retry_wait_remaining_seconds": max(0., retry_until - now)})
+                        continue
                     if (request_activity.last_activity_type in {
                             "text_delta", "tool_use_start", "tool_input",
                     } and request_activity.last_activity_at is not None
@@ -631,6 +713,7 @@ class AgentLoop:
                               f"剩余 {remaining_total:.1f} 秒，可取消当前请求。"),
                         data={
                             "phase": "model",
+                            **self.request_details,
                             "agent": self.agent_name,
                             "request_elapsed_seconds": elapsed,
                             "connect_timeout_seconds": self.model_connect_timeout,
@@ -656,11 +739,7 @@ class AgentLoop:
                     continue
                 if event is sentinel:
                     break
-                if event.type == "text_delta":
-                    yield event
-                elif event.type == "text_reset":
-                    yield event
-                elif event.type == "done":
+                if event.type in ("text_delta", "text_reset", "done", "warning"):
                     yield event
             await task
         finally:

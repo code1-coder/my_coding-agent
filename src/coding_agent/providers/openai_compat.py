@@ -101,7 +101,7 @@ class OpenAICompatProvider(LLMProvider):
         """逐项产出文本和工具参数增量，并在流结束后组装完整响应。
 
         工具调用按索引累积 ID、名称和 JSON 参数片段，待片段收齐后
-        才解析参数；无法解析的参数回退为空字典。最终的 done 事件
+        才解析参数；无法解析的流式参数不进入工具分发。最终的 done 事件
         包含停止原因、模型名称及服务端返回的令牌用量。
         """
         kwargs: dict[str, Any] = {
@@ -177,13 +177,16 @@ class OpenAICompatProvider(LLMProvider):
             content.append({"type": "text", "text": full_text})
 
         # 解析累积的 tool-call JSON 片段
-        for idx in sorted(tool_call_buf):
+        tool_indexes = sorted(tool_call_buf) if finish_reason in ("stop", "tool_calls") else ()
+        for idx in tool_indexes:
             buf = tool_call_buf[idx]
             raw_args = "".join(buf["args_chunks"])
             try:
                 parsed = json.loads(raw_args) if raw_args else {}
-            except json.JSONDecodeError:
-                parsed = {}
+            except json.JSONDecodeError as exc:
+                raise IncompleteStreamError("模型结束工具调用时仍有不完整的参数。") from exc
+            if not buf["name"] or not isinstance(parsed, dict):
+                raise IncompleteStreamError("模型结束工具调用时缺少有效工具名称或参数。")
             content.append({
                 "type": "tool_use",
                 "id": buf["id"] or f"call_{idx}",
@@ -191,7 +194,7 @@ class OpenAICompatProvider(LLMProvider):
                 "input": parsed,
             })
 
-        stop_reason = "tool_use" if tool_call_buf else _map_finish_reason(finish_reason)
+        stop_reason = "tool_use" if tool_indexes else _map_finish_reason(finish_reason)
 
         yield StreamEvent(
             type="done",
@@ -313,12 +316,15 @@ def _oai_to_provider_response(resp: Any) -> ProviderResponse:
     if choice.message.content:
         content.append({"type": "text", "text": choice.message.content})
 
-    if choice.message.tool_calls:
-        for tc in choice.message.tool_calls:
+    tools = choice.message.tool_calls if choice.finish_reason in (None, "stop", "tool_calls") else []
+    if tools:
+        for tc in tools:
             try:
                 inp = json.loads(tc.function.arguments) if tc.function.arguments else {}
-            except json.JSONDecodeError:
-                inp = {}
+            except json.JSONDecodeError as exc:
+                raise IncompleteStreamError("模型返回了不完整的工具参数。") from exc
+            if not tc.function.name or not isinstance(inp, dict):
+                raise IncompleteStreamError("模型返回的工具名称或参数无效。")
             content.append({
                 "type": "tool_use",
                 "id": tc.id,
@@ -326,8 +332,7 @@ def _oai_to_provider_response(resp: Any) -> ProviderResponse:
                 "input": inp,
             })
 
-    has_tools = bool(choice.message.tool_calls)
-    stop_reason = "tool_use" if has_tools else _map_finish_reason(choice.finish_reason)
+    stop_reason = "tool_use" if tools else _map_finish_reason(choice.finish_reason)
 
     usage = {}
     if resp.usage:
