@@ -474,6 +474,8 @@ function handleEvent(data) {
     if (state.sending) setAgentState('正在执行工具', true);
   } else if (data.type === 'tool_done') {
     updateTool(data, true);
+  } else if (data.type === 'analysis_progress') {
+    appendMessage('system', `分析检查点 · 剩余 ${data.remaining_batches} 个读取批次\n${data.text}`);
   } else if (data.type === 'memory_saved') {
     appendMessage('system', '已将 ' + data.count + ' 条信息保存到项目记忆。', 'success');
   } else if (data.type === 'warning' || data.type === 'error') {
@@ -493,11 +495,13 @@ function handleEvent(data) {
 async function send(recoveryId = null) {
   const prompt = $('prompt-input').value.trim();
   if ((!prompt && !recoveryId) || state.sending) return;
+  const mode = $('analysis-mode').checked ? 'analysis' : 'default';
   const readyButtons = document.querySelectorAll('.retry-request:not(:disabled)');
   readyButtons.forEach(button => { button.disabled = true; });
   state.sending = true;
   state.controller = new AbortController();
   $('send-btn').disabled = true;
+  $('analysis-mode').disabled = true;
   $('stop-btn').hidden = false;
   if (!recoveryId) $('prompt-input').value = '';
   openAssistant();
@@ -519,7 +523,7 @@ async function send(recoveryId = null) {
     }
   };
   try {
-    const payload = recoveryId ? { recovery_id: recoveryId } : { prompt };
+    const payload = recoveryId ? { recovery_id: recoveryId } : { prompt, mode };
     const response = await fetch(recoveryId ? '/chat/retry' : '/chat', {
       ...jsonOptions('POST', { ...payload, session_id: sessionId }), signal: state.controller.signal,
     });
@@ -553,6 +557,7 @@ async function send(recoveryId = null) {
     state.controller = null;
     readyButtons.forEach(button => { button.disabled = false; });
     $('send-btn').disabled = false;
+    $('analysis-mode').disabled = false;
     $('stop-btn').hidden = true;
     setAgentState(streamFailed ? '本轮已结束' : '准备就绪');
     await refreshWorkspace(true);

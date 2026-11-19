@@ -108,6 +108,22 @@ def test_web_reports_model_errors_and_cleans_up(configured_server, monkeypatch, 
     assert provider.closed
 
 
+def test_web_analysis_emits_checkpoints_and_partial_terminal(configured_server, monkeypatch):
+    provider = ScriptedProvider([
+        tool_response("analysis_checkpoint", {"action": "plan", "dimensions": ["usage"]}, "plan"),
+        tool_response("analysis_checkpoint", {"action": "record", "dimension": "usage", "blocked": True,
+                                             "finding": "没有读到入口文件。"}, "blocked"),
+        tool_response("analysis_checkpoint", {"action": "finish"}, "finish"),
+    ])
+    monkeypatch.setattr(server, "_get_provider", lambda _: provider)
+    with TestClient(server.app) as client:
+        assert client.post("/chat", json={"prompt": "检查", "mode": "invalid"}).status_code == 422
+        events = decode_events(client.post("/chat", json={"prompt": "只解释入口", "mode": "analysis"}))
+    assert any(event["type"] == "analysis_progress" and "没有读到入口文件" in event["text"] for event in events)
+    assert events[-1]["type"] == "done"
+    assert events[-1]["analysis_status"] == "partial"
+
+
 def test_web_resume_rejects_other_sessions_and_consumed_ids(configured_server, monkeypatch):
     cfg, _ = configured_server
     cfg.model_max_attempts = 1

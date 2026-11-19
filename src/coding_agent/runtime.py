@@ -19,7 +19,7 @@ from coding_agent.config import Config, validate_config
 from coding_agent.context.compaction import CompactionPipeline
 from coding_agent.context.recovery import RecoveryManager, RecoveryState, RetryBudget, with_retry
 from coding_agent.hooks.bus import Event, EventBus, EventType, OutputTruncateHook, TokenUsageHook
-from coding_agent.loop import AgentLoop, LoopEvent, TurnProgress
+from coding_agent.loop import ANALYSIS_READ_TOOLS, AgentLoop, AnalysisProgress, LoopEvent, TurnProgress
 from coding_agent.memory import MemoryStore
 from coding_agent.prompt import get_system_prompt
 from coding_agent.providers import AnthropicProvider, OpenAICompatProvider
@@ -28,6 +28,7 @@ from coding_agent.security.permission import (
     ApprovalHandler, DenyListChecker, DestructiveCommandChecker, PermissionPipeline, WorkspaceChecker,
 )
 from coding_agent.skills.loader import SkillLoader
+from coding_agent.tools import build_builtin_tools
 from coding_agent.tools.mcp import assemble_tool_pool, connect_mcp
 from coding_agent.tools.registry import ToolRegistry
 
@@ -187,7 +188,7 @@ class AgentRuntime:
 
     async def _inject_inbox(self, event: Event) -> None:
         """主会话下一次调用模型前自动读取队友回信，子生命周期自行处理其邮箱。"""
-        if event.data.get("purpose") != "agent" or event.data.get("agent") != "lead":
+        if event.data.get("purpose") != "agent" or event.data.get("agent") != "lead" or event.data.get("analysis"):
             return
         messages = event.data.get("messages")
         if messages is not None and self.mailbox.peek("lead"):
@@ -247,19 +248,21 @@ class AgentRuntime:
             progress_interval=self.cfg.progress_interval,
         )
 
-    def system_prompt(self, registry: ToolRegistry, memories: str = "", identity: str = "") -> str:
+    def system_prompt(self, registry: ToolRegistry, memories: str = "", identity: str = "", *,
+                      analysis: bool = False) -> str:
         return get_system_prompt({
             "identity": self.cfg.system_prompt + ("\n" + identity if identity else ""),
             "enabled_tools": list(registry), "workspace": str(self.workdir),
-            "skills": self.skills.build_catalog() if len(self.skills) else "",
-            "memories": memories, "mcp_servers": list(self.mcp_clients),
-            "extra_sections": {"memory_rules": (
+            "skills": self.skills.build_catalog() if not analysis and len(self.skills) else "",
+            "memories": memories, "mcp_servers": [] if analysis else list(self.mcp_clients),
+            "analysis": analysis,
+            "extra_sections": {} if analysis else {"memory_rules": (
                 "跨会话记忆与当前用户指示冲突时，以当前指示为准。"
                 "本轮完成后系统会提取记忆，并独立报告实际写入结果。"
             )},
         })
 
-    async def run_turn(self, prompt: str, *, stream: bool = True) -> AsyncIterator[LoopEvent]:
+    async def run_turn(self, prompt: str, *, stream: bool = True, analysis: bool = False) -> AsyncIterator[LoopEvent]:
         """处理一轮输入；记忆在压缩前保留用户原文，完成保存后才报告 done。"""
         await self.start()
         async with self.turn_lock:
@@ -268,7 +271,8 @@ class AgentRuntime:
                 raise PermissionError(f"用户输入被 Hook 阻止：{blocked}")
             self._checkpoint = None
             self.messages.append({"role": "user", "content": prompt})
-            async with aclosing(self._execute_turn(prompt, stream=stream)) as events:
+            async with aclosing(self._execute_turn(prompt, stream=stream,
+                                                   analysis=AnalysisProgress(prompt[:1200]) if analysis else None)) as events:
                 async for event in events:
                     yield event
 
@@ -315,8 +319,17 @@ class AgentRuntime:
                     yield event
 
     async def _execute_turn(self, prompt: str, *, stream: bool,
+                            analysis: AnalysisProgress | None = None,
                             checkpoint: _TurnCheckpoint | None = None) -> AsyncIterator[LoopEvent]:
-        loop = self.make_loop(self.registry, system="")
+        if checkpoint is not None:
+            analysis = checkpoint.progress.analysis
+        registry = self.registry
+        if analysis is not None:
+            registry = ToolRegistry()
+            for tool in build_builtin_tools(self.workdir):
+                if tool.name in ANALYSIS_READ_TOOLS:
+                    registry.register_tool(tool)
+        loop = self.make_loop(registry, system="")
         relevant = ""
         configuration = self._retry_configuration()
 
@@ -325,12 +338,13 @@ class AgentRuntime:
             async with self.workspace_lock:
                 relevant = await self.memory.select_and_load(self.messages)
 
-        async with aclosing(loop.wait_events(load_memory(), "选择和加载记忆")) as events:
-            async for event in events:
-                yield event
-        loop.system_prompt = self.system_prompt(self.registry, relevant)
+        if analysis is None:
+            async with aclosing(loop.wait_events(load_memory(), "选择和加载记忆")) as events:
+                async for event in events:
+                    yield event
+        loop.system_prompt = self.system_prompt(registry, relevant, analysis=analysis is not None)
         done = None
-        async with aclosing(loop.run(self.messages, stream=stream,
+        async with aclosing(loop.run(self.messages, stream=stream, analysis=analysis,
                                      resume=checkpoint.progress if checkpoint else None)) as events:
             async for event in events:
                 if checkpoint:
@@ -352,6 +366,10 @@ class AgentRuntime:
                     done = event
                 else:
                     yield event
+        if analysis is not None:
+            if done is not None:
+                yield done
+            return
         snapshot = [{"role": "user", "content": prompt}]
         if self.messages and self.messages[-1].get("role") == "assistant":
             snapshot.append(self.messages[-1])

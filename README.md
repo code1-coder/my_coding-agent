@@ -140,6 +140,10 @@ export OPENAI_API_KEY="你的 API 密钥"
 
 macOS / Linux 将解释器路径替换为 `.venv/bin/python`。激活虚拟环境后，也可以使用安装时注册的 `coding-agent chat` 和 `coding-agent run "任务内容"`。
 
+只想了解项目代码时，在交互式 CLI 输入 `/analyze 检查 runtime 在本项目中的作用`，使用 `coding-agent run --analysis "解释调用关系"`，或在网页勾选「静态分析」。此模式仅开放搜索、Python 提纲、分段读取和检查点登记，不执行项目代码、不编辑源码、不提取跨轮项目记忆。工作区外读取仍需审批。
+
+分析检查点记录有源码引用的阶段结论和缺口，随当前轮跨上下文压缩及 `/retry` 保留。最多读取 8 批、每批最多 4 项；连续两批没有新增证据就交付已有结论。检查点不跨会话或进程保存。结论是模型对静态证据的归纳，不表示已做动态验证。未显式启用时，普通对话仍按原编码流程工作。
+
 交互模式中输入 `q` 或 `exit` 退出。全局选项放在子命令之前，例如：
 
 ```powershell
@@ -293,7 +297,7 @@ deny_list:                 # bash 命令的硬阻止子串，可按需补充
 | `POST` | `/tasks` | 手动创建任务，字段为 `subject`、可选 `description` 和 `blockedBy` |
 | `PATCH` | `/tasks/{task_id}` | 手动流转任务，`action` 为 `claim` 或 `complete`，保留依赖与状态检查 |
 | `GET` | `/workspace?session_id=...` | 工作目录、模型名称、记忆、当前会话团队及令牌用量，不返回密钥、不调用模型 |
-| `POST` | `/chat` | SSE 流式对话，请求包含 `prompt` 和可选的 `session_id` |
+| `POST` | `/chat` | SSE 流式对话，请求包含 `prompt` 和可选的 `session_id`、`mode`（`default` 或 `analysis`） |
 | `POST` | `/chat/retry` | 同会话续接，传入 `session_id` 和失败事件中的 `recovery_id`；响应沿用对话 SSE |
 | `POST` | `/approvals/{approval_id}` | 提交 `session_id` 和布尔值 `approved`，处理工具审批 |
 | `WebSocket` | `/ws` | 工具调用通知和心跳 |

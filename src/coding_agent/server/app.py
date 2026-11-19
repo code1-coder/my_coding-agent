@@ -286,7 +286,10 @@ async def chat(request: Request):
     if not isinstance(session_id, str) or not session_id or len(session_id) > 200:
         raise HTTPException(422, "session_id 必须是长度不超过 200 的非空字符串")
 
-    return _chat_response(session_id, prompt=prompt)
+    mode = body.get("mode", "default")
+    if mode not in ("default", "analysis"):
+        raise HTTPException(422, "mode 必须是 default 或 analysis")
+    return _chat_response(session_id, prompt=prompt, analysis=mode == "analysis")
 
 
 @app.post("/chat/retry")
@@ -310,7 +313,8 @@ async def retry_chat(request: Request):
     return _chat_response(session_id, retry=(runtime, recovery_id))
 
 
-def _chat_response(session_id: str, *, prompt: str = "", retry: tuple[AgentRuntime, str] | None = None):
+def _chat_response(session_id: str, *, prompt: str = "", analysis: bool = False,
+                   retry: tuple[AgentRuntime, str] | None = None):
     async def event_stream() -> AsyncIterator[str]:
         queue: asyncio.Queue = asyncio.Queue()
         sentinel = object()
@@ -321,7 +325,7 @@ def _chat_response(session_id: str, *, prompt: str = "", retry: tuple[AgentRunti
             try:
                 if retry is None:
                     runtime = await _get_runtime(session_id)
-                    operation = runtime.run_turn(prompt)
+                    operation = runtime.run_turn(prompt, analysis=analysis)
                 else:
                     runtime, recovery_id = retry
                     operation = runtime.retry_turn(recovery_id)

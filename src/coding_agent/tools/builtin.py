@@ -409,7 +409,7 @@ class ReadFileTool(Tool):
 
     def _read_file(self, path: str, limit: int | None = None, start_line: int | None = None,
                    end_line: int | None = None,
-                   show_line_numbers: bool | None = None) -> tuple[str, dict[str, str]]:
+                   show_line_numbers: bool | None = None) -> tuple[str, dict[str, Any]]:
         for name, value in (("limit", limit), ("start_line", start_line), ("end_line", end_line)):
             if value is not None and (type(value) is not int or value < 1):
                 raise ValueError(f"{name} must be a positive integer")
@@ -442,6 +442,7 @@ class ReadFileTool(Tool):
             }),
             "freshness_token": hashlib.sha256(source).hexdigest(),
             "output_digest": hashlib.sha256(output.encode("utf-8")).hexdigest(),
+            "read_span": (first, last),
         }
         return output, metadata
 

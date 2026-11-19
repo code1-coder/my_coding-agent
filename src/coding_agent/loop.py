@@ -30,6 +30,7 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import json
 import logging
 import uuid
 from contextlib import aclosing
@@ -54,6 +55,16 @@ from coding_agent.providers.activity import RequestActivity, _current_request_ac
 logger = logging.getLogger(__name__)
 _MAX_NO_PROGRESS_READ_ROUNDS = 3
 _MAX_REPEATED_TOOL_FAILURES = 3
+ANALYSIS_READ_TOOLS = frozenset({"read_file", "search_code", "code_outline"})
+_ANALYSIS_CHECKPOINT = "analysis_checkpoint"
+_ANALYSIS_DIMENSIONS = {"role": "职责", "flow": "调用关系", "usage": "入口与用法", "limits": "生命周期与边界"}
+_ANALYSIS_BATCHES = 8
+_ANALYSIS_BATCH_SIZE = 4
+_ANALYSIS_NO_PROGRESS = 2
+
+
+def _analysis_display(value: str, limit: int) -> str:
+    return "".join(char if char.isprintable() else " " for char in value[:limit]).strip()
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -82,6 +93,150 @@ class LoopEvent:
 
 # ═══════════════════════════════════════════════════════════════
 
+@dataclass(frozen=True)
+class AnalysisEvidence:
+    label: str
+    key: str
+    path: str = ""
+    call_id: str = ""
+
+
+@dataclass
+class AnalysisProgress:
+    """只保存本轮已提交的证据引用和模型归纳，不复制源码或授权。"""
+
+    goal: str
+    dimensions: tuple[str, ...] = tuple(_ANALYSIS_DIMENSIONS)
+    evidence: dict[str, AnalysisEvidence] = field(default_factory=dict)
+    findings: dict[str, tuple[str, str, tuple[str, ...]]] = field(default_factory=dict)
+    batches: int = 0
+    stalled: int = 0
+    stalled_controls: int = 0
+    revision: int = 0
+    planned: bool = False
+    finished: bool = False
+    versions: dict[str, str] = field(default_factory=dict)
+
+    def register(self, registry: ToolRegistry) -> None:
+        registry.register(
+            name=_ANALYSIS_CHECKPOINT,
+            description=("提交本轮分析检查点。action=plan 时可用 dimensions 缩小明确指定的范围；"
+                         "record 记录一个 dimension、finding 及 evidence_ids，或用 blocked=true 记录缺口；"
+                         "finish 仅在要求的维度都有记录后使用。每次单独调用。"),
+        )(self.checkpoint)
+
+    async def checkpoint(self, action: str, dimensions: list[str] | None = None,
+                         dimension: str = "", finding: str = "", evidence_ids: list[str] | None = None,
+                         blocked: bool = False) -> str:
+        if action == "plan":
+            if (self.planned or self.batches or self.findings or not isinstance(dimensions, list)
+                    or not 1 <= len(dimensions) <= len(_ANALYSIS_DIMENSIONS)
+                    or any(not isinstance(item, str) or item not in _ANALYSIS_DIMENSIONS for item in dimensions)
+                    or len(set(dimensions)) != len(dimensions)):
+                raise ValueError("只能在读取前设置一次分析维度。")
+            self.dimensions = tuple(dimensions)
+            self.planned = True
+            self.revision += 1
+            return "已设置本轮分析范围。"
+        if action == "finish":
+            if not all(item in self.findings for item in self.dimensions):
+                raise ValueError("还有未记录的分析维度；无证据时请说明具体阻塞。")
+            self.finished = True
+            return "已关闭分析工具阶段。"
+        refs = [] if evidence_ids is None else evidence_ids
+        if (action != "record" or not isinstance(dimension, str) or dimension not in self.dimensions
+                or not isinstance(finding, str) or not 0 < len(finding.strip()) <= 400
+                or type(blocked) is not bool or not isinstance(refs, list) or len(refs) > 4
+                or any(not isinstance(ref, str) or ref not in self.evidence for ref in refs)
+                or (not blocked and not refs)):
+            raise ValueError("请提供有效的维度、简短结论和本轮已登记的证据 ID；无证据时标记阻塞。")
+        finding = _analysis_display(finding, 400)
+        if not finding:
+            raise ValueError("结论或阻塞原因不能为空。")
+        update = ("blocked" if blocked else "supported", finding, tuple(sorted(set(refs))))
+        previous = self.findings.get(dimension)
+        if previous and (previous[0], previous[2]) == (update[0], update[2]):
+            return "已有相同状态和证据；仅改写文字不更新检查点。"
+        self.findings[dimension] = update
+        self.revision += 1
+        return self.describe(dimension)
+
+    def describe(self, dimension: str) -> str:
+        label = _ANALYSIS_DIMENSIONS[dimension]
+        if dimension not in self.findings:
+            return f"{label}：未确认，尚未记录结论。"
+        status, finding, refs = self.findings[dimension]
+        locations = "；".join(self.evidence[ref].label for ref in refs)
+        return f"{label}（{'源码依据' if status == 'supported' else '未确认'}）：{finding}" + (
+            f"［{locations}］" if locations else "")
+
+    def summary(self) -> str:
+        return "\n".join(f"- {self.describe(item)}" for item in self.dimensions)
+
+    def view(self) -> str:
+        return json.dumps({"goal": self.goal, "checks": self.summary(),
+                           "evidence": {ref: item.label for ref, item in self.evidence.items()},
+                           "reading_batches_left": _ANALYSIS_BATCHES - self.batches}, ensure_ascii=False)
+
+    def add_evidence(self, block: dict, result: dict, execution_id: str) -> bool:
+        content, meta = result.get("content", ""), result.get("metadata", {})
+        if result.get("is_error") or meta.get("reused_from"):
+            return False
+        name, args = block["name"], block.get("input", {})
+        path = str(args.get("path") or ".")
+        span = ""
+        version = ""
+        if name == "read_file":
+            if "read_span" not in meta:
+                return False
+            selected = json.loads(meta["repeat_key"])
+            path, version = selected["path"], meta["freshness_token"]
+            self._update_file_version(path, version)
+        if not content.strip() or "... (truncated at " in content:
+            return False
+        if name == "read_file":
+            if hashlib.sha256(content.encode()).hexdigest() != meta.get("output_digest"):
+                return False
+            first, last = meta["read_span"]
+            if last < first:
+                return False
+            span = f":{first}–{last}"
+        elif name in {"search_code", "code_outline"}:
+            try:
+                payload = json.loads(content)
+            except json.JSONDecodeError:
+                return False
+            if not isinstance(payload, dict):
+                return False
+            items = payload.get("results" if name == "search_code" else "symbols", [])
+            if payload.get("truncated") or not items or any(item.get("line_truncated") for item in items):
+                return False
+            path = payload.get("path") or path
+            if name == "search_code":
+                matches = sorted({(item["path"], item["line"], item["text"]) for item in items})
+                content = json.dumps(matches, ensure_ascii=False)
+                path = "、".join(f"{file}:{line}" for file, line, _ in matches[:3])
+        # 读文件用规范化路径、实际行区间和文件版本判重，不因切换行号样式产生新证据。
+        digest = version or hashlib.sha256(content.encode()).hexdigest()
+        key = json.dumps((name, path, span, digest), ensure_ascii=False)
+        if any(item.key == key for item in self.evidence.values()):
+            return False
+        label = f"{_analysis_display(path, 200)}{span}（{name}）"
+        self.evidence[execution_id] = AnalysisEvidence(label, key, path, block["id"])
+        return True
+
+    def _update_file_version(self, path: str, version: str) -> None:
+        if self.versions.get(path, version) != version:
+            stale = {ref for ref, item in self.evidence.items() if item.path == path}
+            for ref in stale:
+                del self.evidence[ref]
+            for dimension, (_, _, refs) in list(self.findings.items()):
+                if stale.intersection(refs):
+                    del self.findings[dimension]
+                    self.revision += 1
+        self.versions[path] = version
+
+
 @dataclass
 class TurnProgress:
     recovery: RecoveryState
@@ -91,6 +246,7 @@ class TurnProgress:
     tool_failure_streaks: dict[str, int] = field(default_factory=dict)
     no_progress_read_rounds: int = 0
     uncertain_tools: bool = False
+    analysis: AnalysisProgress | None = None
 
 
 class AgentLoop:
@@ -147,10 +303,11 @@ class AgentLoop:
 
     async def run(
         self, messages: list[dict[str, Any]], *, stream: bool = True, resume: TurnProgress | None = None,
+        analysis: AnalysisProgress | None = None,
     ) -> AsyncIterator[LoopEvent]:
         """执行本轮循环，并在取消或中断时修复尚未配对的工具结果。"""
         try:
-            async with aclosing(self._run_impl(messages, stream=stream, resume=resume)) as events:
+            async with aclosing(self._run_impl(messages, stream=stream, resume=resume, analysis=analysis)) as events:
                 async for event in events:
                     yield event
         finally:
@@ -169,6 +326,7 @@ class AgentLoop:
         *,
         stream: bool = True,
         resume: TurnProgress | None = None,
+        analysis: AnalysisProgress | None = None,
     ) -> AsyncIterator[LoopEvent]:
         """执行智能体循环。
 
@@ -184,7 +342,12 @@ class AgentLoop:
         工具结果作为用户消息写回。仅工具调用会触发下一轮；达到
         max_iterations 后也会产出 done，以防模型持续调用工具。
         """
-        self.progress = progress = resume or TurnProgress(RecoveryState(current_model=self.provider.model_id))
+        self.progress = progress = resume or TurnProgress(
+            RecoveryState(current_model=self.provider.model_id), analysis=analysis,
+        )
+        analysis = progress.analysis
+        if analysis is not None:
+            analysis.register(self.registry)
         self.request_failure: RecoverableModelRequestError | None = None
         self.resuming_request = resume is not None
         self.recovery_state = progress.recovery
@@ -205,10 +368,10 @@ class AgentLoop:
             try:
                 async with aclosing(self._model_events(messages, stream)) as events:
                     async for ev in events:
-                        if ev.type == "text_delta":
+                        if ev.type == "text_delta" and analysis is None:
                             text += ev.text
                             yield LoopEvent(type="text_delta", text=ev.text)
-                        elif ev.type == "text_reset":
+                        elif ev.type == "text_reset" and analysis is None:
                             text = prefix + ev.text
                             yield LoopEvent(type="text_reset", text=text, data=ev.data)
                         elif ev.type == "done":
@@ -221,6 +384,8 @@ class AgentLoop:
                 if isinstance(exc, RecoverableModelRequestError):
                     self.request_failure = exc
                 delivery = self._request_failure_delivery(exc, tool_outcomes, progress.uncertain_tools)
+                if analysis is not None:
+                    delivery += "\n\n本轮分析检查点：\n" + analysis.summary()
                 history_text = (f"模型中断前的未完成输出：\n{text}\n\n" if text else "") + delivery
                 messages.append({"role": "assistant", "content": [{"type": "text", "text": history_text}]})
                 yield LoopEvent(type="error", text=delivery, data={
@@ -228,11 +393,17 @@ class AgentLoop:
                     "partial_output": bool(text), **self.request_details,
                     "error_category": getattr(exc, "category", "request"),
                     "http_status": getattr(exc, "status", getattr(exc, "status_code", None)),
+                    **({"analysis_status": "failed"} if analysis is not None else {}),
                 })
                 return
             if response is None:
                 raise RuntimeError("模型未返回完整响应")
             self.resuming_request = False
+
+            if analysis is not None and (response.stop_reason != "tool_use" or not response.tool_use_blocks):
+                async for event in self._finish_analysis(messages, "analysis_not_finished"):
+                    yield event
+                return
 
             if response.stop_reason == "max_tokens" and self.recovery is not None:
                 escalated = self.recovery_state.has_escalated
@@ -246,7 +417,8 @@ class AgentLoop:
                     continue
                 # 恢复管理器已追加最后一次截断响应。
             else:
-                messages.append({"role": "assistant", "content": response.content})
+                messages.append({"role": "assistant", "content": response.tool_use_blocks
+                                 if analysis is not None else response.content})
 
             if response.stop_reason != "tool_use" or not response.tool_use_blocks:
                 if not response.text.strip() or response.stop_reason in ("max_tokens", "tool_use"):
@@ -260,13 +432,20 @@ class AgentLoop:
 
             blocks = response.tool_use_blocks
             execution_ids = [uuid.uuid4().hex for _ in blocks]
+            rejected: dict[int, str] = {}
+            reads = False
+            if analysis is not None:
+                rejected, reads = self._analysis_batch(blocks, analysis)
+                if reads:
+                    analysis.batches += 1
+                revision = analysis.revision
             for block, execution_id in zip(blocks, execution_ids):
                 yield LoopEvent(type="tool_start", tool_name=block["name"],
                                 tool_id=block["id"], data={"input": block.get("input", {}),
                                 "execution_id": execution_id, "agent": self.agent_name})
             round_results = []
             round_failures: list[tuple[str, str, str]] = []
-            async with aclosing(self._tool_events(messages, blocks, execution_ids)) as events:
+            async with aclosing(self._tool_events(messages, blocks, execution_ids, rejected=rejected)) as events:
                 async for event in events:
                     if event.type == "tool_done":
                         execution = event.data.get("execution") or {}
@@ -284,6 +463,32 @@ class AgentLoop:
                         round_results.append((event.tool_name, event.data.get("metadata", {}),
                                               bool(event.data.get("is_error"))))
                     yield event
+            if analysis is not None:
+                results = messages[-1]["content"]
+                if reads:
+                    new_evidence = sum(
+                        analysis.add_evidence(block, result, execution_id)
+                        for block, result, execution_id in zip(blocks, results, execution_ids)
+                    )
+                    analysis.stalled = 0 if new_evidence else analysis.stalled + 1
+                changed = analysis.revision != revision
+                analysis.stalled_controls = 0 if reads or changed else analysis.stalled_controls + 1
+                if changed:
+                    remaining = _ANALYSIS_BATCHES - analysis.batches
+                    next_step = ("请说明缺口或补查未确认的维度。"
+                                 if len(analysis.findings) < len(analysis.dimensions) else "各维度均已记录，等待收尾。")
+                    yield LoopEvent(type="analysis_progress", text=analysis.summary() + "\n" + next_step, data={
+                        "turn_id": progress.turn_id, "revision": analysis.revision,
+                        "remaining_batches": remaining,
+                    })
+                reason = ("analysis_finished" if analysis.finished else
+                          "analysis_no_progress" if analysis.stalled >= _ANALYSIS_NO_PROGRESS else
+                          "analysis_budget" if analysis.batches >= _ANALYSIS_BATCHES and rejected and not reads else
+                          "analysis_stalled_controls" if analysis.stalled_controls >= _ANALYSIS_NO_PROGRESS else None)
+                if reason:
+                    async for event in self._finish_analysis(messages, reason):
+                        yield event
+                    return
             round_tool_names = {name for name, _metadata, _failed in round_results}
             for tool_name in round_tool_names:
                 failures = [failure for failure in round_failures if failure[0] == tool_name]
@@ -314,6 +519,46 @@ class AgentLoop:
 
         async for event in self._finish_without_answer(messages, text, "max_iterations"):
             yield event
+
+    def _analysis_batch(self, blocks: list[dict], analysis: AnalysisProgress) -> tuple[dict[int, str], bool]:
+        controls = [index for index, block in enumerate(blocks) if block["name"] == _ANALYSIS_CHECKPOINT]
+        if len(controls) == 1:
+            position = controls[0]
+            if len(blocks) == 1:
+                return {}, False
+            arguments = blocks[position].get("input")
+            if isinstance(arguments, dict) and arguments.get("action") == "finish":
+                return {index: "收尾请求同批不执行其他工具。" for index in range(len(blocks))
+                        if index != position}, False
+        if not controls and len(blocks) <= _ANALYSIS_BATCH_SIZE and analysis.batches < _ANALYSIS_BATCHES:
+            if all(block["name"] in ANALYSIS_READ_TOOLS for block in blocks):
+                return {}, True
+            return dict.fromkeys(range(len(blocks)), "分析模式只允许内置只读工具，本批未执行。"), False
+        reason = ("已达读取上限；只允许单独提交检查点。" if analysis.batches >= _ANALYSIS_BATCHES else
+                  "分析批次不合法；每批最多四个只读工具，检查点须单独提交。")
+        return dict.fromkeys(range(len(blocks)), reason), False
+
+    async def _finish_analysis(self, messages: list[dict[str, Any]], reason: str) -> AsyncIterator[LoopEvent]:
+        analysis = self.progress.analysis
+        complete = analysis.finished and all(
+            analysis.findings[item][0] == "supported" for item in analysis.dimensions
+        )
+        notice = {
+            "analysis_finished": "已结束源码检查。",
+            "analysis_not_finished": "模型结束了检查，但未确认分析范围已覆盖。",
+            "analysis_no_progress": "连续读取未产生新证据，已停止检查。",
+            "analysis_budget": "已达本轮读取批次上限，已停止检查。",
+            "analysis_stalled_controls": "连续请求无效或未更新检查点，已停止检查。",
+            "max_iterations": "已达本轮迭代上限。",
+            "repeated_tool_failure": "工具连续失败，已停止检查。",
+            "no_progress": "未获取新的读取证据。",
+        }[reason]
+        text = f"{'分析完成' if complete else '分析部分交付'}：{notice}\n\n{analysis.summary()}\n\n仅作静态检查，未运行项目代码。"
+        messages.append({"role": "assistant", "content": [{"type": "text", "text": text}]})
+        yield LoopEvent(type="text_delta", text=text)
+        await self.emit(EventType.STOP, stop_reason=reason)
+        yield LoopEvent(type="done", text=text, data={"stop_reason": reason,
+                                                        "analysis_status": "complete" if complete else "partial"})
 
     def _request_failure_delivery(self, exc: Exception, tool_outcomes: dict[tuple[str, str, bool], int],
                                   uncertain_tools: bool) -> str:
@@ -350,6 +595,10 @@ class AgentLoop:
                                      reason: str, *,
                                      failure: tuple[str, str, str] | None = None) -> AsyncIterator[LoopEvent]:
         """最多补充一次无工具总结；失败时明确告知缺少交付，不能静默结束。"""
+        if self.progress.analysis is not None:
+            async for event in self._finish_analysis(messages, reason):
+                yield event
+            return
         notices = {
             "max_iterations": "已达到本轮执行轮次上限，已停止继续调用工具；任务是否完成仍需依据执行结果确认。",
             "no_progress": "连续只读调用未产生新证据，已停止重复读取并根据已有结果整理结论。",
@@ -430,9 +679,10 @@ class AgentLoop:
                 task.cancel()
             await asyncio.gather(task, return_exceptions=True)
 
-    async def _tool_events(self, messages, blocks, execution_ids) -> AsyncIterator[LoopEvent]:
-        tasks = [asyncio.create_task(self._execute_one(block, messages, execution_id=execution_id))
-                 for block, execution_id in zip(blocks, execution_ids)]
+    async def _tool_events(self, messages, blocks, execution_ids, *, rejected: dict[int, str]) -> AsyncIterator[LoopEvent]:
+        tasks = [asyncio.create_task(self._execute_one(block, messages, execution_id=execution_id,
+                                                      rejection=rejected.get(index)))
+                 for index, (block, execution_id) in enumerate(zip(blocks, execution_ids))]
         indexes = {task: index for index, task in enumerate(tasks)}
         pending = set(tasks)
         try:
@@ -515,7 +765,8 @@ class AgentLoop:
             idle_timeout = asyncio.timeout(None)
             try:
                 blocked = await self.emit(EventType.PRE_LLM_CALL, messages=messages,
-                                          purpose="agent", model=provider.model_id)
+                                          purpose="agent", model=provider.model_id,
+                                          analysis=self.progress.analysis is not None)
                 if blocked is not None:
                     raise PermissionError(f"模型调用被 Hook 阻止：{blocked}")
                 # 内部新鲜度指纹只保存在会话历史，不能扩展 Provider 的工具协议。
@@ -528,6 +779,9 @@ class AgentLoop:
                             if isinstance(block, dict) and block.get("type") == "tool_result" else block
                             for block in content
                         ]
+                analysis = self.progress.analysis
+                if analysis is not None:
+                    self._attach_analysis_view(provider_messages, analysis)
                 kwargs = dict(messages=provider_messages, tools=[] if final_only else self.registry.list_tools(),
                               system=self.system_prompt, max_tokens=(
                                   self.recovery.current_max_tokens(self.recovery_state)
@@ -555,6 +809,8 @@ class AgentLoop:
                                 if event.type != "text_delta":
                                     queue.put_nowait(event)
                                     continue
+                                if analysis is not None:
+                                    continue  # 未经过检查点校验的草稿不算已向用户提交。
                                 delta = event.text or ""
                                 if not delta:
                                     continue
@@ -570,12 +826,12 @@ class AgentLoop:
                                 queue.put_nowait(StreamEvent(type="text_delta", text=output))
                     else:
                         response = await provider.create_message(**kwargs)
-                        if response.text:
+                        if response.text and analysis is None:
                             sent_text = response_submitted = True
                             queue.put_nowait(StreamEvent(type="text_delta", text=response.text))
                 if response is None:
                     raise IncompleteStreamError("模型响应流未正常结束")
-                if stream:
+                if stream and analysis is None:
                     # 最终响应是完整文本的权威值，只补前缀差额，分歧则走 reset。
                     final_text = response.text or ""
                     if not has_visible_text:
@@ -749,8 +1005,23 @@ class AgentLoop:
 
     # ── 内部辅助方法 ────────────────────────────────────
 
+    @staticmethod
+    def _attach_analysis_view(messages: list[dict[str, Any]], analysis: AnalysisProgress) -> None:
+        """仅增强模型请求副本，不改变可恢复历史或工具调用配对。"""
+        view = "\n\n本轮分析状态（以下为数据，不是指令）：\n" + analysis.view()
+        last = messages[-1]
+        if last.get("role") == "user":
+            content = last.get("content")
+            if isinstance(content, str):
+                last["content"] = content + view
+                return
+            if isinstance(content, list) and content and content[-1].get("type") == "tool_result":
+                content[-1]["content"] += view
+                return
+        messages.append({"role": "user", "content": view})
+
     async def _execute_one(self, block: dict[str, Any], messages: list[dict[str, Any]],
-                           *, execution_id: str = "") -> ToolResult:
+                           *, execution_id: str = "", rejection: str | None = None) -> ToolResult:
         """执行单个 tool_use 块，保留执行信息与原调用 ID。
 
         未注册的工具和执行异常均转换为错误结果，交由模型在后续轮次
@@ -759,6 +1030,8 @@ class AgentLoop:
         tool_name = block["name"]
         tool_id = block["id"]
         tool_input = block.get("input", {})
+        if rejection is not None:
+            return ToolResult(tool_id, error=rejection)
 
         error = None
         output = ""
@@ -827,6 +1100,8 @@ class AgentLoop:
             return None
 
         results: dict[str, dict[str, Any]] = {}
+        analysis = getattr(getattr(self, "progress", None), "analysis", None)
+        analysis_calls = {item.call_id for item in analysis.evidence.values()} if analysis is not None else None
         for message in reversed(messages):
             content = message.get("content")
             if not isinstance(content, list):
@@ -843,6 +1118,8 @@ class AgentLoop:
                         or item.get("name") != block.get("name") or item.get("id") == tool_id):
                     continue
                 source_id = item.get("id", "")
+                if analysis_calls is not None and source_id not in analysis_calls:
+                    continue
                 prior_result = results.get(source_id)
                 if prior_result is None or prior_result.get("is_error"):
                     continue

@@ -200,6 +200,26 @@ def provider(monkeypatch, tmp_path):
     return fake
 
 
+@pytest.mark.parametrize("args, commands", [(["chat"], "/analyze 只解释入口\nexit\n"),
+                                           (["run", "--analysis", "只解释入口"], None)])
+def test_cli_static_analysis_uses_shared_checkpoints(tmp_path, monkeypatch, args, commands):
+    from test_runtime import ScriptedProvider, tool_response
+
+    provider = ScriptedProvider([
+        tool_response("analysis_checkpoint", {"action": "plan", "dimensions": ["usage"]}, "plan"),
+        tool_response("analysis_checkpoint", {"action": "record", "dimension": "usage", "blocked": True,
+                                             "finding": "没有找到入口。"}, "record"),
+        tool_response("analysis_checkpoint", {"action": "finish"}, "finish"),
+    ])
+    monkeypatch.setattr(main, "load_config", lambda _: Config(workdir=str(tmp_path)))
+    monkeypatch.setattr(main, "_build_provider", lambda _: provider)
+    result = CliRunner().invoke(main.cli, args, input=commands)
+    assert result.exit_code == 0, result.exception
+    assert "[分析检查点]" in result.output
+    assert "分析部分交付" in result.output and "没有找到入口" in result.output
+    assert not list((tmp_path / ".memory").iterdir())
+
+
 def test_chat_preserves_loop_and_history_across_turns(provider):
     result = CliRunner().invoke(
         main.cli, ["chat"], input="你记住你叫李华\n你叫什么？\nexit\n"

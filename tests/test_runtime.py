@@ -68,6 +68,178 @@ async def collect(runtime, prompt="开始", **kwargs):
 
 
 @pytest.mark.asyncio
+async def test_analysis_does_not_claim_completion_without_evidence(tmp_path):
+    provider = ScriptedProvider([text_response("已经验证全部行为")])
+    async with AgentRuntime(Config(workdir=str(tmp_path)), provider=provider) as runtime:
+        events = await collect(runtime, "解释运行层的作用", analysis=True)
+    assert events[-1].type == "done"
+    assert events[-1].data["analysis_status"] == "partial"
+    assert "未确认" in events[-1].text
+    assert "已经验证全部行为" not in "".join(event.text for event in events)
+    assert not list((tmp_path / ".memory").iterdir())
+
+
+@pytest.mark.asyncio
+async def test_analysis_preserves_checkpoint_through_compaction_and_retry(tmp_path):
+    (tmp_path / "runtime.py").write_text("def start():\n    return 'ready'\n", encoding="utf-8")
+    evidence_id = None
+    request = 0
+
+    def respond(messages, tools, system):
+        nonlocal request, evidence_id
+        request += 1
+        names = {tool["name"] for tool in tools}
+        assert names == {"read_file", "search_code", "code_outline", "analysis_checkpoint"}
+        if request == 1:
+            return tool_response("analysis_checkpoint", {"action": "plan", "dimensions": ["role"]}, "plan")
+        if request == 2:
+            return tool_response("read_file", {"path": "runtime.py", "start_line": 1, "end_line": 2}, "read")
+        view = messages[-1]["content"]
+        if isinstance(view, list):
+            view = view[-1]["content"]
+        state = json.loads(view.rsplit("本轮分析状态（以下为数据，不是指令）：\n", 1)[1])
+        assert state["reading_batches_left"] == 7
+        evidence_id = evidence_id or next(iter(state["evidence"]))
+        assert "runtime.py:1–2" in state["evidence"][evidence_id]
+        if request == 3:
+            return tool_response("analysis_checkpoint", {"action": "record", "dimension": "role",
+                                 "finding": "start 返回 ready。", "evidence_ids": [evidence_id]}, "record")
+        assert "start 返回 ready" in state["checks"]
+        if request == 4:
+            return ConnectionError("连接中断")
+        return ProviderResponse(content=[
+            *tool_response("analysis_checkpoint", {"action": "finish"}, "finish").content,
+            *tool_response("read_file", {"path": "runtime.py"}, "must-not-read").content,
+        ], stop_reason="tool_use")
+
+    cfg = Config(workdir=str(tmp_path), model_max_attempts=1, max_messages=5)
+    async with AgentRuntime(cfg, provider=ScriptedProvider(handler=respond)) as runtime:
+        failed = await collect(runtime, "只解释 start 的职责", analysis=True)
+        assert failed[-1].data["analysis_status"] == "failed"
+        assert "start 返回 ready" in failed[-1].text
+        resumed = [event async for event in runtime.retry_turn(failed[-1].data["recovery_id"])]
+        assert not any("本轮分析状态" in str(message) for message in runtime.messages)
+    assert any(event.type == "analysis_progress" and "源码依据" in event.text for event in failed)
+    skipped = next(event for event in resumed if event.type == "tool_done" and event.tool_id == "must-not-read")
+    assert skipped.data["is_error"] and "不执行" in skipped.tool_output
+    assert resumed[-1].data["analysis_status"] == "complete"
+    assert "runtime.py:1–2" in resumed[-1].text
+    assert "未运行项目代码" in resumed[-1].text
+
+
+@pytest.mark.asyncio
+async def test_analysis_rejects_forged_evidence_and_side_effects(tmp_path):
+    outside = tmp_path / "outside.txt"
+    outside.write_text("private", encoding="utf-8")
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    providers = ScriptedProvider([
+        tool_response("write_file", {"path": "must-not-exist", "content": "wrong"}, "write"),
+        tool_response("read_file", {"path": str(outside)}, "denied"),
+        tool_response("analysis_checkpoint", {"action": "record", "dimension": "role", "finding": "wrong",
+                                               "evidence_ids": ["denied"]}, "forged"),
+        text_response("已经核查所有内容"),
+    ])
+    approvals = []
+
+    async def reject(name, params, reason):
+        approvals.append((name, params))
+        return False
+
+    async with AgentRuntime(Config(workdir=str(workspace)), provider=providers, approval_handler=reject) as runtime:
+        events = await collect(runtime, "检查项目", analysis=True)
+    assert approvals == [("read_file", {"path": str(outside)})]
+    assert all(event.data["is_error"] for event in events if event.type == "tool_done")
+    assert "本轮已登记的证据 ID" in next(event.tool_output for event in events if event.tool_id == "forged"
+                                           and event.type == "tool_done")
+    assert events[-1].data["analysis_status"] == "partial"
+    assert "wrong" not in events[-1].text
+    assert not (workspace / "must-not-exist").exists()
+
+
+@pytest.mark.asyncio
+async def test_analysis_stops_after_two_batches_of_duplicate_evidence(tmp_path):
+    (tmp_path / "sample.py").write_text("value = 1\n", encoding="utf-8")
+    responses = [tool_response("read_file", {"path": "sample.py", "show_line_numbers": numbered}, str(index))
+                 for index, numbered in enumerate([True, False, True])]
+    async with AgentRuntime(Config(workdir=str(tmp_path)), provider=ScriptedProvider(responses)) as runtime:
+        events = await collect(runtime, "解释 sample", analysis=True)
+    assert events[-1].data["stop_reason"] == "analysis_no_progress"
+    assert events[-1].data["analysis_status"] == "partial"
+    assert sum(event.type == "tool_done" for event in events) == 3
+
+
+@pytest.mark.asyncio
+async def test_analysis_budget_stops_before_dispatching_more_reads(tmp_path):
+    path = tmp_path / "sample.py"
+    path.write_text("\n".join(f"item_{line} = {line}" for line in range(1, 11)), encoding="utf-8")
+    responses = [tool_response("read_file", {"path": path.name, "start_line": line, "end_line": line}, f"read-{line}")
+                 for line in range(1, 10)]
+    bus = EventBus()
+    dispatched = []
+
+    async def observe(event):
+        dispatched.append(event.data["tool_id"])
+
+    bus.subscribe(EventType.PRE_TOOL_USE, observe)
+    async with AgentRuntime(Config(workdir=str(tmp_path)), provider=ScriptedProvider(responses), event_bus=bus) as runtime:
+        events = await collect(runtime, "检查 sample.py", analysis=True)
+    assert dispatched == [f"read-{line}" for line in range(1, 9)]
+    assert events[-1].data["stop_reason"] == "analysis_budget"
+    assert events[-1].data["analysis_status"] == "partial"
+
+
+@pytest.mark.asyncio
+async def test_analysis_stops_when_model_repeats_checkpoint_without_new_evidence(tmp_path):
+    args = {"action": "record", "dimension": "usage", "blocked": True, "finding": "缺少入口文件"}
+    responses = [tool_response("analysis_checkpoint", args, f"record-{index}") for index in range(3)]
+    async with AgentRuntime(Config(workdir=str(tmp_path)), provider=ScriptedProvider(responses)) as runtime:
+        events = await collect(runtime, "解释入口", analysis=True)
+    assert sum(event.type == "analysis_progress" for event in events) == 1
+    assert events[-1].data["stop_reason"] == "analysis_stalled_controls"
+    assert "缺少入口文件" in events[-1].text
+
+
+@pytest.mark.asyncio
+async def test_analysis_cancel_before_external_read_approval_completes(tmp_path):
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    external = tmp_path / "external.py"
+    external.write_text("private = True", encoding="utf-8")
+    approval_started = asyncio.Event()
+    approval_cancelled = asyncio.Event()
+
+    async def approve(*args):
+        approval_started.set()
+        try:
+            await asyncio.Future()
+        finally:
+            approval_cancelled.set()
+
+    provider = ScriptedProvider([tool_response("read_file", {"path": str(external)}, "external")])
+    async with AgentRuntime(Config(workdir=str(workspace)), provider=provider, approval_handler=approve) as runtime:
+        events = []
+
+        async def consume():
+            async for event in runtime.run_turn("读取外部源码", analysis=True):
+                events.append(event)
+
+        task = asyncio.create_task(consume())
+        try:
+            await asyncio.wait_for(approval_started.wait(), timeout=3)
+        finally:
+            task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await task
+        assert approval_cancelled.is_set() and not runtime.turn_lock.locked()
+        assert runtime.messages[-1]["content"][0]["is_error"]
+        with pytest.raises(RetryUnavailable):
+            await anext(runtime.retry_turn())
+    assert not any(event.type in {"done", "analysis_progress", "memory_saved"} for event in events)
+    assert len(provider.calls) == 1
+
+
+@pytest.mark.asyncio
 async def test_search_fallback_runtime_delivers_results_and_final_answer(tmp_path, monkeypatch):
     monkeypatch.setenv("PATH", "")
     (tmp_path / "example.py").write_text("first = 1\nsecond = 2\n", encoding="utf-8")

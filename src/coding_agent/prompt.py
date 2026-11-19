@@ -69,6 +69,22 @@ def assemble_system_prompt(context: dict[str, Any]) -> str:
         "If blocked or interrupted by a limit, explain what was done and what remains; never claim unverified success. "
         "Fix incorrect source code before verification; passing tests alone does not prove the real behavior works."
     )
+    sections.append(
+        "For requests to explain code without changing it, locate definitions, callers and lifecycle using static "
+        "inspection. Summarize each finding with evidence. Stop once the requested responsibilities, call chain, "
+        "usage and limits are covered; do not edit or run tests by default. Only run a targeted check if it is "
+        "necessary and authorized to resolve a specific runtime question."
+    )
+    if context.get("analysis"):
+        sections.append(
+            "当前为静态分析模式。默认维度：role（职责）、flow（调用关系）、usage（入口与用法）、"
+            "limits（生命周期与边界）。只有用户明确缩小范围时才在读取前用 analysis_checkpoint(action=plan) 设置维度。"
+            "使用内置读取工具，每批最多四个，优先分段读源码。避免重复读取，禁止执行项目代码或修改文件。"
+            "根据请求附带的证据 ID，单独调用 analysis_checkpoint(action=record, dimension, finding, evidence_ids) "
+            "提交用户语言的阶段结论。无法确认时传 blocked=true 并说明缺少的证据或下一步。"
+            "每个所需维度都有记录后，单独调用 analysis_checkpoint(action=finish)。"
+            "不要用普通正文提前结束；运行时从检查点交付最终答复。"
+        )
 
     # 动态：工具
     tools = context.get("enabled_tools", [])
@@ -84,7 +100,7 @@ def assemble_system_prompt(context: dict[str, Any]) -> str:
                 "from the user's interactive shell. After a tool error, do not repeat an equivalent failed command; "
                 "switch to the matching tool or explain the environment limitation."
             )
-        if "search_code" in tools:
+        if "search_code" in tools and not context.get("analysis"):
             sections.append(
                 "Coding workflow: inspect git_status/git_diff before editing. Locate code with search_code "
                 "(literal by default; regex=true opts in). Use code_outline for Python symbols, then "

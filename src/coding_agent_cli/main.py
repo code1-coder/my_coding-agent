@@ -183,6 +183,9 @@ def _print_event(event: LoopEvent, *, color: bool = True) -> None:
                        + ("，范围未完整搜索，请检查结果限制" if result.get("truncated") else ""))
     elif event.type == "memory_saved":
         click.echo(f"\n[记忆] 已保存 {event.data['count']} 条到 {event.data['path']}\n")
+    elif event.type == "analysis_progress":
+        summary = "\n".join(_terminal_text(line) for line in event.text.splitlines())
+        click.echo(f"\n[分析检查点] 剩余读取批次：{event.data['remaining_batches']}\n{summary}")
     elif event.type == "warning":
         click.echo("\n" + event.text, err=True)
     elif event.type == "error":
@@ -192,13 +195,14 @@ def _print_event(event: LoopEvent, *, color: bool = True) -> None:
         click.echo("\n" + delivery + "\n" + hint, err=True)
 
 
-async def _run_agent_loop(prompt: str, cfg: Config, *, stream: bool = True, color: bool = True) -> str:
+async def _run_agent_loop(prompt: str, cfg: Config, *, stream: bool = True, color: bool = True,
+                          analysis: bool = False) -> str:
     """单次任务也经过完整运行流程，并在退出前释放队友和客户端。"""
     runtime, _ = _create_runtime(cfg)
     final = ""
     failure = None
     async with runtime:
-        async with aclosing(runtime.run_turn(prompt, stream=stream)) as events:
+        async with aclosing(runtime.run_turn(prompt, stream=stream, analysis=analysis)) as events:
             async for event in events:
                 if event.type == "error":
                     failure = event.text
@@ -243,7 +247,7 @@ async def _chat_session(cfg: Config) -> None:
     runtime, read_lock = _create_runtime(cfg)
     async with runtime:
         click.echo(f"coding-agent chat  |  model: {cfg.model_id}  |  workdir: {cfg.workdir}")
-        click.echo('输入 "q" 或 "exit" 退出。\n')
+        click.echo('输入 /analyze <问题> 进行静态分析；输入 "q" 或 "exit" 退出。\n')
         while True:
             try:
                 async with read_lock:
@@ -255,7 +259,16 @@ async def _chat_session(cfg: Config) -> None:
                 break
             click.echo()
             try:
-                operation = runtime.retry_turn() if query.strip() == "/retry" else runtime.run_turn(query)
+                words = query.strip().split(maxsplit=1)
+                if query.strip() == "/retry":
+                    operation = runtime.retry_turn()
+                elif words[0] == "/analyze":
+                    if len(words) == 1:
+                        click.echo("用法：/analyze <问题>", err=True)
+                        continue
+                    operation = runtime.run_turn(words[1], analysis=True)
+                else:
+                    operation = runtime.run_turn(query)
                 async with aclosing(operation) as events:
                     async for event in events:
                         _print_event(event)
@@ -268,11 +281,12 @@ async def _chat_session(cfg: Config) -> None:
 
 @cli.command()
 @click.argument("prompt")
+@click.option("--analysis", is_flag=True, help="只做静态源码分析，不执行项目代码或修改文件。")
 @click.pass_context
-def run(ctx, prompt):
+def run(ctx, prompt, analysis):
     """执行单次提示词任务后退出。"""
     try:
-        final = asyncio.run(_run_agent_loop(prompt, ctx.obj["cfg"], stream=True))
+        final = asyncio.run(_run_agent_loop(prompt, ctx.obj["cfg"], stream=True, analysis=analysis))
     except REQUEST_ERRORS as exc:
         raise click.ClickException(f"模型请求失败：{exc}") from exc
     if not final.endswith("\n"):
