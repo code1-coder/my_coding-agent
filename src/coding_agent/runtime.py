@@ -223,11 +223,12 @@ class AgentRuntime:
         return message
 
     def make_loop(self, registry: ToolRegistry, *, system: str, agent_name: str = "lead",
-                  max_iterations: int | None = None) -> AgentLoop:
+                  max_iterations: int | None = None, analysis: bool = False) -> AgentLoop:
         pipeline = CompactionPipeline(
             summarize=self.summarize, workdir=self.workdir,
             context_limit=self.cfg.context_limit, max_messages=self.cfg.max_messages,
             keep_recent=self.cfg.keep_recent, persist_threshold=self.cfg.persist_threshold,
+            persist=not analysis,
         )
         return AgentLoop(
             provider=self.provider, tools=[], registry=registry, system_prompt=system,
@@ -329,7 +330,7 @@ class AgentRuntime:
             for tool in build_builtin_tools(self.workdir):
                 if tool.name in ANALYSIS_READ_TOOLS:
                     registry.register_tool(tool)
-        loop = self.make_loop(registry, system="")
+        loop = self.make_loop(registry, system="", analysis=analysis is not None)
         relevant = ""
         configuration = self._retry_configuration()
 

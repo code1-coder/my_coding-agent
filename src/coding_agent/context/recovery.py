@@ -409,6 +409,8 @@ class RecoveryManager:
         state: RecoveryState,
         messages: list[dict[str, Any]],
         response: Any,
+        *,
+        allow_continuation: bool = True,
     ) -> bool:
         """处理 ``stop_reason == "max_tokens"``。
 
@@ -418,6 +420,7 @@ class RecoveryManager:
             state: 可变恢复状态。
             messages: 对话历史（续写时追加到此列表）。
             response: 包含截断输出的 provider 响应。
+            allow_continuation: 预算升级后是否允许保留截断正文并续写。
 
         返回:
             如果循环应 **继续**（重试/升级），返回 ``True``。
@@ -433,6 +436,9 @@ class RecoveryManager:
             )
             # 不追加截断输出 —— 重试同一请求
             return True
+
+        if not allow_continuation:
+            return False
 
         # ── 64K 仍截断：追加 + 续写提示词 ──
         # 追加截断输出以保留上下文

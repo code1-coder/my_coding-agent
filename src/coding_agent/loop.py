@@ -32,6 +32,7 @@ import asyncio
 import hashlib
 import json
 import logging
+import os
 import uuid
 from contextlib import aclosing
 from dataclasses import dataclass, field
@@ -61,6 +62,7 @@ _ANALYSIS_DIMENSIONS = {"role": "职责", "flow": "调用关系", "usage": "入�
 _ANALYSIS_BATCHES = 8
 _ANALYSIS_BATCH_SIZE = 4
 _ANALYSIS_NO_PROGRESS = 2
+_ANALYSIS_MAX_RESULT_CHARS = 30_000
 
 
 def _analysis_display(value: str, limit: int) -> str:
@@ -97,8 +99,8 @@ class LoopEvent:
 class AnalysisEvidence:
     label: str
     key: str
-    path: str = ""
-    call_id: str = ""
+    paths: frozenset[str]
+    call_id: str
 
 
 @dataclass
@@ -180,10 +182,11 @@ class AnalysisProgress:
 
     def add_evidence(self, block: dict, result: dict, execution_id: str) -> bool:
         content, meta = result.get("content", ""), result.get("metadata", {})
-        if result.get("is_error") or meta.get("reused_from"):
+        if meta.get("reused_from"):
             return False
         name, args = block["name"], block.get("input", {})
         path = str(args.get("path") or ".")
+        paths = {path}
         span = ""
         version = ""
         if name == "read_file":
@@ -192,7 +195,8 @@ class AnalysisProgress:
             selected = json.loads(meta["repeat_key"])
             path, version = selected["path"], meta["freshness_token"]
             self._update_file_version(path, version)
-        if not content.strip() or "... (truncated at " in content:
+            paths = {path}
+        if result.get("is_error") or not content.strip() or "... (truncated at " in content:
             return False
         if name == "read_file":
             if hashlib.sha256(content.encode()).hexdigest() != meta.get("output_digest"):
@@ -212,9 +216,11 @@ class AnalysisProgress:
             if payload.get("truncated") or not items or any(item.get("line_truncated") for item in items):
                 return False
             path = payload.get("path") or path
+            paths = {path}
             if name == "search_code":
                 matches = sorted({(item["path"], item["line"], item["text"]) for item in items})
                 content = json.dumps(matches, ensure_ascii=False)
+                paths = {file for file, _, _ in matches}
                 path = "、".join(f"{file}:{line}" for file, line, _ in matches[:3])
         # 读文件用规范化路径、实际行区间和文件版本判重，不因切换行号样式产生新证据。
         digest = version or hashlib.sha256(content.encode()).hexdigest()
@@ -222,12 +228,16 @@ class AnalysisProgress:
         if any(item.key == key for item in self.evidence.values()):
             return False
         label = f"{_analysis_display(path, 200)}{span}（{name}）"
-        self.evidence[execution_id] = AnalysisEvidence(label, key, path, block["id"])
+        self.evidence[execution_id] = AnalysisEvidence(
+            label, key, frozenset(os.path.normcase(file) for file in paths), block["id"],
+        )
         return True
 
     def _update_file_version(self, path: str, version: str) -> None:
-        if self.versions.get(path, version) != version:
-            stale = {ref for ref, item in self.evidence.items() if item.path == path}
+        path = os.path.normcase(path)
+        # 搜索和提纲不含文件版本；首次拿到指纹时也不能确认这些旧结果仍有效。
+        if self.versions.get(path) != version:
+            stale = {ref for ref, item in self.evidence.items() if path in item.paths}
             for ref in stale:
                 del self.evidence[ref]
             for dimension, (_, _, refs) in list(self.findings.items()):
@@ -400,10 +410,22 @@ class AgentLoop:
                 raise RuntimeError("模型未返回完整响应")
             self.resuming_request = False
 
-            if analysis is not None and (response.stop_reason != "tool_use" or not response.tool_use_blocks):
-                async for event in self._finish_analysis(messages, "analysis_not_finished"):
-                    yield event
-                return
+            if analysis is not None:
+                if response.stop_reason == "max_tokens":
+                    # 截断的工具参数和草稿都不能入历史，升级预算后重新生成同一步。
+                    if (iteration + 1 < self.max_iterations and self.recovery is not None
+                            and self.recovery.handle_max_tokens(
+                                self.recovery_state, messages, response, allow_continuation=False)):
+                        continue
+                    reason = "max_tokens"
+                elif response.stop_reason != "tool_use" or not response.tool_use_blocks:
+                    reason = "analysis_not_finished"
+                else:
+                    reason = None
+                if reason:
+                    async for event in self._finish_analysis(messages, reason):
+                        yield event
+                    return
 
             if response.stop_reason == "max_tokens" and self.recovery is not None:
                 escalated = self.recovery_state.has_escalated
@@ -489,6 +511,8 @@ class AgentLoop:
                     async for event in self._finish_analysis(messages, reason):
                         yield event
                     return
+                # 静态分析按批次判断进展，同批多项失败不能抢先终止整轮。
+                continue
             round_tool_names = {name for name, _metadata, _failed in round_results}
             for tool_name in round_tool_names:
                 failures = [failure for failure in round_failures if failure[0] == tool_name]
@@ -549,6 +573,7 @@ class AgentLoop:
             "analysis_no_progress": "连续读取未产生新证据，已停止检查。",
             "analysis_budget": "已达本轮读取批次上限，已停止检查。",
             "analysis_stalled_controls": "连续请求无效或未更新检查点，已停止检查。",
+            "max_tokens": "模型输出达到长度上限，无法继续检查。",
             "max_iterations": "已达本轮迭代上限。",
             "repeated_tool_failure": "工具连续失败，已停止检查。",
             "no_progress": "未获取新的读取证据。",
@@ -1063,6 +1088,10 @@ class AgentLoop:
             execution = exc.result.execution
         except Exception as exc:
             error = str(exc)
+        if (not error and tool_name in ANALYSIS_READ_TOOLS
+                and self.progress.analysis is not None and len(output) > _ANALYSIS_MAX_RESULT_CHARS):
+            # 无磁盘回退时不把超大结果交给模型，也不将预览登记为完整证据。
+            error = "静态分析单项输出超过 30,000 字符，请缩小读取或搜索范围后重试。"
         if error:
             await self.emit(EventType.ERROR, tool_name=tool_name, error=error)
         event = Event(EventType.POST_TOOL_USE, data={

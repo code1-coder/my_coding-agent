@@ -462,6 +462,7 @@ async def compact_history(
     *,
     summarize: SummarizeFn,
     workdir: Path | str | None = None,
+    persist: bool = True,
 ) -> list[dict[str, Any]]:
     """通过 LLM 生成完整对话摘要。
 
@@ -475,9 +476,10 @@ async def compact_history(
     返回一个 **新** 列表（调用方应重新绑定，如
     ``messages = await compact_history(...)``）。
     """
-    wd = Path(workdir) if workdir else Path.cwd()
-    transcript_path = _write_transcript(messages, wd)
-    logger.info("Transcript saved: %s", transcript_path)
+    if persist:
+        wd = Path(workdir) if workdir else Path.cwd()
+        transcript_path = _write_transcript(messages, wd)
+        logger.info("Transcript saved: %s", transcript_path)
 
     conversation = _select_summary_input(messages)
     latest_request_index = _latest_request_index(messages)
@@ -516,6 +518,7 @@ async def reactive_compact(
     *,
     summarize: SummarizeFn,
     workdir: Path | str | None = None,
+    persist: bool = True,
 ) -> list[dict[str, Any]]:
     """当 API 返回 ``prompt_too_long`` 时的紧急摘要。
 
@@ -528,7 +531,8 @@ async def reactive_compact(
     返回一个 **新** 列表。
     """
     wd = Path(workdir) if workdir else Path.cwd()
-    _write_transcript(messages, wd)
+    if persist:
+        _write_transcript(messages, wd)
 
     tail_start = max(0, len(messages) - 5)
 
@@ -545,7 +549,7 @@ async def reactive_compact(
     tail = messages[tail_start:]
     if not old_part:
         # 少量超大消息也需要真正缩减，不能只在原文前追加一个空摘要。
-        return await compact_history(messages, summarize=summarize, workdir=wd)
+        return await compact_history(messages, summarize=summarize, workdir=wd, persist=persist)
 
     # 只摘要旧的部分
     conv = _select_summary_input(old_part)
@@ -614,6 +618,7 @@ class CompactionPipeline:
         persist_threshold: int = DEFAULT_PERSIST_THRESHOLD,
         max_messages: int = DEFAULT_MAX_MESSAGES,
         max_reactive_retries: int = DEFAULT_MAX_REACTIVE_RETRIES,
+        persist: bool = True,
     ) -> None:
         self.summarize = summarize
         self.workdir = Path(workdir) if workdir else Path.cwd()
@@ -622,6 +627,7 @@ class CompactionPipeline:
         self.persist_threshold = persist_threshold
         self.max_messages = max_messages
         self.max_reactive_retries = max_reactive_retries
+        self.persist = persist
 
     # ── LLM 调用前管道（除非 L4 触发，否则不调 API）──────
 
@@ -635,17 +641,17 @@ class CompactionPipeline:
         摘要前的对话记录可能写入工作目录下的持久化文件。
         """
         # L3 → 将大工具输出持久化到磁盘
-        tool_result_budget(
-            messages,
-            workdir=self.workdir,
-            persist_threshold=self.persist_threshold,
-        )
+        if self.persist:
+            tool_result_budget(messages, workdir=self.workdir, persist_threshold=self.persist_threshold)
 
         # L1 → 裁剪中间消息（配对保护）
         snip_compact(messages, max_messages=self.max_messages)
 
         # L2 → 旧工具结果替换为占位符
-        micro_compact(messages, keep_recent=self.keep_recent)
+        latest_tool_count = len(messages[-1]["content"]) if (
+            not self.persist and messages and _is_tool_result_message(messages[-1])
+        ) else 0
+        micro_compact(messages, keep_recent=max(self.keep_recent, latest_tool_count))
 
         # L4 → 若仍超预算，用 LLM 生成摘要
         if estimate_tokens(messages) > self.context_limit:
@@ -656,12 +662,15 @@ class CompactionPipeline:
                 )
             else:
                 logger.info("上下文超出限制 —— 触发 L4 compact_history")
+                # 静态分析的最新工具批次尚未交给模型。整批保留，并保护调用与结果配对。
+                split = len(messages) - 2 if latest_tool_count else len(messages)
                 new_msgs = await compact_history(
-                    messages,
+                    messages[:split],
                     summarize=self.summarize,
                     workdir=self.workdir,
+                    persist=self.persist,
                 )
-                messages[:] = new_msgs
+                messages[:] = [*new_msgs, *messages[split:]]
 
         return messages
 
@@ -677,6 +686,7 @@ class CompactionPipeline:
             messages,
             summarize=self.summarize,
             workdir=self.workdir,
+            persist=self.persist,
         )
 
     # ── 辅助方法 ────────────────────────────────────────────

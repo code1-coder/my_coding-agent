@@ -80,6 +80,139 @@ async def test_analysis_does_not_claim_completion_without_evidence(tmp_path):
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("evidence_tool", ["search_code", "code_outline"])
+async def test_analysis_revokes_findings_when_source_version_changes(tmp_path, evidence_tool):
+    source = tmp_path / "entry.py"
+    source.write_text("def old_entry(): pass\n", encoding="utf-8")
+    args = {"path": source.name}
+    evidence_args = {**args, "pattern": "old_entry"} if evidence_tool == "search_code" else args
+    old_id = None
+
+    def respond(messages, tools, system):
+        match len(provider.calls):
+            case 1:
+                return tool_response("analysis_checkpoint", {"action": "plan", "dimensions": ["role"]}, "plan")
+            case 2:
+                return tool_response("read_file", args, "baseline")
+            case 3:
+                return tool_response(evidence_tool, evidence_args, "evidence")
+            case 4:
+                state = json.loads(messages[-1]["content"][-1]["content"].rsplit("\n", 1)[1])
+                old_id = next(ref for ref, label in state["evidence"].items() if evidence_tool in label)
+                return tool_response("analysis_checkpoint", {"action": "record", "dimension": "role",
+                                     "finding": "入口为 old_entry。", "evidence_ids": [old_id]}, "record")
+            case 5:
+                source.write_text("def new_entry(): pass\n", encoding="utf-8")
+                return tool_response("read_file", args, "updated")
+            case 6:
+                return tool_response("analysis_checkpoint", {"action": "finish"}, "finish")
+        return text_response()
+
+    provider = ScriptedProvider(handler=respond)
+    async with AgentRuntime(Config(workdir=str(tmp_path)), provider=provider) as runtime:
+        events = await collect(runtime, "解释入口的职责", analysis=True)
+    assert any(event.type == "analysis_progress" and "入口为 old_entry" in event.text for event in events)
+    assert any(event.tool_id == "finish" and event.data.get("is_error") for event in events)
+    assert events[-1].data["analysis_status"] == "partial"
+    assert "入口为 old_entry" not in events[-1].text
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("compaction", ["proactive", "reactive"])
+async def test_analysis_does_not_persist_reading_or_transcripts(tmp_path, compaction):
+    source = tmp_path / "sample.py"
+    source.write_text("synthetic_value = 1\n" * 1800, encoding="utf-8")
+    replies = [tool_response("read_file", {"path": source.name}, "large-read"), text_response()]
+    cfg = Config(workdir=str(tmp_path))
+    if compaction == "proactive":
+        cfg.context_limit = 25
+    else:
+        replies.insert(1, model_http_error(400, message="context_length_exceeded"))
+    provider = ScriptedProvider(replies)
+    async with AgentRuntime(cfg, provider=provider) as runtime:
+        events = await collect(runtime, "解释大文件", analysis=True)
+    assert events[-1].type == "done"
+    assert any(call["tools"] is None for call in provider.calls)
+    read = next(event for event in events if event.type == "tool_done" and event.tool_id == "large-read")
+    assert read.data["is_error"] and "缩小" in read.tool_output
+    assert "synthetic_value" not in str(provider.calls)
+    assert not (tmp_path / ".task_outputs").exists()
+    assert not (tmp_path / ".transcripts").exists()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("context_limit", [50_000, 200])
+async def test_analysis_delivers_all_four_reads_before_compacting_them(tmp_path, context_limit):
+    blocks = []
+    for index in range(4):
+        path = tmp_path / f"part_{index}.py"
+        path.write_text("value = 1\n" * 60 + f"tail_marker = {index}\n", encoding="utf-8")
+        blocks.extend(tool_response("read_file", {"path": path.name}, f"read-{index}").content)
+    provider = ScriptedProvider([ProviderResponse(content=blocks, stop_reason="tool_use"), text_response()])
+    cfg = Config(workdir=str(tmp_path), context_limit=context_limit)
+    async with AgentRuntime(cfg, provider=provider) as runtime:
+        await collect(runtime, "检查四个文件", analysis=True)
+    request = [call for call in provider.calls if call["tools"]][-1]
+    results = [block for message in request["messages"] if isinstance(message["content"], list)
+               for block in message["content"] if block["type"] == "tool_result"]
+    assert [block["tool_use_id"] for block in results] == [f"read-{i}" for i in range(4)]
+    assert all(f"tail_marker = {i}" in block["content"] for i, block in enumerate(results))
+
+
+@pytest.mark.asyncio
+async def test_analysis_can_record_blocker_after_three_failures_in_one_batch(tmp_path):
+    failed_reads = [tool_response("read_file", {"path": f"missing_{i}.py"}, f"missing-{i}").content[0]
+                    for i in range(3)]
+    provider = ScriptedProvider([
+        tool_response("analysis_checkpoint", {"action": "plan", "dimensions": ["usage"]}, "plan"),
+        ProviderResponse(content=failed_reads, stop_reason="tool_use"),
+        tool_response("analysis_checkpoint", {"action": "record", "dimension": "usage", "blocked": True,
+                     "finding": "三个候选入口均不存在。"}, "blocked"),
+        tool_response("analysis_checkpoint", {"action": "finish"}, "finish"),
+    ])
+    async with AgentRuntime(Config(workdir=str(tmp_path)), provider=provider) as runtime:
+        events = await collect(runtime, "只检查入口", analysis=True)
+    assert events[-1].data["stop_reason"] == "analysis_finished"
+    assert "三个候选入口均不存在" in events[-1].text
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("exhausted", [False, True])
+async def test_analysis_recovers_truncated_output_without_replaying_reads(tmp_path, exhausted):
+    (tmp_path / "entry.py").write_text("value = 1\n", encoding="utf-8")
+    provider = ScriptedProvider([
+        tool_response("analysis_checkpoint", {"action": "plan", "dimensions": ["role"]}, "plan"),
+        tool_response("read_file", {"path": "entry.py"}, "read"),
+        text_response("不完整草稿", "max_tokens"),
+    ])
+
+    def respond(messages, tools, system):
+        if provider.responses:
+            return provider.responses.pop(0)
+        if exhausted:
+            return text_response("不完整草稿", "max_tokens")
+        if len(provider.calls) == 4:
+            state = json.loads(messages[-1]["content"][-1]["content"].rsplit("\n", 1)[1])
+            return tool_response("analysis_checkpoint", {"action": "record", "dimension": "role",
+                                 "finding": "定义初始值。", "evidence_ids": list(state["evidence"])}, "record")
+        return tool_response("analysis_checkpoint", {"action": "finish"}, "finish")
+
+    provider.handler = respond
+    cfg = Config(workdir=str(tmp_path), max_tokens=1024, escalated_max_tokens=2048)
+    async with AgentRuntime(cfg, provider=provider) as runtime:
+        events = await collect(runtime, "只解释职责", analysis=True)
+        assert "不完整草稿" not in str(runtime.messages)
+    assert [call["max_tokens"] for call in provider.calls][:4] == [1024, 1024, 1024, 2048]
+    assert sum(event.tool_id == "read" and event.type == "tool_done" for event in events) == 1
+    if exhausted:
+        assert events[-1].data["analysis_status"] == "partial"
+        assert "输出达到长度上限" in events[-1].text
+    else:
+        assert events[-1].data["analysis_status"] == "complete"
+        assert "定义初始值" in events[-1].text
+
+
+@pytest.mark.asyncio
 async def test_analysis_preserves_checkpoint_through_compaction_and_retry(tmp_path):
     (tmp_path / "runtime.py").write_text("def start():\n    return 'ready'\n", encoding="utf-8")
     evidence_id = None
