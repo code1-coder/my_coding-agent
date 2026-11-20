@@ -16,7 +16,7 @@ from coding_agent.agents.subagent import AgentPool, SubagentSpec
 from coding_agent.agents.tasks import TaskBoard
 from coding_agent.agents.team import FileMailbox, TeamRegistry
 from coding_agent.config import Config, validate_config
-from coding_agent.context.compaction import CompactionPipeline
+from coding_agent.context.compaction import CompactionPipeline, internal_context_message
 from coding_agent.context.recovery import RecoveryManager, RecoveryState, RetryBudget, with_retry
 from coding_agent.hooks.bus import Event, EventBus, EventType, OutputTruncateHook, TokenUsageHook
 from coding_agent.loop import ANALYSIS_READ_TOOLS, AgentLoop, AnalysisProgress, LoopEvent, TurnProgress
@@ -193,9 +193,9 @@ class AgentRuntime:
         messages = event.data.get("messages")
         if messages is not None and self.mailbox.peek("lead"):
             inbox = self.team.check_inbox("lead")
-            messages.append({"role": "user", "content": (
+            messages.append(internal_context_message(
                 "<inbox>" + json.dumps(inbox, ensure_ascii=False) + "</inbox>"
-            )})
+            ))
 
     def make_registry(self, *, agent_name: str = "lead", delegation: bool = True,
                       allowed_tools: set[str] | None = None) -> ToolRegistry:

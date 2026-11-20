@@ -44,6 +44,7 @@ import anthropic
 import httpx
 import openai
 
+from coding_agent.context.compaction import internal_context_message
 from coding_agent.providers.activity import _sdk_http_module
 from coding_agent.providers.base import (
     IncompleteStreamError, ModelIdleTimeout, ModelRequestError, RecoverableModelRequestError,
@@ -445,7 +446,7 @@ class RecoveryManager:
         messages.append({"role": "assistant", "content": response.content})
 
         if state.recovery_count < self._max_recovery_retries:
-            messages.append({"role": "user", "content": CONTINUATION_PROMPT})
+            messages.append(internal_context_message(CONTINUATION_PROMPT))
             state.recovery_count += 1
             logger.info(
                 "[max_tokens] 续写 %d/%d",

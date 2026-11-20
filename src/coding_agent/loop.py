@@ -43,7 +43,7 @@ from coding_agent.tools.base import Tool, ToolCancelledError, ToolResult, tool_r
 from coding_agent.tools.registry import ToolRegistry
 from coding_agent.hooks.bus import Event, EventBus, EventType
 from coding_agent.security.permission import PermissionPipeline, Verdict
-from coding_agent.context.compaction import CompactionPipeline
+from coding_agent.context.compaction import CompactionPipeline, INTERNAL_CONTEXT_KEY
 from coding_agent.context.recovery import (
     DEFAULT_MODEL_ATTEMPTS, RETRY_LABELS, RecoveryManager, RecoveryState, RetryBudget,
     is_model_request_failure, retry_after_deadline, retry_category,
@@ -794,9 +794,10 @@ class AgentLoop:
                                           analysis=self.progress.analysis is not None)
                 if blocked is not None:
                     raise PermissionError(f"模型调用被 Hook 阻止：{blocked}")
-                # 内部新鲜度指纹只保存在会话历史，不能扩展 Provider 的工具协议。
+                # 历史消息来源和工具结果指纹都是运行时元数据，不属于 Provider 协议。
                 provider_messages = [dict(message) for message in messages]
                 for message in provider_messages:
+                    message.pop(INTERNAL_CONTEXT_KEY, None)
                     content = message.get("content")
                     if isinstance(content, list):
                         message["content"] = [

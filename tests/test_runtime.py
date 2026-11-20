@@ -941,6 +941,71 @@ async def test_runtime_compacts_real_history_before_model_call(tmp_path):
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("mode", ["snip", "proactive", "reactive"])
+async def test_runtime_preserves_current_request_through_compaction_and_resume(tmp_path, mode):
+    constraint = "唯一约束：仅核对接口，不要写入文件。"
+    prompt = "请核对接口。" + "前置资料 " * 700 + constraint + " 后置资料" * 700
+    responses = []
+    for index in range(7):
+        path = f"note-{index}.txt"
+        (tmp_path / path).write_text("接口说明", encoding="utf-8")
+        responses.append(tool_response("read_file", {"path": path}, f"read-{index}"))
+    if mode == "reactive":
+        responses.append(model_http_error(400, message="context_length_exceeded"))
+    responses.extend([ConnectionError("断开"), text_response("已核对")])
+    provider = ScriptedProvider(responses)
+    cfg = Config(workdir=str(tmp_path), max_messages=8,
+                 context_limit=1000 if mode == "proactive" else 50000,
+                 model_max_attempts=2 if mode == "reactive" else 1)
+    async with AgentRuntime(cfg, provider=provider) as runtime:
+        runtime.messages.extend([
+            {"role": "user", "content": "历史请求"},
+            {"role": "assistant", "content": "历史答复"},
+        ] * 2)
+        events = await collect(runtime, prompt, stream=False)
+        failure = events[-1]
+        assert failure.type == "error"
+        resumed = [event async for event in runtime.retry_turn(failure.data["recovery_id"], stream=False)]
+    assert resumed[-1].text == "已核对"
+    assert not any(event.type == "tool_start" for event in resumed)
+    calls = [call["messages"] for call in provider.calls if call["tools"] is not None]
+    markers = {"snip": "[snipped ", "proactive": "[Compacted]", "reactive": "[Reactive compact]"}
+    assert any(message["content"].startswith(markers[mode]) for call in calls for message in call
+               if isinstance(message["content"], str))
+    if mode != "snip":
+        summaries = [call["messages"][0]["content"] for call in provider.calls
+                     if call["tools"] is None and call["messages"][0]["content"].startswith("请摘要")]
+        assert any(constraint in summary for summary in summaries)
+    for messages in calls:
+        assert str(messages).count(constraint) == 1
+        assert sum(message.get("content") == prompt for message in messages) == 1
+        blocks = [block for message in messages if isinstance(message["content"], list)
+                  for block in message["content"]]
+        assert [block["id"] for block in blocks if block["type"] == "tool_use"] == [
+            block["tool_use_id"] for block in blocks if block["type"] == "tool_result"
+        ]
+
+
+@pytest.mark.asyncio
+async def test_runtime_reports_context_limit_if_provider_rejects_preserved_request(tmp_path):
+    prompt = "请核对接口。" + "前置资料 " * 700 + "只读检查" + " 后置资料" * 700
+    provider = ScriptedProvider([
+        model_http_error(400, message="context_length_exceeded"),
+        model_http_error(400, message="context_length_exceeded"),
+    ])
+    cfg = Config(workdir=str(tmp_path), model_max_attempts=3)
+    async with AgentRuntime(cfg, provider=provider) as runtime:
+        events = await collect(runtime, prompt, stream=False)
+
+    assert events[-1].type == "error"
+    assert "上下文超出限制" in events[-1].text
+    assert not any(event.type in {"done", "tool_start"} for event in events)
+    calls = [call["messages"] for call in provider.calls if call["tools"] is not None]
+    assert len(calls) == 2
+    assert all(sum(message.get("content") == prompt for message in messages) == 1 for messages in calls)
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("stream", [True, False])
 async def test_runtime_retries_rate_limit_and_reactively_compacts(tmp_path, monkeypatch, stream):
     monkeypatch.setattr("coding_agent.context.recovery.asyncio.sleep", AsyncMock())

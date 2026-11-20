@@ -220,7 +220,7 @@ class TestToolResultBudget:
 
 class TestCompactHistory:
     @pytest.mark.asyncio
-    async def test_returns_single_summary_message(self, tmp_path):
+    async def test_returns_summary_and_preserves_original_request(self, tmp_path):
         summarize = AsyncMock(return_value="Goal: finish task.\nFindings: none.")
 
         msgs = [
@@ -228,10 +228,11 @@ class TestCompactHistory:
             {"role": "assistant", "content": [{"type": "text", "text": "ok done"}]},
         ]
         result = await compact_history(msgs, summarize=summarize, workdir=tmp_path)
-        assert len(result) == 1
+        assert len(result) == 2
         assert result[0]["role"] == "user"
         assert "[Compacted]" in result[0]["content"]
         assert "Goal: finish task" in result[0]["content"]
+        assert result[1] == msgs[0]
 
     @pytest.mark.asyncio
     async def test_summary_input_includes_latest_request_after_large_history(self, tmp_path):
@@ -250,7 +251,7 @@ class TestCompactHistory:
 
         assert "latest target marker" in captured[0]
         assert len(captured[0]) <= 82_000
-        assert "latest target marker" in result[0]["content"]
+        assert result[1] == messages[-1]
 
     @pytest.mark.asyncio
     async def test_summary_cancellation_propagates_without_replacing_history(self, tmp_path):
@@ -276,7 +277,7 @@ class TestCompactHistory:
             workdir=tmp_path,
         )
 
-        assert result[0]["content"][1:] == latest["content"]
+        assert result[1] == latest
 
     @pytest.mark.asyncio
     async def test_writes_transcript_file(self, tmp_path):
@@ -330,7 +331,7 @@ class TestReactiveCompact:
         result = await reactive_compact(messages, summarize=summarize, workdir=tmp_path)
 
         assert "latest goal marker" in captured[0]
-        assert "latest goal marker" in result[0]["content"]
+        assert result[1] == latest
 
 
 # ── 压缩流水线编排器（CompactionPipeline） ───────────────────────
