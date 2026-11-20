@@ -118,6 +118,171 @@ async def test_analysis_revokes_findings_when_source_version_changes(tmp_path, e
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(("phase", "change"), [
+    ("finish", "none"), ("finish", "write"), ("finish", "delete"),
+    ("resume", "write"), ("resume", "delete"),
+])
+async def test_analysis_checks_cited_source_without_model_reread(tmp_path, phase, change):
+    source = tmp_path / "entry.py"
+    source.write_text("def old_entry(): pass\n", encoding="utf-8")
+    finding = "入口为 old_entry。"
+
+    def respond(messages, tools, system):
+        match len(provider.calls):
+            case 1:
+                return tool_response("analysis_checkpoint", {"action": "plan", "dimensions": ["role"]}, "plan")
+            case 2:
+                return tool_response("read_file", {"path": "entry.py"}, "read")
+            case 3:
+                state = json.loads(messages[-1]["content"][-1]["content"].rsplit("\n", 1)[1])
+                return tool_response("analysis_checkpoint", {"action": "record", "dimension": "role",
+                                     "finding": finding, "evidence_ids": list(state["evidence"])}, "record")
+            case 4:
+                if phase == "resume":
+                    return ConnectionError("断开")
+                return tool_response("analysis_checkpoint", {"action": "finish"}, "finish")
+            case 5:
+                state = json.loads(messages[-1]["content"][-1]["content"].rsplit("\n", 1)[1])
+                assert finding not in state["checks"]
+                assert "待复核" in state["checks"]
+                assert not state["evidence"]
+        return text_response()
+
+    def change_source():
+        if change == "write":
+            source.write_text("def new_entry(): pass\n", encoding="utf-8")
+        elif change == "delete":
+            source.unlink()
+
+    provider = ScriptedProvider(handler=respond)
+    cfg = Config(workdir=str(tmp_path), model_max_attempts=1)
+    async with AgentRuntime(cfg, provider=provider) as runtime:
+        events = []
+        async for event in runtime.run_turn("检查入口职责", analysis=True):
+            events.append(event)
+            if event.type == "tool_done" and event.tool_id == "finish":
+                change_source()
+        if phase == "resume":
+            assert events[-1].type == "error"
+            change_source()
+            events = [event async for event in runtime.retry_turn(events[-1].data["recovery_id"])]
+    assert events[-1].type == "done"
+    if change == "none":
+        assert events[-1].data["analysis_status"] == "complete"
+        assert finding in events[-1].text
+    else:
+        assert events[-1].data["analysis_status"] == "partial"
+        assert finding not in events[-1].text
+        assert "待复核" in events[-1].text
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("tool", ["search_code", "code_outline"])
+async def test_analysis_cannot_finish_on_unversioned_source_leads(tmp_path, tool):
+    (tmp_path / "entry.py").write_text("def locate_entry(): pass\n", encoding="utf-8")
+    params = {"path": "entry.py"}
+    if tool == "search_code":
+        params["pattern"] = "locate_entry"
+
+    def respond(messages, tools, system):
+        match len(provider.calls):
+            case 1:
+                return tool_response("analysis_checkpoint", {"action": "plan", "dimensions": ["role"]}, "plan")
+            case 2:
+                return tool_response(tool, params, "lead")
+            case 3:
+                state = json.loads(messages[-1]["content"][-1]["content"].rsplit("\n", 1)[1])
+                return tool_response("analysis_checkpoint", {"action": "record", "dimension": "role",
+                                     "finding": "入口已经确认。", "evidence_ids": list(state["evidence"])}, "record")
+            case 4:
+                return tool_response("analysis_checkpoint", {"action": "finish"}, "finish")
+        return text_response()
+
+    provider = ScriptedProvider(handler=respond)
+    async with AgentRuntime(Config(workdir=str(tmp_path)), provider=provider) as runtime:
+        events = await collect(runtime, "检查入口的职责", analysis=True)
+    assert events[-1].data["analysis_status"] == "partial"
+    assert "待复核" in events[-1].text
+    assert "入口已经确认" not in events[-1].text
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("decision", ["approve", "deny", "cancel", "hook_denies"])
+async def test_analysis_revalidates_external_evidence_through_read_permissions(tmp_path, decision):
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    outside = tmp_path / "outside.py"
+    outside.write_text("def outside_entry(): pass\n", encoding="utf-8")
+    finding = "已定位外部入口。"
+    approvals = []
+    waiting = asyncio.Event()
+    cleaned = asyncio.Event()
+
+    async def approve(name, params, reason):
+        approvals.append((name, params))
+        if len(approvals) == 1:
+            return True
+        if decision == "cancel":
+            waiting.set()
+            try:
+                await asyncio.Future()
+            finally:
+                cleaned.set()
+        return decision == "approve"
+
+    async def block_revalidation(event):
+        if decision == "hook_denies" and event.data.get("purpose") == "analysis_revalidation":
+            return "禁止再次访问工作区外文件。"
+
+    def respond(messages, tools, system):
+        match len(provider.calls):
+            case 1:
+                return tool_response("analysis_checkpoint", {"action": "plan", "dimensions": ["role"]}, "plan")
+            case 2:
+                return tool_response("read_file", {"path": str(outside)}, "read")
+            case 3:
+                state = json.loads(messages[-1]["content"][-1]["content"].rsplit("\n", 1)[1])
+                return tool_response("analysis_checkpoint", {"action": "record", "dimension": "role",
+                                     "finding": finding, "evidence_ids": list(state["evidence"])}, "record")
+            case 4:
+                return tool_response("analysis_checkpoint", {"action": "finish"}, "finish")
+        pytest.fail("收尾不应再次请求模型。")
+
+    provider = ScriptedProvider(handler=respond)
+    events = []
+    async with AgentRuntime(Config(workdir=str(workspace)), provider=provider, approval_handler=approve) as runtime:
+        runtime.bus.subscribe(EventType.PRE_TOOL_USE, block_revalidation)
+
+        async def run():
+            async for event in runtime.run_turn("检查外部入口", analysis=True):
+                events.append(event)
+
+        if decision == "cancel":
+            task = asyncio.create_task(run())
+            try:
+                await asyncio.wait_for(waiting.wait(), timeout=5)
+            finally:
+                task.cancel()
+                with pytest.raises(asyncio.CancelledError):
+                    await task
+            assert cleaned.is_set()
+            assert not runtime.turn_lock.locked()
+        else:
+            await run()
+
+    assert approvals == [("read_file", {"path": str(outside)})] * (1 if decision == "hook_denies" else 2)
+    if decision == "cancel":
+        assert not any(event.type in {"done", "error"} for event in events)
+    elif decision == "approve":
+        assert events[-1].data["analysis_status"] == "complete"
+        assert finding in events[-1].text
+    else:
+        assert events[-1].data["analysis_status"] == "partial"
+        assert "无法验证源码版本" in events[-1].text
+        assert finding not in events[-1].text
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("compaction", ["proactive", "reactive"])
 async def test_analysis_does_not_persist_reading_or_transcripts(tmp_path, compaction):
     source = tmp_path / "sample.py"

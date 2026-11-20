@@ -386,14 +386,20 @@ class ReadFileTool(Tool):
         from coding_agent.security.permission import approved_read_path
 
         path = approved_read_path(self._workdir, arguments["path"])
+        return self._repeat_key(path, arguments)
+
+    def _source_path(self, path: Path) -> str:
+        root = self._workdir.resolve()
+        return path.relative_to(root).as_posix() if path.is_relative_to(root) else str(path)
+
+    def _repeat_key(self, path: Path, arguments: dict[str, Any]) -> str:
         start_line = arguments.get("start_line")
         end_line = arguments.get("end_line")
         show_line_numbers = arguments.get("show_line_numbers")
         numbered = show_line_numbers if show_line_numbers is not None else (
             start_line is not None or end_line is not None)
         normalized = {
-            "path": (path.relative_to(self._workdir.resolve()).as_posix()
-                      if path.is_relative_to(self._workdir.resolve()) else str(path)),
+            "path": self._source_path(path),
             "limit": arguments.get("limit"),
             "start_line": start_line if start_line is not None else 1,
             "end_line": end_line,
@@ -405,7 +411,13 @@ class ReadFileTool(Tool):
         from coding_agent.security.permission import approved_read_path
 
         path = approved_read_path(self._workdir, arguments["path"])
-        return hashlib.sha256(path.read_bytes()).hexdigest()
+        expected_path = arguments.get("_evidence_path")
+        if expected_path is not None and self._source_path(path) != expected_path:
+            raise ValueError("源码引用的规范路径已变化")
+        if not path.is_file():
+            raise ValueError("只能校验普通文件的版本")
+        with path.open("rb") as source:
+            return hashlib.file_digest(source, "sha256").hexdigest()
 
     def _read_file(self, path: str, limit: int | None = None, start_line: int | None = None,
                    end_line: int | None = None,
@@ -436,8 +448,8 @@ class ReadFileTool(Tool):
         # 指纹绑定读取范围和原始输出；Hook 改写结果后摘要不匹配便会失效。
         metadata = {
             "repeat_policy": self.repeat_policy,
-            "repeat_key": self.repeat_key({
-                "path": path, "limit": limit, "start_line": start_line,
+            "repeat_key": self._repeat_key(file_path, {
+                "limit": limit, "start_line": start_line,
                 "end_line": end_line, "show_line_numbers": show_line_numbers,
             }),
             "freshness_token": hashlib.sha256(source).hexdigest(),

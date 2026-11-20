@@ -101,6 +101,8 @@ class AnalysisEvidence:
     key: str
     paths: frozenset[str]
     call_id: str
+    source_path: str = ""
+    version: str = ""
 
 
 @dataclass
@@ -111,6 +113,7 @@ class AnalysisProgress:
     dimensions: tuple[str, ...] = tuple(_ANALYSIS_DIMENSIONS)
     evidence: dict[str, AnalysisEvidence] = field(default_factory=dict)
     findings: dict[str, tuple[str, str, tuple[str, ...]]] = field(default_factory=dict)
+    review_gaps: dict[str, str] = field(default_factory=dict)
     batches: int = 0
     stalled: int = 0
     stalled_controls: int = 0
@@ -123,7 +126,7 @@ class AnalysisProgress:
         registry.register(
             name=_ANALYSIS_CHECKPOINT,
             description=("提交本轮分析检查点。action=plan 时可用 dimensions 缩小明确指定的范围；"
-                         "record 记录一个 dimension、finding 及 evidence_ids，或用 blocked=true 记录缺口；"
+                         "record 记录一个 dimension、finding 及 read_file 的 evidence_ids，或用 blocked=true 记录缺口；"
                          "finish 仅在要求的维度都有记录后使用。每次单独调用。"),
         )(self.checkpoint)
 
@@ -160,16 +163,22 @@ class AnalysisProgress:
         if previous and (previous[0], previous[2]) == (update[0], update[2]):
             return "已有相同状态和证据；仅改写文字不更新检查点。"
         self.findings[dimension] = update
+        self.review_gaps.pop(dimension, None)
         self.revision += 1
         return self.describe(dimension)
 
     def describe(self, dimension: str) -> str:
         label = _ANALYSIS_DIMENSIONS[dimension]
         if dimension not in self.findings:
+            if dimension in self.review_gaps:
+                return f"{label}：待复核，{self.review_gaps[dimension]}"
             return f"{label}：未确认，尚未记录结论。"
         status, finding, refs = self.findings[dimension]
         locations = "；".join(self.evidence[ref].label for ref in refs)
-        return f"{label}（{'源码依据' if status == 'supported' else '未确认'}）：{finding}" + (
+        confidence = "未确认"
+        if status == "supported":
+            confidence = "源码依据" if all(self.evidence[ref].version for ref in refs) else "定位线索，待复核"
+        return f"{label}（{confidence}）：{finding}" + (
             f"［{locations}］" if locations else "")
 
     def summary(self) -> str:
@@ -230,6 +239,7 @@ class AnalysisProgress:
         label = f"{_analysis_display(path, 200)}{span}（{name}）"
         self.evidence[execution_id] = AnalysisEvidence(
             label, key, frozenset(os.path.normcase(file) for file in paths), block["id"],
+            source_path=path if version else "", version=version,
         )
         return True
 
@@ -238,13 +248,18 @@ class AnalysisProgress:
         # 搜索和提纲不含文件版本；首次拿到指纹时也不能确认这些旧结果仍有效。
         if self.versions.get(path) != version:
             stale = {ref for ref, item in self.evidence.items() if path in item.paths}
-            for ref in stale:
-                del self.evidence[ref]
-            for dimension, (_, _, refs) in list(self.findings.items()):
-                if stale.intersection(refs):
-                    del self.findings[dimension]
-                    self.revision += 1
+            self.invalidate_evidence(dict.fromkeys(stale, "源码版本已更新，请重新读取。"))
         self.versions[path] = version
+
+    def invalidate_evidence(self, reasons: dict[str, str]) -> None:
+        for ref in reasons:
+            del self.evidence[ref]
+        for dimension, (_, _, refs) in list(self.findings.items()):
+            unavailable = next((reasons[ref] for ref in refs if ref in reasons), None)
+            if unavailable is not None:
+                del self.findings[dimension]
+                self.review_gaps[dimension] = unavailable
+                self.revision += 1
 
 
 @dataclass
@@ -361,6 +376,10 @@ class AgentLoop:
         self.request_failure: RecoverableModelRequestError | None = None
         self.resuming_request = resume is not None
         self.recovery_state = progress.recovery
+        if analysis is not None and resume is not None:
+            async with aclosing(self.wait_events(self._revalidate_analysis(analysis), "复核分析证据")) as events:
+                async for event in events:
+                    yield event
         text = ""
         tool_outcomes = progress.tool_outcomes
         tool_failure_streaks = progress.tool_failure_streaks
@@ -562,10 +581,57 @@ class AgentLoop:
                   "分析批次不合法；每批最多四个只读工具，检查点须单独提交。")
         return dict.fromkeys(range(len(blocks)), reason), False
 
+    async def _revalidate_analysis(self, analysis: AnalysisProgress) -> None:
+        cited = dict.fromkeys(ref for _, _, refs in analysis.findings.values() for ref in refs)
+        versions: dict[str, str | None] = {}
+        unavailable: dict[str, str] = {}
+        for ref in cited:
+            item = analysis.evidence[ref]
+            if not item.version:
+                unavailable[ref] = "搜索或提纲缺少源码版本，请使用 read_file 读取对应行。"
+                continue
+            if item.source_path not in versions:
+                versions[item.source_path] = await self._analysis_source_version(item.source_path)
+            current_version = versions[item.source_path]
+            if current_version != item.version:
+                problem = "源码已变化" if current_version else "无法验证源码版本"
+                unavailable[ref] = f"{problem}［{item.label}］，请重新读取。"
+        analysis.invalidate_evidence(unavailable)
+
+    async def _analysis_source_version(self, path: str) -> str | None:
+        entry = self.registry.get("read_file")
+        if entry is None or entry.freshness_token is None or self.permissions is None:
+            return None
+        params = {"path": path}
+        check_id = uuid.uuid4().hex
+        blocked = await self.emit(EventType.PRE_TOOL_USE, tool_name="read_file", params=params,
+                                  tool_id=check_id, execution_id=check_id, purpose="analysis_revalidation")
+        version = None
+        if blocked is None:
+            # 复用逐次读取授权，只读取指纹。工作区外文件的原始授权不跨调用复用。
+            async with self.permissions.authorize("read_file", params) as (verdict, _):
+                if verdict == Verdict.ALLOW:
+                    try:
+                        version = await asyncio.to_thread(entry.freshness_token, {
+                            "path": path, "_evidence_path": path,
+                        })
+                    except (OSError, ValueError, RuntimeError):
+                        # 文件可能被删除、无法访问，或解析到循环链接。
+                        version = None
+        status = "已读取源码指纹。" if version else "无法校验源码版本。"
+        await self.emit(EventType.POST_TOOL_USE, tool_name="read_file", tool_id=check_id,
+                        execution_id=check_id, purpose="analysis_revalidation", output=status,
+                        error=None if version else status)
+        return version
+
     async def _finish_analysis(self, messages: list[dict[str, Any]], reason: str) -> AsyncIterator[LoopEvent]:
         analysis = self.progress.analysis
+        async with aclosing(self.wait_events(self._revalidate_analysis(analysis), "复核分析证据")) as events:
+            async for event in events:
+                yield event
         complete = analysis.finished and all(
-            analysis.findings[item][0] == "supported" for item in analysis.dimensions
+            item in analysis.findings and analysis.findings[item][0] == "supported"
+            for item in analysis.dimensions
         )
         notice = {
             "analysis_finished": "已结束源码检查。",
