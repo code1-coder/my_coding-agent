@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import json
 import threading
+from collections.abc import AsyncGenerator
 from contextlib import aclosing
 from typing import Any
 
@@ -129,15 +130,8 @@ def _tool_summary(name: str, parameters: Any) -> list[str]:
 
 
 def _print_event(event: LoopEvent, *, color: bool = True) -> None:
-    """把公共运行事件渲染到终端，保持入口只负责交互和显示。"""
-    if event.type == "text_delta":
-        click.echo(event.text, nl=False)
-    elif event.type == "text_reset":
-        if event.data.get("reason") == "response_reconciliation":
-            click.echo("\n[已按完整响应校准输出]\n" + event.text, nl=False)
-        else:
-            click.echo("\n[输出达到上限，正在重新生成]\n")
-    elif event.type == "tool_start":
+    """渲染正文以外的运行事件。"""
+    if event.type == "tool_start":
         label = f"> {_terminal_text(event.tool_name)}"
         details = _tool_summary(event.tool_name, event.data.get("input"))
         heading = click.style(label, fg="yellow") if color else label
@@ -195,26 +189,56 @@ def _print_event(event: LoopEvent, *, color: bool = True) -> None:
         click.echo("\n" + delivery + "\n" + hint, err=True)
 
 
+async def _render_turn(operation: AsyncGenerator[LoopEvent, None], *, show_text: bool = True,
+                       color: bool = True, fail_on_error: bool = False) -> str:
+    """正文确认后再写入 stdout；工具、审批和进度提示仍即时可见。"""
+    pending: list[str] = []
+    committed_chars = 0
+    final = ""
+
+    def flush_text() -> None:
+        nonlocal committed_chars
+        if pending:
+            text = "".join(pending)
+            pending.clear()
+            committed_chars += len(text)
+            if text:
+                click.echo(text, nl=False)
+
+    async with aclosing(operation) as events:
+        try:
+            async for event in events:
+                if event.type == "text_delta":
+                    if show_text:
+                        pending.append(event.text)
+                elif event.type == "text_reset":
+                    if show_text:
+                        # reset 携带本轮完整正文，已确认并输出的前缀不能再打印一次。
+                        pending[:] = [event.text[committed_chars:]]
+                    if event.data.get("reason") != "response_reconciliation":
+                        click.echo("\n[输出达到上限，正在重新生成]", err=True)
+                else:
+                    if event.type in ("tool_start", "memory_saved", "done", "error"):
+                        flush_text()
+                    if event.type == "done":
+                        final = event.text
+                    if event.type == "error" and fail_on_error:
+                        raise click.ClickException(event.text)
+                    _print_event(event, color=color)
+        finally:
+            # 流中断时保留已经收到、尚未被 reset 撤回的正文，原异常仍由入口处理。
+            flush_text()
+    return final
+
+
 async def _run_agent_loop(prompt: str, cfg: Config, *, stream: bool = True, color: bool = True,
                           analysis: bool = False, analysis_dimensions: tuple[str, ...] | None = None) -> str:
     """单次任务也经过完整运行流程，并在退出前释放队友和客户端。"""
     runtime, _ = _create_runtime(cfg)
-    final = ""
-    failure = None
     async with runtime:
-        async with aclosing(runtime.run_turn(prompt, stream=stream, analysis=analysis,
-                                             analysis_dimensions=analysis_dimensions)) as events:
-            async for event in events:
-                if event.type == "error":
-                    failure = event.text
-                    continue
-                if stream or event.type != "text_delta":
-                    _print_event(event, color=color)
-                if event.type == "done":
-                    final = event.text
-    if failure:
-        raise click.ClickException(failure)
-    return final
+        return await _render_turn(runtime.run_turn(prompt, stream=stream, analysis=analysis,
+                                                   analysis_dimensions=analysis_dimensions),
+                                  show_text=stream, color=color, fail_on_error=True)
 
 
 @click.group()
@@ -283,9 +307,7 @@ async def _chat_session(cfg: Config) -> None:
                     operation = runtime.run_turn(prompt, analysis=True, analysis_dimensions=dimensions)
                 else:
                     operation = runtime.run_turn(query)
-                async with aclosing(operation) as events:
-                    async for event in events:
-                        _print_event(event)
+                await _render_turn(operation)
             except (RetryUnavailable, PermissionError) as exc:
                 click.echo(f"\n[无法续接] {exc}", err=True)
             except REQUEST_ERRORS as exc:
