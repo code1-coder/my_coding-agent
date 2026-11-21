@@ -140,6 +140,20 @@ export OPENAI_API_KEY="你的 API 密钥"
 
 macOS / Linux 将解释器路径替换为 `.venv/bin/python`。激活虚拟环境后，也可以使用安装时注册的 `coding-agent chat` 和 `coding-agent run "任务内容"`。
 
+CLI 在模型确认正文后分段输出，终端和文件重定向都不会保留作废的草稿。工具进度和审批提示仍实时显示；请求中断时会保留已收到且未撤回的部分正文。
+
+只想了解项目代码时，在交互式 CLI 输入 `/analyze 检查 runtime 在本项目中的作用`，使用 `coding-agent run --analysis "解释调用关系"`，或在网页勾选「静态分析」。此模式仅开放搜索、Python 提纲、分段读取和检查点登记，不执行项目代码、不编辑源码、不提取跨轮项目记忆。工作区外读取仍需审批。
+
+默认检查职责（`role`）、调用关系（`flow`）、入口与用法（`usage`）、生命周期与边界（`limits`）。模型不能更改必查维度。需要缩小范围时，请在入口显式选择：
+
+- 交互式 CLI：`/analyze --dimensions role,flow 检查 runtime`。
+- 单次 CLI：`coding-agent run --analysis --analysis-dimension role --analysis-dimension flow "检查 runtime"`。
+- 网页：勾选「静态分析」，在「必查维度」中保留本轮要检查的项。API 调用可在 `POST /chat` 的静态分析请求中传入 `"analysis_dimensions": ["role", "flow"]`。
+
+分析检查点记录有源码引用的阶段结论和缺口，必查维度与检查点随当前轮跨上下文压缩及 `/retry` 保留。搜索和提纲用于定位源码，确认结论需要引用 `read_file` 的结果。收尾和续接前会复核已引用的文件版本，工作区外文件须重新审批，无法验证的结论标记为待复核。
+
+每轮最多读取 8 批、每批最多 4 项；每项结果最多 30,000 字符，超出时需缩小读取或搜索范围。连续两批没有新增证据就交付已有结论。静态分析的上下文压缩在内存中处理，检查点不跨会话或进程保存。结论是模型对静态证据的归纳，不表示已做动态验证。未显式启用时，普通对话仍按原编码流程工作。
+
 交互模式中输入 `q` 或 `exit` 退出。全局选项放在子命令之前，例如：
 
 ```powershell
@@ -150,7 +164,17 @@ macOS / Linux 将解释器路径替换为 `.venv/bin/python`。激活虚拟环�
 
 ## 统一运行流程
 
-代码工具现已支持 search_code、read_file 分段读取、apply_patch、git_status、git_diff 和 Python code_outline。参见[代码工具参数与补丁格式](docs/code-tools.md)。搜索需要 PATH 中的 ripgrep (rg)，Git 查看需要 Git；无需新增 Python 依赖。
+代码工具现已支持 search_code、read_file 分段读取、apply_patch、git_status、git_diff 和 Python code_outline。参见[代码工具参数与补丁格式](docs/code-tools.md)。项目依赖 ripgrep-bin 将 rg 可执行文件安装到 Python 环境，激活虚拟环境后即可使用；不依赖 Codex 附带版本。搜索优先使用 rg，缺失时可由 Git 筛选文件并用 Python 完成受限字面量搜索，Git 也不可用时须指定文件。正则和复杂 glob 仍需要 rg，备用差异与不完整范围会在结果中说明。
+
+Windows 在项目根目录安装及验证搜索依赖：
+
+```powershell
+.\.venv\Scripts\python.exe -m pip install -r requirements.txt
+.\.venv\Scripts\Activate.ps1
+rg --version
+```
+
+Linux/macOS 对应使用 `.venv/bin/python -m pip install -r requirements.txt`，然后 `source .venv/bin/activate`。直接使用虚拟环境解释器但未激活环境时，需要将该环境的可执行文件目录加入启动服务的 PATH，搜索工具不会扫描开发机的其他软件目录。
 
 CLI 的 `chat`、`run` 和网页 `/chat` 均通过 `AgentRuntime` 调用项目已有模块。入口负责终端交互或 HTTP/SSE 编码，实际处理流程保持一致：会话开始 → 提交用户输入 → 读取记忆、技能与队友回信 → 组装系统提示词 → 压缩上下文 → 调用模型 → 检查并执行工具 → 保存记忆 → 本轮结束。退出 CLI 或关闭网页服务时，会取消后台队友并关闭模型连接。
 
@@ -249,7 +273,9 @@ deny_list:                 # bash 命令的硬阻止子串，可按需补充
 
 记忆选择、提取、合并以及超限摘要会额外调用模型接口。流式响应已经输出文本后若中途断开，会报告错误，避免自动重放造成重复内容。修改运行配置后，CLI 重新启动，网页服务也需重新启动，以重新创建会话运行层。
 
-模型连接中断或超时且尚未显示文本时，运行层最多尝试 3 次（含首次请求），按指数退避重试；失败尝试中未完成的工具调用会丢弃。已显示部分回复后不会自动重放，也不会执行该不完整响应中的工具。交互式 chat 显示错误后保留会话，可继续输入；单次 run 显示简明错误并以非零状态退出。OpenAI 兼容接口若未发送 finish_reason 就结束流，也会作为不完整响应处理。
+尚未显示正文时，连接中断、空闲超时及已识别的瞬时服务错误共享 `model_max_attempts`（默认 5 次，含首次，支持 1～20）。连接错误原默认 3 次，限流或过载原最多 10 次；可显式设置 `model_max_attempts: 10` 保留更长的限流重试额度。退避和上下文恢复共用 `model_timeout`，且不会早于模型服务的 `Retry-After` 建议再次请求。
+
+失败尝试中未完成的工具调用不会执行，已显示的部分回复不会自动重放。对可恢复失败，交互式 `chat` 可输入 `/retry`，网页可点击“重试本次请求”；两者都从当前会话的已确认历史续接，不重新执行旧工具，也不复用审批。重试入口仅在当前进程、当前会话有效；新任务使旧入口失效。单次 `run` 失败仍以非零状态退出。
 
 同类环境变量同时存在时，地址优先读取 `ANTHROPIC_BASE_URL`；密钥按表中的顺序采用第一个非空值。设置模型后端时应同时确认模型、地址和密钥属于同一服务。
 
@@ -281,7 +307,8 @@ deny_list:                 # bash 命令的硬阻止子串，可按需补充
 | `POST` | `/tasks` | 手动创建任务，字段为 `subject`、可选 `description` 和 `blockedBy` |
 | `PATCH` | `/tasks/{task_id}` | 手动流转任务，`action` 为 `claim` 或 `complete`，保留依赖与状态检查 |
 | `GET` | `/workspace?session_id=...` | 工作目录、模型名称、记忆、当前会话团队及令牌用量，不返回密钥、不调用模型 |
-| `POST` | `/chat` | SSE 流式对话，请求包含 `prompt` 和可选的 `session_id` |
+| `POST` | `/chat` | SSE 流式对话，请求包含 `prompt` 和可选的 `session_id`、`mode`（`default` 或 `analysis`） |
+| `POST` | `/chat/retry` | 同会话续接，传入 `session_id` 和失败事件中的 `recovery_id`；响应沿用对话 SSE |
 | `POST` | `/approvals/{approval_id}` | 提交 `session_id` 和布尔值 `approved`，处理工具审批 |
 | `WebSocket` | `/ws` | 工具调用通知和心跳 |
 | `GET` | `/docs` | 交互式 HTTP 接口文档 |

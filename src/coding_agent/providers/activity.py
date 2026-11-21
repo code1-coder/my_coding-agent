@@ -19,6 +19,8 @@ class RequestActivity:
         self.last_http_status: int | None = None
         self._provider_http_retry_counts: list[int] = []
         self._provider_http_observation: list[bool] = []
+        self._idle_timeout: asyncio.Timeout | None = None
+        self._idle_timeout_seconds = 0.0
 
     @property
     def http_retry_count(self) -> int:
@@ -34,6 +36,20 @@ class RequestActivity:
 
     def mark_model_event(self, event_type: str) -> None:
         self._mark(event_type, "model")
+
+    def monitor_idle_timeout(
+        self, timeout: asyncio.Timeout, seconds: float, *, wait_for_http_request: bool,
+    ) -> None:
+        self._idle_timeout = timeout
+        self._idle_timeout_seconds = seconds
+        if not wait_for_http_request:
+            self._refresh_idle_timeout()
+
+    def stop_idle_timeout_monitoring(self) -> None:
+        self._idle_timeout = None
+
+    def mark_request_started(self) -> None:
+        self._mark("request_started", "application")
 
     def mark_http_request(self, retry_count: int | None) -> None:
         self.http_request_attempts += 1
@@ -54,9 +70,19 @@ class RequestActivity:
         self._mark("http_error", "http")
 
     def _mark(self, event_type: str, source: str) -> None:
+        loop = asyncio.get_running_loop()
         self.last_activity_type = event_type
         self.last_activity_source = source
-        self.last_activity_at = asyncio.get_running_loop().time()
+        self.last_activity_at = loop.time()
+        if source in {"http", "model"}:
+            self._refresh_idle_timeout()
+
+    def _refresh_idle_timeout(self) -> None:
+        if self._idle_timeout is None or self._idle_timeout.expired():
+            return
+        self._idle_timeout.reschedule(
+            asyncio.get_running_loop().time() + self._idle_timeout_seconds,
+        )
 
 
 _current_request_activity: ContextVar[RequestActivity | None] = ContextVar(
@@ -115,10 +141,19 @@ class _ObservedTransport:
         await self._transport.aclose()
 
 
+def _sdk_http_module(sdk_module: str) -> Any:
+    base_client = import_module(f"{sdk_module}._base_client")
+    return getattr(base_client, "httpx2", None) or getattr(base_client, "httpx")
+
+
+def sdk_timeout(sdk_module: str, connect_timeout: float, idle_timeout: float) -> Any:
+    """Create a timeout using the HTTPX type bundled with the provider SDK."""
+    return _sdk_http_module(sdk_module).Timeout(idle_timeout + 1.0, connect=connect_timeout)
+
+
 def _sdk_http_types(sdk_client: Any) -> tuple[type, type]:
     sdk_module = type(sdk_client).__module__.split(".", 1)[0]
-    base_client = import_module(f"{sdk_module}._base_client")
-    http_module = getattr(base_client, "httpx2", None) or getattr(base_client, "httpx")
+    http_module = _sdk_http_module(sdk_module)
     return http_module.AsyncByteStream, http_module.AsyncBaseTransport
 
 

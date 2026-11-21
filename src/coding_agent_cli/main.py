@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import json
 import threading
+from collections.abc import AsyncGenerator
 from contextlib import aclosing
 from typing import Any
 
@@ -14,9 +15,9 @@ import httpx
 import openai
 
 from coding_agent.config import Config, load_config
-from coding_agent.loop import LoopEvent
+from coding_agent.loop import ANALYSIS_DIMENSION_IDS, LoopEvent, resolve_analysis_dimensions
 from coding_agent.providers.base import LLMProvider, ModelRequestError
-from coding_agent.runtime import AgentRuntime, build_provider
+from coding_agent.runtime import AgentRuntime, RetryUnavailable, build_provider
 from coding_agent.security.permission import create_terminal_pipeline
 from coding_agent.tools.patch import parse_patch
 
@@ -129,12 +130,8 @@ def _tool_summary(name: str, parameters: Any) -> list[str]:
 
 
 def _print_event(event: LoopEvent, *, color: bool = True) -> None:
-    """把公共运行事件渲染到终端，保持入口只负责交互和显示。"""
-    if event.type == "text_delta":
-        click.echo(event.text, nl=False)
-    elif event.type == "text_reset":
-        click.echo("\n[输出达到上限，正在重新生成]\n")
-    elif event.type == "tool_start":
+    """渲染正文以外的运行事件。"""
+    if event.type == "tool_start":
         label = f"> {_terminal_text(event.tool_name)}"
         details = _tool_summary(event.tool_name, event.data.get("input"))
         heading = click.style(label, fg="yellow") if color else label
@@ -168,24 +165,80 @@ def _print_event(event: LoopEvent, *, color: bool = True) -> None:
         execution = event.data["execution"]
         click.echo(f"[bash 完成] 退出码: {execution['exit_code']}，耗时: {execution['duration_ms']} ms"
                    + ("，输出已截断" if execution.get("truncated") else ""))
+    elif event.type == "tool_done" and event.tool_name == "search_code":
+        try:
+            result = json.loads(event.tool_output)
+        except json.JSONDecodeError:
+            return
+        if isinstance(result, dict) and result.get("fallback_reason") == "rg_unavailable":
+            details = _tool_summary(event.tool_name, event.data.get("input"))
+            label = "[搜索降级] " + (details[0] if details else ".")
+            click.echo(label + "：" + _terminal_text(str(result.get("backend", "python")))
+                       + ("，范围未完整搜索，请检查结果限制" if result.get("truncated") else ""))
     elif event.type == "memory_saved":
         click.echo(f"\n[记忆] 已保存 {event.data['count']} 条到 {event.data['path']}\n")
+    elif event.type == "analysis_progress":
+        summary = "\n".join(_terminal_text(line) for line in event.text.splitlines())
+        click.echo(f"\n[分析检查点] 剩余读取批次：{event.data['remaining_batches']}\n{summary}")
     elif event.type == "warning":
         click.echo("\n" + event.text, err=True)
+    elif event.type == "error":
+        hint = ("本次失败，会话已保留；输入 /retry 可续接本次请求，已完成工具不会重放。"
+                if event.data.get("recovery_id") else "本次失败，会话已保留，可继续输入。")
+        delivery = "\n".join(_terminal_text(line) for line in event.text.split("\n"))
+        click.echo("\n" + delivery + "\n" + hint, err=True)
 
 
-async def _run_agent_loop(prompt: str, cfg: Config, *, stream: bool = True, color: bool = True) -> str:
+async def _render_turn(operation: AsyncGenerator[LoopEvent, None], *, show_text: bool = True,
+                       color: bool = True, fail_on_error: bool = False) -> str:
+    """正文确认后再写入 stdout；工具、审批和进度提示仍即时可见。"""
+    pending: list[str] = []
+    committed_chars = 0
+    final = ""
+
+    def flush_text() -> None:
+        nonlocal committed_chars
+        if pending:
+            text = "".join(pending)
+            pending.clear()
+            committed_chars += len(text)
+            if text:
+                click.echo(text, nl=False)
+
+    async with aclosing(operation) as events:
+        try:
+            async for event in events:
+                if event.type == "text_delta":
+                    if show_text:
+                        pending.append(event.text)
+                elif event.type == "text_reset":
+                    if show_text:
+                        # reset 携带本轮完整正文，已确认并输出的前缀不能再打印一次。
+                        pending[:] = [event.text[committed_chars:]]
+                    if event.data.get("reason") != "response_reconciliation":
+                        click.echo("\n[输出达到上限，正在重新生成]", err=True)
+                else:
+                    if event.type in ("tool_start", "memory_saved", "done", "error"):
+                        flush_text()
+                    if event.type == "done":
+                        final = event.text
+                    if event.type == "error" and fail_on_error:
+                        raise click.ClickException(event.text)
+                    _print_event(event, color=color)
+        finally:
+            # 流中断时保留已经收到、尚未被 reset 撤回的正文，原异常仍由入口处理。
+            flush_text()
+    return final
+
+
+async def _run_agent_loop(prompt: str, cfg: Config, *, stream: bool = True, color: bool = True,
+                          analysis: bool = False, analysis_dimensions: tuple[str, ...] | None = None) -> str:
     """单次任务也经过完整运行流程，并在退出前释放队友和客户端。"""
     runtime, _ = _create_runtime(cfg)
-    final = ""
     async with runtime:
-        async with aclosing(runtime.run_turn(prompt, stream=stream)) as events:
-            async for event in events:
-                if stream or event.type != "text_delta":
-                    _print_event(event, color=color)
-                if event.type == "done":
-                    final = event.text
-    return final
+        return await _render_turn(runtime.run_turn(prompt, stream=stream, analysis=analysis,
+                                                   analysis_dimensions=analysis_dimensions),
+                                  show_text=stream, color=color, fail_on_error=True)
 
 
 @click.group()
@@ -219,7 +272,7 @@ async def _chat_session(cfg: Config) -> None:
     runtime, read_lock = _create_runtime(cfg)
     async with runtime:
         click.echo(f"coding-agent chat  |  model: {cfg.model_id}  |  workdir: {cfg.workdir}")
-        click.echo('输入 "q" 或 "exit" 退出。\n')
+        click.echo('输入 /analyze <问题> 进行静态分析；输入 "q" 或 "exit" 退出。\n')
         while True:
             try:
                 async with read_lock:
@@ -231,9 +284,32 @@ async def _chat_session(cfg: Config) -> None:
                 break
             click.echo()
             try:
-                async with aclosing(runtime.run_turn(query)) as events:
-                    async for event in events:
-                        _print_event(event)
+                words = query.strip().split(maxsplit=1)
+                if query.strip() == "/retry":
+                    operation = runtime.retry_turn()
+                elif words[0] == "/analyze":
+                    prompt = words[1] if len(words) == 2 else ""
+                    dimensions = None
+                    args = prompt.split(maxsplit=2)
+                    if args and args[0] == "--dimensions":
+                        if len(args) != 3:
+                            click.echo("用法：/analyze --dimensions role,flow <问题>", err=True)
+                            continue
+                        try:
+                            dimensions = resolve_analysis_dimensions(True, args[1].split(","))
+                        except ValueError as exc:
+                            click.echo(str(exc), err=True)
+                            continue
+                        prompt = args[2]
+                    if not prompt:
+                        click.echo("用法：/analyze [--dimensions role,flow] <问题>", err=True)
+                        continue
+                    operation = runtime.run_turn(prompt, analysis=True, analysis_dimensions=dimensions)
+                else:
+                    operation = runtime.run_turn(query)
+                await _render_turn(operation)
+            except (RetryUnavailable, PermissionError) as exc:
+                click.echo(f"\n[无法续接] {exc}", err=True)
             except REQUEST_ERRORS as exc:
                 click.echo(f"\n[请求失败] {exc}\n会话已保留，可继续输入或重试。", err=True)
             click.echo("\n")
@@ -241,11 +317,19 @@ async def _chat_session(cfg: Config) -> None:
 
 @cli.command()
 @click.argument("prompt")
+@click.option("--analysis", is_flag=True, help="只做静态源码分析，不执行项目代码或修改文件。")
+@click.option("--analysis-dimension", "dimensions", type=click.Choice(ANALYSIS_DIMENSION_IDS), multiple=True,
+              help="指定必查维度，可重复使用；省略时检查全部维度。")
 @click.pass_context
-def run(ctx, prompt):
+def run(ctx, prompt, analysis, dimensions):
     """执行单次提示词任务后退出。"""
     try:
-        final = asyncio.run(_run_agent_loop(prompt, ctx.obj["cfg"], stream=True))
+        scope = resolve_analysis_dimensions(analysis, dimensions or None)
+    except ValueError as exc:
+        raise click.BadParameter(str(exc), param_hint="--analysis-dimension") from exc
+    try:
+        final = asyncio.run(_run_agent_loop(prompt, ctx.obj["cfg"], stream=True, analysis=analysis,
+                                           analysis_dimensions=scope))
     except REQUEST_ERRORS as exc:
         raise click.ClickException(f"模型请求失败：{exc}") from exc
     if not final.endswith("\n"):

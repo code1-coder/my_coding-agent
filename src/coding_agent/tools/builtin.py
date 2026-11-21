@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import asyncio
 import glob as _glob
+import hashlib
 import json
 import os
 import socket
@@ -20,6 +21,7 @@ import sys
 import time
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
+from typing import Any
 
 from coding_agent.tools.base import Tool, ToolCancelledError, ToolResult
 
@@ -361,11 +363,14 @@ class BashTool(Tool):
 
 class ReadFileTool(Tool):
     name = "read_file"
-    description = "读取 UTF-8 文件；start_line/end_line 为从 1 开始的闭区间。分段读取默认展示行号，limit 可限制行数。"
+    repeat_policy = "fresh_read"
+    description = ("读取工作区内或经用户批准的工作区外 UTF-8 文件；path 可使用相对路径、"
+                   "当前宿主机绝对路径或 WSL 中可访问的 Windows 盘符路径。"
+                   "start_line/end_line 为从 1 开始的闭区间；limit 可限制行数。")
     input_schema = {
         "type": "object",
         "properties": {
-            "path": {"type": "string", "description": "文件的相对路径。"},
+            "path": {"type": "string", "description": "相对路径、宿主机绝对路径，或 WSL 可访问的 Windows 盘符路径。"},
             "limit": {"type": "integer", "description": "最大返回行数（可选）。"},
             "start_line": {"type": "integer", "minimum": 1},
             "end_line": {"type": "integer", "minimum": 1},
@@ -377,6 +382,92 @@ class ReadFileTool(Tool):
     def __init__(self, workdir: Path | str | None = None) -> None:
         self._workdir = Path(workdir) if workdir else Path.cwd()
 
+    def repeat_key(self, arguments: dict[str, Any]) -> str | None:
+        from coding_agent.security.permission import approved_read_path
+
+        path = approved_read_path(self._workdir, arguments["path"])
+        return self._repeat_key(path, arguments)
+
+    def _source_path(self, path: Path) -> str:
+        root = self._workdir.resolve()
+        return path.relative_to(root).as_posix() if path.is_relative_to(root) else str(path)
+
+    def _repeat_key(self, path: Path, arguments: dict[str, Any]) -> str:
+        start_line = arguments.get("start_line")
+        end_line = arguments.get("end_line")
+        show_line_numbers = arguments.get("show_line_numbers")
+        numbered = show_line_numbers if show_line_numbers is not None else (
+            start_line is not None or end_line is not None)
+        normalized = {
+            "path": self._source_path(path),
+            "limit": arguments.get("limit"),
+            "start_line": start_line if start_line is not None else 1,
+            "end_line": end_line,
+            "show_line_numbers": numbered,
+        }
+        return json.dumps(normalized, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+
+    def freshness_token(self, arguments: dict[str, Any]) -> str:
+        from coding_agent.security.permission import approved_read_path
+
+        path = approved_read_path(self._workdir, arguments["path"])
+        expected_path = arguments.get("_evidence_path")
+        if expected_path is not None and self._source_path(path) != expected_path:
+            raise ValueError("源码引用的规范路径已变化")
+        if not path.is_file():
+            raise ValueError("只能校验普通文件的版本")
+        with path.open("rb") as source:
+            return hashlib.file_digest(source, "sha256").hexdigest()
+
+    def _read_file(self, path: str, limit: int | None = None, start_line: int | None = None,
+                   end_line: int | None = None,
+                   show_line_numbers: bool | None = None) -> tuple[str, dict[str, Any]]:
+        for name, value in (("limit", limit), ("start_line", start_line), ("end_line", end_line)):
+            if value is not None and (type(value) is not int or value < 1):
+                raise ValueError(f"{name} must be a positive integer")
+        first = start_line or 1
+        if end_line is not None and end_line < first:
+            raise ValueError("end_line must be >= start_line")
+        from coding_agent.security.permission import approved_read_path
+
+        file_path = approved_read_path(self._workdir, path)
+        source = file_path.read_bytes()
+        lines = source.decode("utf-8", errors="replace").splitlines()
+        if first > len(lines) and first != 1:
+            raise ValueError(f"start_line exceeds file length ({len(lines)} lines)")
+        last = min(len(lines), end_line if end_line is not None else len(lines))
+        if limit is not None:
+            last = min(last, first + limit - 1)
+        numbered = show_line_numbers if show_line_numbers is not None else (
+            start_line is not None or end_line is not None)
+        selected = [f"{index + 1}: {lines[index]}" if numbered else lines[index]
+                    for index in range(first - 1, last)]
+        if last < len(lines):
+            selected.append(f"... ({len(lines) - last} more lines; next start_line={last + 1})")
+        output = "\n".join(selected)
+        # 指纹绑定读取范围和原始输出；Hook 改写结果后摘要不匹配便会失效。
+        metadata = {
+            "repeat_policy": self.repeat_policy,
+            "repeat_key": self._repeat_key(file_path, {
+                "limit": limit, "start_line": start_line,
+                "end_line": end_line, "show_line_numbers": show_line_numbers,
+            }),
+            "freshness_token": hashlib.sha256(source).hexdigest(),
+            "output_digest": hashlib.sha256(output.encode("utf-8")).hexdigest(),
+            "read_span": (first, last),
+        }
+        return output, metadata
+
+    async def aexecute(self, path: str, limit: int | None = None, start_line: int | None = None,
+                       end_line: int | None = None, show_line_numbers: bool | None = None) -> ToolResult:
+        try:
+            output, metadata = await asyncio.to_thread(
+                self._read_file, path, limit, start_line, end_line, show_line_numbers,
+            )
+        except (OSError, ValueError) as exc:
+            return ToolResult(tool_use_id="", error=f"Error: {exc}")
+        return ToolResult(tool_use_id="", content=output, metadata=metadata)
+
     def execute(self, path: str, limit: int | None = None, start_line: int | None = None,
                 end_line: int | None = None, show_line_numbers: bool | None = None) -> str:
         """读取工作区内的 UTF-8 文件，按 limit 截取行数并注明省略的行数。
@@ -384,26 +475,9 @@ class ReadFileTool(Tool):
         路径越界或读取失败时返回错误文本；不修改原文件。
         """
         try:
-            for name, value in (("limit", limit), ("start_line", start_line), ("end_line", end_line)):
-                if value is not None and (type(value) is not int or value < 1):
-                    raise ValueError(f"{name} must be a positive integer")
-            first = start_line or 1
-            if end_line is not None and end_line < first:
-                raise ValueError("end_line must be >= start_line")
-            lines = _safe_path(self._workdir, path).read_text(encoding="utf-8", errors="replace").splitlines()
-            if first > len(lines) and first != 1:
-                raise ValueError(f"start_line exceeds file length ({len(lines)} lines)")
-            last = min(len(lines), end_line if end_line is not None else len(lines))
-            if limit is not None:
-                last = min(last, first + limit - 1)
-            numbered = show_line_numbers if show_line_numbers is not None else (
-                start_line is not None or end_line is not None)
-            selected = [f"{index + 1}: {lines[index]}" if numbered else lines[index]
-                        for index in range(first - 1, last)]
-            if last < len(lines):
-                selected.append(f"... ({len(lines) - last} more lines; next start_line={last + 1})")
-            return "\n".join(selected)
-        except Exception as exc:
+            output, _metadata = self._read_file(path, limit, start_line, end_line, show_line_numbers)
+            return output
+        except (OSError, ValueError) as exc:
             return f"Error: {exc}"
 
 

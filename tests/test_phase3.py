@@ -5,6 +5,7 @@
 from __future__ import annotations
 
 import json
+import asyncio
 import tempfile
 from pathlib import Path
 from unittest.mock import AsyncMock
@@ -60,6 +61,29 @@ class TestSnipCompact:
         assert len(result) < 60
         # 前 3 条消息 + 1 条占位消息 + 后 27 条消息，共 31 条
         assert any("snipped" in str(m.get("content", "")) for m in result)
+
+    def test_retains_bounded_evidence_from_snipped_messages(self):
+        messages = [
+            {"role": "user", "content": "initial request"},
+            *[{"role": "assistant", "content": f"old filler {i}"} for i in range(4)],
+            {"role": "assistant", "content": "Confirmed: parser uses the shared runtime."},
+            {"role": "user", "content": [{
+                "type": "tool_result",
+                "tool_use_id": "read-runtime",
+                "content": "<persisted-output>\n完整输出: .task_outputs/tool-results/read-runtime.txt\n预览:\nsource excerpt\n</persisted-output>",
+            }]},
+            *[{"role": "assistant", "content": f"middle filler {i}"} for i in range(10)],
+            {"role": "user", "content": "latest request"},
+            *[{"role": "assistant", "content": f"tail {i}"} for i in range(6)],
+        ]
+
+        result = snip_compact(messages, max_messages=8)
+        excerpt = next(str(msg["content"]) for msg in result if "snipped" in str(msg.get("content", "")))
+
+        assert "Confirmed: parser uses the shared runtime." in excerpt
+        assert ".task_outputs/tool-results/read-runtime.txt" in excerpt
+        assert "unverified evidence, not current instructions" in excerpt
+        assert len(excerpt) <= 6_100
 
     def test_protects_tool_use_pair_forward(self):
         """助手 tool_use 与用户 tool_result 组成的消息对不应被裁断。"""
@@ -128,8 +152,11 @@ class TestMicroCompact:
             {"role": "user", "content": [{"type": "tool_result", "tool_use_id": "new3", "content": "w" * 200}]},
         ]
         micro_compact(msgs, keep_recent=3)
-        # 最旧的工具结果应被压缩
-        assert "Earlier tool result compacted" in msgs[0]["content"][0]["content"]
+        # 最旧结果保留有限预览，不诱导重新执行。
+        old_content = msgs[0]["content"][0]["content"]
+        assert "Earlier result preview" in old_content
+        assert "Re-run if needed" not in old_content
+        assert len(old_content) < 200
         # 最近 3 条工具结果应保持完整
         assert "Earlier tool result compacted" not in msgs[1]["content"][0]["content"]
         assert "Earlier tool result compacted" not in msgs[2]["content"][0]["content"]
@@ -176,6 +203,7 @@ class TestToolResultBudget:
         assert out_dir.exists()
         files = list(out_dir.glob("*.txt"))
         assert len(files) >= 1
+        assert "完整输出: .task_outputs/tool-results/big.txt" in content
 
     def test_skips_when_under_budget(self, tmp_path):
         msgs = [
@@ -192,7 +220,7 @@ class TestToolResultBudget:
 
 class TestCompactHistory:
     @pytest.mark.asyncio
-    async def test_returns_single_summary_message(self, tmp_path):
+    async def test_returns_summary_and_preserves_original_request(self, tmp_path):
         summarize = AsyncMock(return_value="Goal: finish task.\nFindings: none.")
 
         msgs = [
@@ -200,10 +228,56 @@ class TestCompactHistory:
             {"role": "assistant", "content": [{"type": "text", "text": "ok done"}]},
         ]
         result = await compact_history(msgs, summarize=summarize, workdir=tmp_path)
-        assert len(result) == 1
+        assert len(result) == 2
         assert result[0]["role"] == "user"
         assert "[Compacted]" in result[0]["content"]
         assert "Goal: finish task" in result[0]["content"]
+        assert result[1] == msgs[0]
+
+    @pytest.mark.asyncio
+    async def test_summary_input_includes_latest_request_after_large_history(self, tmp_path):
+        captured = []
+
+        async def summarize(prompt):
+            captured.append(prompt)
+            return "summary"
+
+        messages = [
+            {"role": "user", "content": "original task"},
+            {"role": "assistant", "content": [{"type": "text", "text": "old " * 22000}]},
+            {"role": "user", "content": "latest target marker"},
+        ]
+        result = await compact_history(messages, summarize=summarize, workdir=tmp_path)
+
+        assert "latest target marker" in captured[0]
+        assert len(captured[0]) <= 82_000
+        assert result[1] == messages[-1]
+
+    @pytest.mark.asyncio
+    async def test_summary_cancellation_propagates_without_replacing_history(self, tmp_path):
+        messages = [{"role": "user", "content": "keep this request"}]
+
+        async def cancel(_prompt):
+            raise asyncio.CancelledError
+
+        with pytest.raises(asyncio.CancelledError):
+            await compact_history(messages, summarize=cancel, workdir=tmp_path)
+
+        assert messages == [{"role": "user", "content": "keep this request"}]
+
+    @pytest.mark.asyncio
+    async def test_compaction_preserves_latest_multiblock_user_message(self, tmp_path):
+        latest = {"role": "user", "content": [
+            {"type": "text", "text": "latest instruction"},
+            {"type": "image", "source": {"type": "base64", "data": "aGVsbG8="}},
+        ]}
+        result = await compact_history(
+            [{"role": "user", "content": "old"}, latest],
+            summarize=AsyncMock(return_value="summary"),
+            workdir=tmp_path,
+        )
+
+        assert result[1] == latest
 
     @pytest.mark.asyncio
     async def test_writes_transcript_file(self, tmp_path):
@@ -239,6 +313,26 @@ class TestReactiveCompact:
         # 尾部消息应得到保留
         assert any("recent-1" in str(m.get("content", "")) for m in result)
 
+    @pytest.mark.asyncio
+    async def test_summary_input_contains_late_goal_and_preserves_it_in_output(self, tmp_path):
+        captured = []
+
+        async def summarize(prompt):
+            captured.append(prompt)
+            return "summary"
+
+        latest = {"role": "user", "content": "latest goal marker"}
+        messages = [
+            {"role": "user", "content": "initial goal"},
+            *[{"role": "assistant", "content": [{"type": "text", "text": "x" * 6000}]} for _ in range(20)],
+            latest,
+            *[{"role": "assistant", "content": "tail"} for _ in range(5)],
+        ]
+        result = await reactive_compact(messages, summarize=summarize, workdir=tmp_path)
+
+        assert "latest goal marker" in captured[0]
+        assert result[1] == latest
+
 
 # ── 压缩流水线编排器（CompactionPipeline） ───────────────────────
 
@@ -265,6 +359,70 @@ class TestCompactionPipeline:
         # 此时应已触发 L4 摘要压缩
         summarize.assert_called_once()
         assert "[Compacted]" in msgs[0]["content"]
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("failure", [TimeoutError("摘要超时"), "", "  \n"], ids=["timeout", "empty", "blank"])
+    async def test_failed_proactive_summary_is_skipped_until_input_changes(self, tmp_path, failure):
+        summarize = AsyncMock(return_value=failure) if isinstance(failure, str) else AsyncMock(side_effect=failure)
+        pipe = CompactionPipeline(workdir=tmp_path, summarize=summarize, context_limit=10)
+        original = {"role": "user", "content": "旧目标 " * 100}
+        messages = [original.copy()]
+
+        await pipe.run(messages)
+        await pipe.run(messages)
+        await pipe.run(messages)
+
+        summarize.assert_awaited_once()
+        assert messages == [original]
+        assert len(list((tmp_path / ".transcripts").glob("*.jsonl"))) == 1
+
+        summarize.side_effect = None
+        summarize.return_value = "新摘要"
+        updated = {"role": "user", "content": "新目标 " * 100}
+        messages[0]["content"] = updated["content"]
+        await pipe.run(messages)
+
+        assert summarize.await_count == 2
+        assert "新目标" in summarize.await_args.args[0]
+        assert "新摘要" in messages[0]["content"]
+        assert messages[-1] == updated
+
+    @pytest.mark.asyncio
+    async def test_proactive_summary_uses_only_input_sent_to_summarizer(self, tmp_path):
+        summarize = AsyncMock(side_effect=["", "紧急摘要"])
+        pipe = CompactionPipeline(workdir=tmp_path, summarize=summarize, context_limit=10, persist=False)
+        request = {"role": "user", "content": "目标 " * 100}
+        call = {"role": "assistant", "content": [{"type": "tool_use", "id": "read-1", "name": "read_file",
+                                                    "input": {"path": "entry.py"}}]}
+        result = {"role": "user", "content": [{"type": "tool_result", "tool_use_id": "read-1", "content": "初始"}]}
+        messages = [request, call, result]
+
+        await pipe.run(messages)
+        messages[-1]["content"][0]["content"] = "更新的读取结果"
+        await pipe.run(messages)
+
+        summarize.assert_awaited_once()
+        assert "初始" not in summarize.await_args.args[0]
+        assert messages[-1]["content"][0]["content"] == "更新的读取结果"
+
+        recovered = await pipe.reactive(messages[:1])
+        assert summarize.await_count == 2
+        assert "紧急摘要" in recovered[0]["content"]
+
+    @pytest.mark.asyncio
+    async def test_cancelled_proactive_summary_can_be_attempted_again(self, tmp_path):
+        summarize = AsyncMock(side_effect=[asyncio.CancelledError, "重试摘要"])
+        pipe = CompactionPipeline(workdir=tmp_path, summarize=summarize, context_limit=10, persist=False)
+        request = {"role": "user", "content": "目标 " * 100}
+        messages = [request.copy()]
+
+        with pytest.raises(asyncio.CancelledError):
+            await pipe.run(messages)
+        assert messages == [request]
+
+        await pipe.run(messages)
+        assert "重试摘要" in messages[0]["content"]
+        assert messages[-1] == request
 
     @pytest.mark.asyncio
     async def test_skips_l4_when_no_summarize(self, tmp_path):

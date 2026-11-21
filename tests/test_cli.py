@@ -2,14 +2,17 @@
 
 import asyncio
 import json
+import sys
+from contextlib import contextmanager
 from copy import deepcopy
+from unittest.mock import patch
 
 import pytest
 from click.testing import CliRunner
 
 from coding_agent.config import Config
 from coding_agent.memory import MemoryStore
-from coding_agent.providers.base import LLMProvider, ProviderResponse, StreamEvent
+from coding_agent.providers.base import LLMProvider, ModelRequestError, ProviderResponse, StreamEvent
 from coding_agent_cli import main
 
 
@@ -116,6 +119,18 @@ def test_tool_success_does_not_print_file_content(capsys):
     assert not captured.out and not captured.err
 
 
+def test_search_fallback_displays_backend_and_incomplete_scope(capsys):
+    main._print_event(main.LoopEvent(
+        type="tool_done", tool_name="search_code",
+        tool_output=json.dumps({"backend": "python_git", "fallback_reason": "rg_unavailable",
+                                "truncated": True, "results": [{"text": "PRIVATE_BODY"}]}),
+        data={"input": {"path": "src", "pattern": "value"}},
+    ), color=False)
+    output = capsys.readouterr().out
+    assert "[搜索降级] src" in output and "python_git" in output
+    assert "范围未完整搜索" in output and "PRIVATE_BODY" not in output
+
+
 class LoopBoundProvider(LLMProvider):
     """模拟持有连接池的客户端，要求所有请求和关闭操作使用同一事件循环。"""
 
@@ -150,7 +165,7 @@ class LoopBoundProvider(LLMProvider):
         self.systems.append(system)
         self.history.append(deepcopy(messages))
         if self.fail:
-            raise RuntimeError("模拟请求失败")
+            raise ModelRequestError("模拟请求失败")
         text = "我叫李华。"
         yield StreamEvent(type="text_delta", text=text)
         yield StreamEvent(
@@ -176,6 +191,126 @@ def provider(monkeypatch, tmp_path):
     return fake
 
 
+class OutputModeRunner(CliRunner):
+    def __init__(self, *, tty):
+        super().__init__()
+        self.tty = tty
+
+    @contextmanager
+    def isolation(self, *args, **kwargs):
+        with super().isolation(*args, **kwargs) as streams:
+            with patch.object(sys.stdout, "isatty", return_value=self.tty):
+                yield streams
+
+
+@pytest.mark.parametrize("command", ["run", "chat"])
+@pytest.mark.parametrize("tty", [False, True], ids=["redirected", "terminal"])
+@pytest.mark.parametrize("blank", [False, True], ids=["replaced", "blank"])
+def test_cli_replaces_streamed_draft_and_keeps_confirmed_output(tmp_path, monkeypatch, command, tty, blank):
+    from test_runtime import ScriptedProvider, text_response, tool_response
+
+    (tmp_path / "sample.txt").write_text("sample", encoding="utf-8")
+    first = tool_response("read_file", {"path": "sample.txt"})
+    first.content.insert(0, {"type": "text", "text": "已确认的前序正文\n"})
+    final = "  def verified():\n      return 1\n"
+    supplement = "正式补答\n    保留缩进"
+    provider = ScriptedProvider([first, text_response(" \n" if blank else final), text_response(supplement)])
+
+    async def stream(*args, **kwargs):
+        response = await provider.create_message(*args, **kwargs)
+        delta = response.text if response.stop_reason == "tool_use" else "待撤回的旧草稿\n    旧代码\n"
+        yield StreamEvent(type="text_delta", text=delta)
+        yield StreamEvent(type="done", response=response)
+
+    monkeypatch.setattr(provider, "stream_message", stream)
+    monkeypatch.setattr(main, "load_config", lambda _: Config(workdir=str(tmp_path)))
+    monkeypatch.setattr(main, "_build_provider", lambda _: provider)
+    args = ["run", "检查文件"] if command == "run" else ["chat"]
+    result = OutputModeRunner(tty=tty).invoke(main.cli, args, input="检查文件\nexit\n", color=False)
+
+    assert result.exit_code == 0, result.exception
+    assert "待撤回的旧草稿" not in result.output
+    assert "旧代码" not in result.output
+    assert result.stdout.count("已确认的前序正文") == 1
+    text = "\n\n" + supplement if blank else final
+    expected = "已确认的前序正文\n\n> read_file sample.txt\n" + text + ("\n" if blank else "")
+    if command == "run":
+        assert result.stdout == expected
+    else:
+        assert expected in result.stdout
+    assert len([call for call in provider.calls if call["tools"] == []]) == int(blank)
+
+
+def test_cli_discards_truncated_draft_before_regeneration(tmp_path, monkeypatch):
+    from test_runtime import ScriptedProvider, text_response
+
+    provider = ScriptedProvider([
+        text_response("将被丢弃的截断正文", reason="max_tokens"),
+        text_response("重生成正文\n"),
+    ])
+    monkeypatch.setattr(main, "load_config", lambda _: Config(workdir=str(tmp_path)))
+    monkeypatch.setattr(main, "_build_provider", lambda _: provider)
+
+    result = CliRunner().invoke(main.cli, ["run", "检查"])
+
+    assert result.exit_code == 0, result.exception
+    assert "将被丢弃的截断正文" not in result.output
+    assert result.stdout == "重生成正文\n"
+    assert "输出达到上限，正在重新生成" in result.stderr
+
+
+@pytest.mark.parametrize("args, commands", [(["chat"], "/analyze 只解释入口\nexit\n"),
+                                           (["run", "--analysis", "只解释入口"], None)])
+def test_cli_static_analysis_uses_shared_checkpoints(tmp_path, monkeypatch, args, commands):
+    from test_runtime import ScriptedProvider, text_response, tool_response
+
+    provider = ScriptedProvider([
+        tool_response("analysis_checkpoint", {"action": "record", "dimension": "usage", "blocked": True,
+                                             "finding": "没有找到入口。"}, "record"),
+        tool_response("analysis_checkpoint", {"action": "finish"}, "finish"),
+        text_response(),
+    ])
+    monkeypatch.setattr(main, "load_config", lambda _: Config(workdir=str(tmp_path)))
+    monkeypatch.setattr(main, "_build_provider", lambda _: provider)
+    result = CliRunner().invoke(main.cli, args, input=commands)
+    assert result.exit_code == 0, result.exception
+    assert "[分析检查点]" in result.output
+    assert "分析部分交付" in result.output and "没有找到入口" in result.output
+    assert not list((tmp_path / ".memory").iterdir())
+
+
+@pytest.mark.parametrize("args, commands", [
+    (["run", "--analysis", "检查职责、调用关系、入口用法和生命周期"], None),
+    (["chat"], "/analyze --dimensions role 检查职责\nexit\n"),
+    (["run", "--analysis", "--analysis-dimension", "role", "检查职责"], None),
+])
+def test_cli_analysis_scope_is_set_by_user(tmp_path, monkeypatch, args, commands):
+    from test_runtime import single_role_analysis_provider
+
+    (tmp_path / "entry.py").write_text("def start(): pass\n", encoding="utf-8")
+    monkeypatch.setattr(main, "load_config", lambda _: Config(workdir=str(tmp_path)))
+    monkeypatch.setattr(main, "_build_provider", lambda _: single_role_analysis_provider())
+    result = CliRunner().invoke(main.cli, args, input=commands)
+
+    assert result.exit_code == 0, result.exception
+    assert "模型不能更改必查维度" in result.output
+    explicit = commands is not None or "--analysis-dimension" in args
+    assert ("分析完成" if explicit else "分析部分交付") in result.output
+    assert "提供入口函数" in result.output
+    assert ("调用关系：未确认" in result.output) == (not explicit)
+
+
+def test_cli_rejects_invalid_dimensions_before_model_call(provider):
+    runner = CliRunner()
+    result = runner.invoke(main.cli, ["run", "--analysis-dimension", "role", "检查职责"])
+    assert result.exit_code == 2
+    assert "只有静态分析模式可以选择分析维度" in result.output
+    result = runner.invoke(main.cli, ["chat"], input="/analyze --dimensions role,role 检查职责\nexit\n")
+    assert result.exit_code == 0
+    assert "不重复的分析维度" in result.output
+    assert not provider.history
+
+
 def test_chat_preserves_loop_and_history_across_turns(provider):
     result = CliRunner().invoke(
         main.cli, ["chat"], input="你记住你叫李华\n你叫什么？\nexit\n"
@@ -189,6 +324,63 @@ def test_chat_preserves_loop_and_history_across_turns(provider):
     assert provider.history[1][1]["content"][0]["text"] == "我叫李华。"
     assert provider.closed
     assert provider.owner_loop.is_closed()
+
+
+def test_chat_completes_approved_external_file_read(tmp_path, monkeypatch):
+    from test_runtime import ScriptedProvider, text_response, tool_response
+
+    external_file = tmp_path.parent / f"{tmp_path.name}-outside.md"
+    external_file.write_text("外部文件内容", encoding="utf-8")
+    provider = ScriptedProvider([
+        tool_response("read_file", {"path": str(external_file)}, "external-read"),
+        text_response("已查看外部文件"),
+    ])
+    cfg = Config(workdir=str(tmp_path))
+    approvals = []
+    monkeypatch.setattr(main, "load_config", lambda _: cfg)
+    monkeypatch.setattr(main, "_build_provider", lambda _: provider)
+    monkeypatch.setattr(main.click, "confirm", lambda *args, **kwargs: approvals.append(True) or True)
+
+    result = CliRunner().invoke(main.cli, ["chat"], input="查看外部文件\nexit\n")
+
+    assert result.exit_code == 0, result.exception
+    assert len(approvals) == 1
+    assert "已查看外部文件" in result.output
+    assert "[工具失败]" not in result.output
+    assert "仍在等待" not in result.output
+    assert provider.closed
+
+
+def test_chat_searches_external_directory_after_terminal_confirmation(tmp_path, monkeypatch):
+    from test_runtime import ScriptedProvider, text_response, tool_response
+
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    directory = tmp_path / "外部 文档"
+    directory.mkdir()
+    source = directory / "report.md"
+    source.write_text("before\n4.7 search approval\n", encoding="utf-8")
+    observed_results = []
+
+    def respond(messages, _tools, _system):
+        if len(messages) == 1:
+            return tool_response("search_code", {"pattern": "4.7", "path": str(directory)})
+        result = messages[-1]["content"][0]
+        assert not result.get("is_error"), result
+        observed_results.append(json.loads(result["content"]))
+        return text_response("已找到批准目录中的第 2 行")
+
+    provider = ScriptedProvider(handler=respond)
+    monkeypatch.setattr(main, "load_config", lambda _: Config(workdir=str(workspace)))
+    monkeypatch.setattr(main, "_build_provider", lambda _: provider)
+    result = CliRunner().invoke(main.cli, ["chat"], input="搜索外部目录\ny\nexit\n")
+    assert result.exit_code == 0, result.exception
+    assert result.output.count("允许执行？") == 1
+    assert "[工具失败]" not in result.output
+    assert "已找到批准目录中的第 2 行" in result.output
+    assert observed_results[0]["results"][0]["path"] == source.as_posix()
+    assert observed_results[0]["results"][0]["line"] == 2
+    assert provider.closed
 
 
 @pytest.mark.parametrize("mode", ["run", "chat", "limit"])
@@ -227,10 +419,21 @@ def test_chat_closes_provider_on_quit_or_eof(provider, user_input):
 def test_chat_closes_provider_on_request_failure(provider):
     provider.fail = True
     result = CliRunner().invoke(main.cli, ["chat"], input="你好\n")
-    assert isinstance(result.exception, RuntimeError)
-    assert str(result.exception) == "模拟请求失败"
+    assert result.exit_code == 0, result.exception
+    assert "模拟请求失败" in result.output
+    assert "会话已保留" in result.output
     assert provider.closed
     assert provider.owner_loop.is_closed()
+
+
+def test_run_exits_nonzero_after_model_request_failure(provider):
+    provider.fail = True
+    result = CliRunner().invoke(main.cli, ["run", "执行任务"])
+    assert result.exit_code == 1
+    assert "模型请求失败" in result.output
+    assert "模拟请求失败" in result.output
+    assert "Traceback" not in result.output
+    assert provider.closed
 
 
 def test_chat_survives_exhausted_connection_failure(provider, monkeypatch):
@@ -244,21 +447,22 @@ def test_chat_survives_exhausted_connection_failure(provider, monkeypatch):
 
     async def interrupted(*args, **kwargs):
         attempts.append(1)
-        if len(attempts) <= 3:
+        if len(attempts) <= 5:
             raise openai.APIConnectionError(request=httpx.Request("POST", "https://example.invalid"))
         async for event in original(*args, **kwargs):
             yield event
 
     monkeypatch.setattr(provider, "stream_message", interrupted)
-    result = CliRunner().invoke(main.cli, ["chat"], input="你好\n再试一次\nexit\n")
+    result = CliRunner().invoke(main.cli, ["chat"], input="你好\n/retry\nexit\n")
     assert result.exit_code == 0, result.exception
-    assert "3 次尝试" in result.output and "会话已保留" in result.output
+    assert "5 次尝试" in result.output and "会话已保留" in result.output
     assert "我叫李华。" in result.output
-    assert len(attempts) == 4 and provider.closed
+    assert len(attempts) == 6 and provider.closed
 
 
 @pytest.mark.parametrize("command", ["chat", "run"])
-def test_cli_reports_partial_stream_failure_without_replay(provider, monkeypatch, command):
+@pytest.mark.parametrize("tty", [False, True], ids=["redirected", "terminal"])
+def test_cli_reports_partial_stream_failure_without_replay(provider, monkeypatch, command, tty):
     import httpx
     import openai
 
@@ -271,10 +475,11 @@ def test_cli_reports_partial_stream_failure_without_replay(provider, monkeypatch
 
     monkeypatch.setattr(provider, "stream_message", interrupted)
     arguments = ["chat"] if command == "chat" else ["run", "你好"]
-    result = CliRunner().invoke(main.cli, arguments, input="你好\nexit\n")
+    result = OutputModeRunner(tty=tty).invoke(main.cli, arguments, input="你好\nexit\n")
     assert result.exit_code == (0 if command == "chat" else 1)
     assert result.output.count("已输出部分回复") == 1
-    assert "未自动重放" in result.output and "Traceback" not in result.output
+    assert "已输出部分回复" in result.stdout
+    assert "未自动重放" in result.stderr and "Traceback" not in result.output
     assert len(attempts) == 1 and provider.closed
 
 

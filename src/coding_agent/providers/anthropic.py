@@ -6,12 +6,14 @@ Anthropic Provider —— ``anthropic.AsyncAnthropic`` 的轻量封装。
 
 from __future__ import annotations
 
+import json
 from typing import Any, AsyncIterator
 
 from anthropic import AsyncAnthropic
 
-from coding_agent.providers.activity import observe_http_client
+from coding_agent.providers.activity import observe_http_client, sdk_timeout
 from coding_agent.providers.base import (
+    IncompleteStreamError,
     LLMProvider,
     ProviderResponse,
     StreamEvent,
@@ -29,6 +31,8 @@ class AnthropicProvider(LLMProvider):
         model_id: str = "claude-sonnet-5",
         api_key: str | None = None,
         base_url: str | None = None,
+        connect_timeout: float = 20.0,
+        idle_timeout: float = 120.0,
     ) -> None:
         super().__init__(model_id=model_id, api_key=api_key, base_url=base_url)
         kwargs: dict[str, Any] = {}
@@ -36,6 +40,10 @@ class AnthropicProvider(LLMProvider):
             kwargs["api_key"] = api_key
         if base_url:
             kwargs["base_url"] = base_url
+        kwargs.update(
+            timeout=sdk_timeout("anthropic", connect_timeout, idle_timeout),
+            max_retries=0,
+        )
         self._client = AsyncAnthropic(**kwargs)
         self.http_activity_supported = observe_http_client(self._client)
 
@@ -94,11 +102,14 @@ class AnthropicProvider(LLMProvider):
             kwargs["tools"] = tools
 
         tool_ids: dict[int, str] = {}
+        tool_arguments: dict[int, list[str]] = {}
+        stopped = False
         async with self._client.messages.stream(**kwargs) as stream:
             async for ev in stream:
                 if ev.type == "content_block_start":
                     if ev.content_block.type == "tool_use":
                         tool_ids[ev.index] = ev.content_block.id
+                        tool_arguments[ev.index] = []
                         yield StreamEvent(
                             type="tool_use_start",
                             tool_id=ev.content_block.id,
@@ -108,10 +119,28 @@ class AnthropicProvider(LLMProvider):
                     if ev.delta.type == "text_delta":
                         yield StreamEvent(type="text_delta", text=ev.delta.text)
                     elif ev.delta.type == "input_json_delta":
+                        if ev.index in tool_arguments:
+                            tool_arguments[ev.index].append(ev.delta.partial_json)
                         yield StreamEvent(type="tool_input", tool_id=tool_ids.get(ev.index, ""),
                                           text=ev.delta.partial_json)
+                elif ev.type == "message_stop":
+                    stopped = True
 
+            # SDK 的快照可能包含半截工具参数，不能把 EOF 当作完整响应。
+            if not stopped:
+                raise IncompleteStreamError("Anthropic 响应流提前结束，未收到 message_stop。")
             final = await stream.get_final_message()
+            if final.stop_reason == "tool_use":
+                # SDK 按部分 JSON 生成快照；即使收到结束标记，也要拒绝未收齐的参数。
+                for fragments in tool_arguments.values():
+                    if not fragments:
+                        continue  # 无参数增量时，沿用 content_block_start 中的 input。
+                    try:
+                        arguments = json.loads("".join(fragments))
+                    except json.JSONDecodeError as exc:
+                        raise IncompleteStreamError("Anthropic 工具参数不完整。") from exc
+                    if not isinstance(arguments, dict):
+                        raise IncompleteStreamError("Anthropic 工具参数必须是 JSON 对象。")
             yield StreamEvent(type="done", response=_to_provider_response(final))
 
 

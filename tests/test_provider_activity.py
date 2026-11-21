@@ -53,6 +53,9 @@ async def test_openai_sdk_retry_is_counted_from_real_http_sends():
     provider = OpenAICompatProvider(api_key="test-key")
     original_timeout = provider._client.timeout
     original_max_retries = provider._client.max_retries
+    assert original_timeout.connect == 20.0
+    assert original_timeout.read == 121.0
+    assert original_max_retries == 0
     await provider._client.close()
     provider._client._client = http.AsyncClient(transport=http.MockTransport(respond), timeout=600)
     provider._client.max_retries = 1
@@ -60,8 +63,8 @@ async def test_openai_sdk_retry_is_counted_from_real_http_sends():
     assert provider._client.timeout is original_timeout
     assert provider._client._client.timeout.read == 600
     assert provider._client.max_retries == 1
-    assert original_timeout.read == 600
-    assert original_max_retries == 2
+    assert original_timeout.read == 121.0
+    assert original_max_retries == 0
     activity = RequestActivity()
     activity.begin_provider_attempt(http_observed=True)
     token = _current_request_activity.set(activity)
@@ -99,6 +102,9 @@ async def test_anthropic_sdk_uses_http_observer():
         )
 
     provider = AnthropicProvider(api_key="test-key")
+    assert provider._client.max_retries == 0
+    assert provider._client.timeout.connect == 20.0
+    assert provider._client.timeout.read == 121.0
     await provider.aclose()
     provider._client._client = http.AsyncClient(transport=http.MockTransport(respond), timeout=600)
     observe_http_client(provider._client)

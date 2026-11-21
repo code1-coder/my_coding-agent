@@ -19,8 +19,9 @@ from pydantic import BaseModel, ConfigDict, Field, StrictStr
 from coding_agent.agents.tasks import TaskBoard
 from coding_agent.config import load_config
 from coding_agent.hooks.bus import EventType
+from coding_agent.loop import resolve_analysis_dimensions
 from coding_agent.memory import MemoryStore
-from coding_agent.runtime import AgentRuntime, build_provider
+from coding_agent.runtime import AgentRuntime, RetryUnavailable, build_provider
 
 logger = logging.getLogger(__name__)
 
@@ -286,6 +287,44 @@ async def chat(request: Request):
     if not isinstance(session_id, str) or not session_id or len(session_id) > 200:
         raise HTTPException(422, "session_id 必须是长度不超过 200 的非空字符串")
 
+    mode = body.get("mode", "default")
+    if mode not in ("default", "analysis"):
+        raise HTTPException(422, "mode 必须是 default 或 analysis")
+    analysis = mode == "analysis"
+    dimensions = body.get("analysis_dimensions")
+    if "analysis_dimensions" in body and not isinstance(dimensions, list):
+        raise HTTPException(422, "analysis_dimensions 必须是数组")
+    try:
+        scope = resolve_analysis_dimensions(analysis, dimensions)
+    except ValueError as exc:
+        raise HTTPException(422, str(exc)) from exc
+    return _chat_response(session_id, prompt=prompt, analysis=analysis, analysis_dimensions=scope)
+
+
+@app.post("/chat/retry")
+async def retry_chat(request: Request):
+    body = await request.json()
+    if not isinstance(body, dict):
+        raise HTTPException(422, "请求体必须是 JSON 对象")
+    session_id = body.get("session_id")
+    recovery_id = body.get("recovery_id")
+    if not isinstance(session_id, str) or not 1 <= len(session_id) <= 200:
+        raise HTTPException(422, "session_id 必须是长度不超过 200 的非空字符串")
+    if not isinstance(recovery_id, str) or not 1 <= len(recovery_id) <= 64:
+        raise HTTPException(422, "缺少有效的 recovery_id")
+    runtime = runtimes.get(session_id)
+    if runtime is None:
+        raise HTTPException(404, "当前会话没有可续接请求")
+    try:
+        runtime.check_retry(recovery_id)
+    except RetryUnavailable as exc:
+        raise HTTPException(409, str(exc)) from exc
+    return _chat_response(session_id, retry=(runtime, recovery_id))
+
+
+def _chat_response(session_id: str, *, prompt: str = "", analysis: bool = False,
+                   analysis_dimensions: tuple[str, ...] | None = None,
+                   retry: tuple[AgentRuntime, str] | None = None):
     async def event_stream() -> AsyncIterator[str]:
         queue: asyncio.Queue = asyncio.Queue()
         sentinel = object()
@@ -294,19 +333,28 @@ async def chat(request: Request):
 
         async def produce():
             try:
-                runtime = await _get_runtime(session_id)
-                async with aclosing(runtime.run_turn(prompt)) as events:
+                if retry is None:
+                    runtime = await _get_runtime(session_id)
+                    operation = runtime.run_turn(prompt, analysis=analysis, analysis_dimensions=analysis_dimensions)
+                else:
+                    runtime, recovery_id = retry
+                    operation = runtime.retry_turn(recovery_id)
+                async with aclosing(operation) as events:
                     async for event in events:
                         payload = {"type": event.type, **event.data}
                         if event.text or event.type == "text_reset":
                             payload["text"] = event.text
+                        if event.type == "error":
+                            payload["message"] = event.text
                         if event.tool_name:
                             payload.update(tool_name=event.tool_name, tool_id=event.tool_id,
                                            output=event.tool_output[:4000])
                         queue.put_nowait(payload)
-            except Exception as exc:
-                logger.exception("网页对话执行失败")
+            except (RetryUnavailable, PermissionError) as exc:
                 queue.put_nowait({"type": "error", "message": str(exc)})
+            except Exception:
+                logger.exception("网页对话执行失败")
+                queue.put_nowait({"type": "error", "message": "会话执行异常，请查看服务端日志。"})
             finally:
                 queue.put_nowait(sentinel)
 

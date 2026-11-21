@@ -11,7 +11,8 @@ from fastapi.testclient import TestClient
 import coding_agent.server.app as server
 from coding_agent.config import Config
 from coding_agent.memory import MemoryStore
-from test_runtime import ScriptedProvider, text_response, tool_response
+from coding_agent.providers.base import ModelRequestError
+from test_runtime import ScriptedProvider, single_role_analysis_provider, text_response, tool_response
 
 
 def decode_events(response):
@@ -97,12 +98,83 @@ def test_web_uses_skills_memory_context_hooks_and_task_board(configured_server, 
         assert any(t["name"] == "mcp__docs__search" for t in agent_call["tools"])
 
 
-def test_web_reports_model_errors_and_cleans_up(configured_server, monkeypatch):
+def test_web_reports_model_errors_and_cleans_up(configured_server, monkeypatch, caplog):
     provider = ScriptedProvider([RuntimeError("模拟模型请求失败")])
     monkeypatch.setattr(server, "_get_provider", lambda _: provider)
     with TestClient(server.app) as client:
         response = client.post("/chat", json={"prompt": "你好"})
-        assert decode_events(response)[-1] == {"type": "error", "message": "模拟模型请求失败"}
+        assert decode_events(response)[-1] == {"type": "error", "message": "会话执行异常，请查看服务端日志。"}
+        assert "RuntimeError: 模拟模型请求失败" in caplog.text
+    assert provider.closed
+
+
+def test_web_analysis_emits_checkpoints_and_partial_terminal(configured_server, monkeypatch):
+    provider = ScriptedProvider([
+        tool_response("analysis_checkpoint", {"action": "record", "dimension": "usage", "blocked": True,
+                                             "finding": "没有读到入口文件。"}, "blocked"),
+        tool_response("analysis_checkpoint", {"action": "finish"}, "finish"),
+        text_response(),
+    ])
+    monkeypatch.setattr(server, "_get_provider", lambda _: provider)
+    with TestClient(server.app) as client:
+        assert client.post("/chat", json={"prompt": "检查", "mode": "invalid"}).status_code == 422
+        events = decode_events(client.post("/chat", json={"prompt": "只解释入口", "mode": "analysis"}))
+    assert any(event["type"] == "analysis_progress" and "没有读到入口文件" in event["text"] for event in events)
+    assert events[-1]["type"] == "done"
+    assert events[-1]["analysis_status"] == "partial"
+
+
+@pytest.mark.parametrize("scope, status", [({}, "partial"), ({"analysis_dimensions": ["role"]}, "complete")])
+def test_web_analysis_scope_is_set_by_request(configured_server, tmp_path, monkeypatch, scope, status):
+    (tmp_path / "entry.py").write_text("def start(): pass\n", encoding="utf-8")
+    monkeypatch.setattr(server, "_get_provider", lambda _: single_role_analysis_provider())
+    prompt = "检查职责" if scope else "检查职责、调用关系、入口用法和生命周期"
+    with TestClient(server.app) as client:
+        response = client.post("/chat", json={"prompt": prompt, "mode": "analysis", **scope})
+        assert response.status_code == 200
+        events = decode_events(response)
+    assert any(event["type"] == "tool_done" and event["tool_id"] == "plan" and event["is_error"] for event in events)
+    assert events[-1]["type"] == "done" and events[-1]["analysis_status"] == status
+    assert "提供入口函数" in events[-1]["text"]
+    assert ("调用关系：未确认" in events[-1]["text"]) == (status == "partial")
+
+
+def test_web_rejects_invalid_analysis_scope_before_creating_runtime(configured_server):
+    _, providers = configured_server
+    with TestClient(server.app) as client:
+        for invalid in ([], ["role", "role"], ["unknown"], [True], "role", None):
+            assert client.post("/chat", json={"prompt": "检查", "mode": "analysis",
+                                             "analysis_dimensions": invalid}).status_code == 422
+        assert client.post("/chat", json={"prompt": "检查", "analysis_dimensions": ["role"]}).status_code == 422
+    assert not providers
+
+
+def test_web_resume_rejects_other_sessions_and_consumed_ids(configured_server, monkeypatch):
+    cfg, _ = configured_server
+    cfg.model_max_attempts = 1
+    provider = ScriptedProvider([ConnectionError("断开"), text_response("续接完成")])
+    monkeypatch.setattr(server, "_get_provider", lambda _: provider)
+    with TestClient(server.app) as client:
+        failed = decode_events(client.post("/chat", json={"prompt": "继续检查", "session_id": "owner"}))[-1]
+        recovery_id = failed["recovery_id"]
+        assert client.post("/chat/retry", json={"session_id": "other", "recovery_id": recovery_id}).status_code == 404
+        body = {"session_id": "owner", "recovery_id": recovery_id}
+        resumed = decode_events(client.post("/chat/retry", json=body))
+        assert resumed[-1]["type"] == "done" and resumed[-1]["text"] == "续接完成"
+        assert client.post("/chat/retry", json=body).status_code == 409
+
+
+def test_web_delivers_model_request_failure_without_success_done(configured_server, monkeypatch):
+    provider = ScriptedProvider([ModelRequestError("模型服务暂不可用")])
+    monkeypatch.setattr(server, "_get_provider", lambda _: provider)
+    with TestClient(server.app) as client:
+        events = decode_events(client.post("/chat", json={"prompt": "检查任务"}))
+
+    assert events[-1]["type"] == "error"
+    assert events[-1]["failed"] is True
+    assert events[-1]["message"] == events[-1]["text"]
+    assert "模型服务暂不可用" in events[-1]["message"]
+    assert not any(event["type"] == "done" for event in events)
     assert provider.closed
 
 

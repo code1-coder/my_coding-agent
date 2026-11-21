@@ -8,7 +8,7 @@ import sys
 import pytest
 
 from coding_agent.agents.subagent import AgentPool
-from coding_agent.security.permission import Verdict, WorkspaceChecker
+from coding_agent.security.permission import PermissionPipeline, Verdict, WorkspaceChecker, resolve_read_path
 from coding_agent.tools import (
     ApplyPatchTool, BashTool, CodeOutlineTool, GitDiffTool, GitStatusTool, ReadFileTool, SearchCodeTool,
 )
@@ -395,6 +395,37 @@ def test_read_file_segments_and_legacy_output(tmp_path):
     assert tool.execute("../outside").startswith("Error:")
 
 
+def test_read_path_resolves_host_absolute_path(tmp_path):
+    workdir = tmp_path / "workspace"
+    workdir.mkdir()
+    external_file = tmp_path / "outside.md"
+    external_file.write_text("outside", encoding="utf-8")
+    assert resolve_read_path(workdir, str(external_file)) == external_file.resolve()
+
+
+def test_read_path_maps_windows_drive_path_to_wsl_mount(tmp_path, monkeypatch):
+    from coding_agent.security.permission import _resolve_wsl_drive_path
+
+    mount = tmp_path / "drive-c"
+    external_file = mount / "Users" / "wang" / "Desktop" / "report.md"
+    external_file.parent.mkdir(parents=True)
+    external_file.write_text("mounted", encoding="utf-8")
+    monkeypatch.setattr("coding_agent.security.permission._wsl_drive_mount", lambda _drive: mount)
+
+    resolved = _resolve_wsl_drive_path(r"C:\Users\wang\Desktop\report.md")
+
+    assert resolved == external_file.resolve()
+
+
+def test_wsl_drive_path_rejects_unmounted_drive(tmp_path, monkeypatch):
+    from coding_agent.security.permission import _resolve_wsl_drive_path
+
+    monkeypatch.setattr("coding_agent.security.permission._wsl_drive_mount", lambda _drive: tmp_path / "missing")
+
+    with pytest.raises(ValueError, match="无法访问 Windows 盘符 C:"):
+        _resolve_wsl_drive_path(r"C:\Users\wang\Desktop\report.md")
+
+
 @pytest.mark.skipif(shutil.which("rg") is None, reason="requires ripgrep")
 def test_search_code_literal_regex_context_and_limits(tmp_path):
     (tmp_path / "main.py").write_text("before\ncall(x)\nCALL(x)\ncallZx\nafter\n", encoding="utf-8")
@@ -445,6 +476,393 @@ def test_search_missing_dependency_is_explicit(tmp_path, monkeypatch):
     monkeypatch.setattr("coding_agent.tools.code.shutil.which", lambda name: None)
     with pytest.raises(RuntimeError, match="ripgrep"):
         SearchCodeTool(tmp_path).execute("example")
+
+
+def test_search_without_dependencies_reads_explicit_file(tmp_path, monkeypatch):
+    (tmp_path / "example.py").write_text("before\n调用(value)\n调用(other)\nafter\n", encoding="utf-8")
+    monkeypatch.setattr("coding_agent.tools.code.shutil.which", lambda name: None)
+    tool = SearchCodeTool(tmp_path)
+    result = json.loads(tool.execute("调用", path="example.py", context_lines=1))
+    assert result["backend"] == "python_file"
+    assert result["fallback_reason"] == "rg_unavailable"
+    assert result["match_count"] == 2
+    assert [row["line"] for row in result["results"]] == [1, 2, 3, 4]
+    assert not result["truncated"] and result["warnings"]
+    limited = json.loads(tool.execute("调用", path="example.py", max_results=1))
+    assert limited["match_count"] == 1 and limited["truncated"]
+    with pytest.raises(ValueError, match="regex"):
+        tool.execute("调用", path="example.py", regex=True)
+    with pytest.raises(ValueError, match="file_glob"):
+        tool.execute("调用", path="example.py", file_glob="*.{py,pyi}")
+    with pytest.raises(ValueError, match="工作区"):
+        tool.execute("调用", path="../example.py")
+
+
+@pytest.mark.asyncio
+async def test_external_search_grant_is_exact_and_separate_from_reading(tmp_path, monkeypatch):
+    monkeypatch.setenv("PATH", "")
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    source = tmp_path / "source.py"
+    source.write_text("value = 1\n", encoding="utf-8")
+    sibling = tmp_path / "sibling.py"
+    sibling.write_text("value = 2\n", encoding="utf-8")
+    registry = ToolRegistry()
+    for tool in (SearchCodeTool(workspace), ReadFileTool(workspace),
+                 CodeOutlineTool(workspace), ApplyPatchTool(workspace)):
+        registry.register_tool(tool)
+
+    async def approve(*_args):
+        return True
+
+    pipeline = PermissionPipeline([WorkspaceChecker(workspace)], approval_handler=approve)
+    params = {"pattern": "value", "path": str(source)}
+    async with pipeline.authorize("search_code", params) as (verdict, _reason):
+        assert verdict == Verdict.ALLOW
+        result = await registry.dispatch("search_code", params)
+        assert not result.error
+        assert json.loads(result.content)["results"][0]["path"] == source.as_posix()
+        for target in (sibling, source.parent):
+            denied = await registry.dispatch("search_code", {**params, "path": str(target)})
+            assert denied.error and "路径逃逸工作区" in denied.error
+        for name in ("read_file", "code_outline"):
+            denied = await registry.dispatch(name, {"path": str(source)})
+            assert denied.error and "路径逃逸工作区" in denied.error
+        denied = await registry.dispatch("apply_patch", {
+            "patch": f"*** Begin Patch\n*** Delete File: {source.as_posix()}\n*** End Patch"})
+        assert denied.error
+        other_workspace = tmp_path / "other-workspace"
+        other_workspace.mkdir()
+        with pytest.raises(ValueError, match="路径逃逸工作区"):
+            SearchCodeTool(other_workspace).execute(**params)
+    denied = await registry.dispatch("search_code", params)
+    assert denied.error and "路径逃逸工作区" in denied.error
+    async with pipeline.authorize("read_file", {"path": str(source)}):
+        result = await registry.dispatch("read_file", {"path": str(source)})
+        assert not result.error and result.content == "value = 1"
+        denied = await registry.dispatch("search_code", params)
+        assert denied.error and "路径逃逸工作区" in denied.error
+    verdict, _reason = await pipeline.check("search_code", params)
+    assert verdict == Verdict.ALLOW
+    denied = await registry.dispatch("search_code", params)
+    assert denied.error and "路径逃逸工作区" in denied.error
+    assert source.read_text(encoding="utf-8") == "value = 1\n"
+
+
+@pytest.mark.asyncio
+async def test_external_search_scopes_are_isolated_during_concurrent_execution(tmp_path, monkeypatch):
+    monkeypatch.setenv("PATH", "")
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    sources = [tmp_path / "left.py", tmp_path / "right.py"]
+    for source in sources:
+        source.write_text(f"value = '{source.stem}'\n", encoding="utf-8")
+    (workspace / "local.py").write_text("local_value = 1\n", encoding="utf-8")
+    registry = ToolRegistry()
+    registry.register_tool(SearchCodeTool(workspace))
+
+    async def approve(*_args):
+        return True
+
+    pipeline = PermissionPipeline([WorkspaceChecker(workspace)], approval_handler=approve)
+    ready = 0
+    all_ready = asyncio.Event()
+
+    async def search(source, other):
+        nonlocal ready
+        params = {"pattern": "value", "path": str(source)}
+        async with pipeline.authorize("search_code", params):
+            ready += 1
+            if ready == 2:
+                all_ready.set()
+            await all_ready.wait()
+            result = await registry.dispatch("search_code", params)
+            denied = await registry.dispatch("search_code", {**params, "path": str(other)})
+            assert denied.error and "路径逃逸工作区" in denied.error
+            local = await registry.dispatch("search_code", {"pattern": "local_value", "path": "local.py"})
+            assert not local.error
+            assert json.loads(local.content)["results"][0]["path"] == "local.py"
+            assert not result.error
+            return json.loads(result.content)["results"][0]
+
+    results = await asyncio.wait_for(asyncio.gather(search(*sources), search(*reversed(sources))), 5)
+    assert [row["path"] for row in results] == [source.as_posix() for source in sources]
+    assert [row["text"] for row in results] == ["value = 'left'", "value = 'right'"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("change", ["params", "directory_link", "file_to_directory"])
+async def test_external_search_rejects_target_changed_during_approval(tmp_path, monkeypatch, change):
+    monkeypatch.setenv("PATH", "")
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    scope = tmp_path / "approved"
+    scope.mkdir()
+    source = scope / "report.md"
+    source.write_text("approved value\n", encoding="utf-8")
+    other = tmp_path / "unapproved"
+    other.mkdir()
+    (other / source.name).write_text("unapproved value\n", encoding="utf-8")
+    params = {"pattern": "value", "path": str(source)}
+
+    async def approve(_name, arguments, _reason):
+        if change == "params":
+            arguments["path"] = str(other / source.name)
+        elif change == "file_to_directory":
+            source.unlink()
+            source.mkdir()
+            (source / "unapproved.md").write_text("unapproved value\n", encoding="utf-8")
+        else:
+            scope.rename(tmp_path / "original")
+            if os.name == "nt":
+                subprocess.run([os.environ["COMSPEC"], "/c", "mklink", "/J", str(scope), str(other)],
+                               check=True, capture_output=True)
+            else:
+                scope.symlink_to(other, target_is_directory=True)
+        return True
+
+    pipeline = PermissionPipeline([WorkspaceChecker(workspace)], approval_handler=approve)
+    registry = ToolRegistry()
+    registry.register_tool(SearchCodeTool(workspace))
+    async with pipeline.authorize("search_code", params) as (verdict, _reason):
+        assert verdict == Verdict.ALLOW
+        denied = await registry.dispatch("search_code", params)
+        assert denied.error and "路径逃逸工作区" in denied.error
+        assert "unapproved value" not in denied.content
+    if change == "directory_link":
+        async with pipeline.authorize("search_code", params) as (verdict, reason):
+            assert verdict == Verdict.DENY and "symlinks or junctions" in reason
+
+
+@pytest.mark.asyncio
+async def test_cancelled_external_search_revokes_grant_after_cleanup(tmp_path, monkeypatch):
+    import threading
+
+    monkeypatch.setenv("PATH", "")
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    source = tmp_path / "external.py"
+    source.write_text("value = 1\n", encoding="utf-8")
+    tool = SearchCodeTool(workspace)
+    registry = ToolRegistry()
+    registry.register_tool(tool)
+    entered, stopped = threading.Event(), threading.Event()
+    original = tool._read_search_file
+
+    def controlled_read(run, target, remaining):
+        entered.set()
+        try:
+            while not run.stopped.wait(0.01):
+                run.check()
+            run.check()
+        finally:
+            stopped.set()
+
+    monkeypatch.setattr(tool, "_read_search_file", controlled_read)
+
+    async def approve(*_args):
+        return True
+
+    pipeline = PermissionPipeline([WorkspaceChecker(workspace)], approval_handler=approve)
+    params = {"pattern": "value", "path": str(source)}
+
+    async def search():
+        try:
+            async with pipeline.authorize("search_code", params):
+                await registry.dispatch("search_code", params)
+        except asyncio.CancelledError:
+            denied = await registry.dispatch("search_code", params)
+            assert denied.error and "路径逃逸工作区" in denied.error
+            raise
+
+    pending = asyncio.create_task(search())
+    try:
+        async with asyncio.timeout(3):
+            while not entered.is_set():
+                await asyncio.sleep(0.01)
+        pending.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await asyncio.wait_for(pending, 3)
+    finally:
+        pending.cancel()
+        await asyncio.gather(pending, return_exceptions=True)
+    assert stopped.is_set()
+    monkeypatch.setattr(tool, "_read_search_file", original)
+    async with pipeline.authorize("search_code", params):
+        result = await registry.dispatch("search_code", params)
+        assert not result.error and json.loads(result.content)["match_count"] == 1
+
+
+@pytest.mark.skipif(shutil.which("git") is None, reason="requires Git")
+def test_search_fallback_uses_real_git_ignore_rules(tmp_path, monkeypatch):
+    git = shutil.which("git")
+    subprocess.run([git, "init"], cwd=tmp_path, check=True, capture_output=True)
+    tracked = tmp_path / "tracked.py"
+    tracked.write_text("marker\n", encoding="utf-8")
+    subprocess.run([git, "add", "tracked.py"], cwd=tmp_path, check=True, capture_output=True)
+    (tmp_path / ".gitignore").write_text("tracked.py\nignored.py\n*.txt\n!keep.txt\n", encoding="utf-8")
+    (tmp_path / "ignored.py").write_text("marker\n", encoding="utf-8")
+    (tmp_path / "visible.py").write_text("before\nmarker\nafter\n", encoding="utf-8")
+    (tmp_path / "keep.txt").write_text("marker\n", encoding="utf-8")
+    (tmp_path / ".hidden.py").write_text("marker\n", encoding="utf-8")
+    (tmp_path / "nested").mkdir()
+    (tmp_path / "nested" / ".gitignore").write_text("*.py\n!keep.py\n", encoding="utf-8")
+    (tmp_path / "nested" / "skip.py").write_text("marker\n", encoding="utf-8")
+    (tmp_path / "nested" / "keep.py").write_text("marker\n", encoding="utf-8")
+    (tmp_path / "deps").mkdir()
+    (tmp_path / "deps" / ".rgignore").write_text("*\n", encoding="utf-8")
+    with (tmp_path / ".gitignore").open("a", encoding="utf-8") as source:
+        source.write("deps/\n")
+    monkeypatch.setattr("coding_agent.tools.code.shutil.which",
+                        lambda name: git if os.path.splitext(os.path.basename(name))[0].lower() == "git" else None)
+    tool = SearchCodeTool(tmp_path)
+    result = json.loads(tool.execute("marker"))
+    assert result["backend"] == "python_git"
+    assert [row["path"] for row in result["results"]] == ["keep.txt", "nested/keep.py", "visible.py"]
+    assert not result["truncated"]
+    assert json.loads(tool.execute("before", file_glob="*.py"))["match_count"] == 1
+    (tmp_path / ".rgignore").write_text("visible.py\n", encoding="utf-8")
+    with pytest.raises(RuntimeError, match="rgignore"):
+        tool.execute("marker")
+
+
+@pytest.mark.parametrize("kind", ["binary", "encoding", "large", "read_budget", "output_budget"])
+def test_search_fallback_reports_incomplete_coverage(tmp_path, monkeypatch, kind):
+    monkeypatch.setattr("coding_agent.tools.code.shutil.which", lambda name: None)
+    source = tmp_path / "source.py"
+    source.write_bytes({"binary": b"needle\0", "encoding": b"needle\xff",
+                        "large": b"n" * (2 * 1024 * 1024 + 1)}.get(kind, b"needle\n"))
+    tool = SearchCodeTool(tmp_path)
+    if kind == "read_budget":
+        monkeypatch.setattr(tool, "_MAX_READ_BYTES", 2)
+    if kind == "output_budget":
+        monkeypatch.setattr(tool, "_MAX_OUTPUT_BYTES", 2050)
+    result = json.loads(tool.execute("needle", path="source.py"))
+    assert result["truncated"] and result["truncation_reasons"]
+    assert result["results"] == [] and result["match_count"] == 0
+
+
+def test_search_fallback_dependency_cache_recovers_and_does_not_cache_results(tmp_path, monkeypatch):
+    monkeypatch.setenv("PATH", "")
+    source = tmp_path / "source.py"
+    source.write_text("first\n", encoding="utf-8")
+    tool = SearchCodeTool(tmp_path)
+    assert json.loads(tool.execute("first", path="source.py"))["backend"] == "python_file"
+    source.write_text("second\n", encoding="utf-8")
+    assert json.loads(tool.execute("first", path="source.py"))["match_count"] == 0
+    assert json.loads(tool.execute("second", path="source.py"))["match_count"] == 1
+
+
+@pytest.mark.skipif(shutil.which("rg") is None, reason="requires ripgrep")
+def test_search_restores_rg_when_path_changes(tmp_path, monkeypatch):
+    original_path = os.environ["PATH"]
+    (tmp_path / "source.py").write_text("value\n", encoding="utf-8")
+    monkeypatch.setenv("PATH", "")
+    tool = SearchCodeTool(tmp_path)
+    assert json.loads(tool.execute("value", path="source.py"))["backend"] == "python_file"
+    monkeypatch.setenv("PATH", original_path)
+    assert json.loads(tool.execute("value", path="source.py"))["backend"] == "rg"
+
+
+@pytest.mark.skipif(shutil.which("rg") is None, reason="requires ripgrep")
+def test_search_supports_relative_path_and_expired_dependency_cache(tmp_path, monkeypatch):
+    from pathlib import Path
+
+    rg = shutil.which("rg")
+    folder = tmp_path / "bin"
+    folder.mkdir()
+    source = tmp_path / "source.py"
+    source.write_text("value\n", encoding="utf-8")
+    monkeypatch.setenv("PATH", "bin")
+    tool = SearchCodeTool(tmp_path)
+    assert json.loads(tool.execute("value", path="source.py"))["backend"] == "python_file"
+    shutil.copy2(rg, folder / Path(rg).name)
+    monkeypatch.setattr(tool, "_capability_time", tool._capability_time - 31)
+    assert json.loads(tool.execute("value", path="source.py"))["backend"] == "rg"
+    (folder / Path(rg).name).unlink()
+    assert json.loads(tool.execute("value", path="source.py"))["backend"] == "python_file"
+
+
+@pytest.mark.parametrize("kind", ["hidden", "git_metadata", "missing", "time_limit"])
+def test_search_fallback_rejects_unsafe_paths_and_reports_timeout(tmp_path, monkeypatch, kind):
+    from coding_agent.tools.code import _SearchRun
+
+    monkeypatch.setenv("PATH", "")
+    source = tmp_path / ".hidden.py" if kind == "hidden" else tmp_path / "source.py"
+    source.write_text("value\n", encoding="utf-8")
+    tool = SearchCodeTool(tmp_path)
+    if kind == "hidden":
+        assert json.loads(tool.execute("value", path=source.name))["results"] == []
+    elif kind == "git_metadata":
+        (tmp_path / ".git").mkdir()
+        (tmp_path / ".git" / "config").write_text("value", encoding="utf-8")
+        with pytest.raises(ValueError, match="metadata"):
+            tool.execute("value", path=".git/config")
+    elif kind == "missing":
+        with pytest.raises(FileNotFoundError):
+            tool.execute("value", path="missing.py")
+    else:
+        run = _SearchRun()
+        run.deadline = 0
+        result = json.loads(tool._execute(run, "value", path="source.py"))
+        assert result["truncated"] and result["truncation_reasons"] == ["time_budget"]
+
+
+@pytest.mark.asyncio
+async def test_search_cancellation_waits_for_scanner_cleanup(tmp_path, monkeypatch):
+    import threading
+
+    monkeypatch.setattr("coding_agent.tools.code.shutil.which", lambda name: None)
+    (tmp_path / "source.py").write_text("value\n", encoding="utf-8")
+    tool = SearchCodeTool(tmp_path)
+    entered, stopped = threading.Event(), threading.Event()
+
+    def slow_read(run, target, remaining):
+        entered.set()
+        try:
+            while not run.stopped.wait(0.01):
+                run.check()
+            run.check()
+        finally:
+            stopped.set()
+
+    monkeypatch.setattr(tool, "_read_search_file", slow_read)
+    registry = ToolRegistry()
+    registry.register_tool(tool)
+    pending = asyncio.create_task(registry.dispatch("search_code", {"pattern": "value", "path": "source.py"}))
+    for _ in range(300):
+        if entered.is_set():
+            break
+        await asyncio.sleep(0.01)
+    assert entered.is_set()
+    pending.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await asyncio.wait_for(pending, 3)
+    assert stopped.is_set()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("stop_mode", ["cancel", "timeout"])
+async def test_search_subprocess_stop_reaps_real_process(tmp_path, stop_mode):
+    from coding_agent.tools.code import _SearchRun
+
+    run = _SearchRun()
+    command = [sys.executable, "-c",
+               "import os,pathlib,time; pathlib.Path('worker.pid').write_text(str(os.getpid())); time.sleep(30)"]
+    pending = asyncio.create_task(asyncio.to_thread(run.command, command, tmp_path))
+    for _ in range(300):
+        if (tmp_path / "worker.pid").exists():
+            break
+        await asyncio.sleep(0.01)
+    assert (tmp_path / "worker.pid").exists()
+    pid = int((tmp_path / "worker.pid").read_text())
+    if stop_mode == "cancel":
+        run.stopped.set()
+    else:
+        run.deadline = 0
+    with pytest.raises(asyncio.CancelledError if stop_mode == "cancel" else TimeoutError):
+        await asyncio.wait_for(pending, 3)
+    assert not _process_running(pid)
 
 
 def test_python_outline_nested_async_and_no_execution(tmp_path):
