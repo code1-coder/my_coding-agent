@@ -154,20 +154,31 @@ async def test_analysis_revokes_findings_when_source_version_changes(tmp_path, e
     ("resume", "write"), ("resume", "delete"),
 ])
 async def test_analysis_checks_cited_source_without_model_reread(tmp_path, phase, change):
+    workdir = tmp_path
+    if phase == "resume":
+        workdir = tmp_path / "workspace"
+        workdir.mkdir()
     source = tmp_path / "entry.py"
     source.write_text("def old_entry(): pass\n", encoding="utf-8")
     finding = "入口为 old_entry。"
+    read_args = {"path": str(source)}
+    approvals = []
+
+    async def approve(name, params, reason):
+        approvals.append((name, params))
+        return True
 
     def respond(messages, tools, system):
         match len(provider.calls):
             case 1:
-                return tool_response("read_file", {"path": "entry.py"}, "read")
+                return tool_response("read_file", read_args, "read")
             case 2:
                 state = json.loads(messages[-1]["content"][-1]["content"].rsplit("\n", 1)[1])
                 return tool_response("analysis_checkpoint", {"action": "record", "dimension": "role",
                                      "finding": finding, "evidence_ids": list(state["evidence"])}, "record")
             case 3:
                 if phase == "resume":
+                    change_source()
                     return ConnectionError("断开")
                 return tool_response("analysis_checkpoint", {"action": "finish"}, "finish")
             case 4:
@@ -184,17 +195,22 @@ async def test_analysis_checks_cited_source_without_model_reread(tmp_path, phase
             source.unlink()
 
     provider = ScriptedProvider(handler=respond)
-    cfg = Config(workdir=str(tmp_path), model_max_attempts=1)
-    async with AgentRuntime(cfg, provider=provider) as runtime:
+    cfg = Config(workdir=str(workdir), model_max_attempts=1)
+    async with AgentRuntime(cfg, provider=provider, approval_handler=approve) as runtime:
         events = []
         async for event in runtime.run_turn("检查入口职责", analysis=True, analysis_dimensions=["role"]):
             events.append(event)
             if event.type == "tool_done" and event.tool_id == "finish":
                 change_source()
         if phase == "resume":
-            assert events[-1].type == "error"
-            change_source()
-            events = [event async for event in runtime.retry_turn(events[-1].data["recovery_id"])]
+            failed = events[-1]
+            assert failed.type == "error"
+            assert failed.data["analysis_status"] == "failed"
+            assert f"职责（待复核）：{finding}" in failed.text
+            assert "源码依据" not in failed.text
+            assert approvals == [("read_file", read_args)]
+            events = [event async for event in runtime.retry_turn(failed.data["recovery_id"])]
+            assert approvals == [("read_file", read_args)] * 2
     assert events[-1].type == "done"
     if change == "none":
         assert events[-1].data["analysis_status"] == "complete"
@@ -506,7 +522,7 @@ async def test_analysis_preserves_checkpoint_through_compaction_and_retry(tmp_pa
     async with AgentRuntime(cfg, provider=provider) as runtime:
         failed = await collect(runtime, "只解释 start 的职责", analysis=True, analysis_dimensions=["role"])
         assert failed[-1].data["analysis_status"] == "failed"
-        assert "start 返回 ready" in failed[-1].text
+        assert "职责（待复核）：start 返回 ready。" in failed[-1].text
         resumed = [event async for event in runtime.retry_turn(failed[-1].data["recovery_id"])]
         assert not any("本轮分析状态" in str(message) for message in runtime.messages)
     assert any(call["tools"] is None for call in provider.calls)

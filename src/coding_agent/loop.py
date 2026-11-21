@@ -172,7 +172,7 @@ class AnalysisProgress:
         self.revision += 1
         return self.describe(dimension)
 
-    def describe(self, dimension: str) -> str:
+    def describe(self, dimension: str, *, pending_review: bool = False) -> str:
         label = _ANALYSIS_DIMENSIONS[dimension]
         if dimension not in self.findings:
             if dimension in self.review_gaps:
@@ -182,12 +182,15 @@ class AnalysisProgress:
         locations = "；".join(self.evidence[ref].label for ref in refs)
         confidence = "未确认"
         if status == "supported":
-            confidence = "源码依据" if all(self.evidence[ref].version for ref in refs) else "定位线索，待复核"
+            if pending_review:
+                confidence = "待复核"
+            else:
+                confidence = "源码依据" if all(self.evidence[ref].version for ref in refs) else "定位线索，待复核"
         return f"{label}（{confidence}）：{finding}" + (
             f"［{locations}］" if locations else "")
 
-    def summary(self) -> str:
-        return "\n".join(f"- {self.describe(item)}" for item in self.dimensions)
+    def summary(self, *, pending_review: bool = False) -> str:
+        return "\n".join(f"- {self.describe(item, pending_review=pending_review)}" for item in self.dimensions)
 
     def view(self) -> str:
         return json.dumps({"goal": self.goal, "required_dimensions": self.dimensions, "checks": self.summary(),
@@ -418,7 +421,8 @@ class AgentLoop:
                     self.request_failure = exc
                 delivery = self._request_failure_delivery(exc, tool_outcomes, progress.uncertain_tools)
                 if analysis is not None:
-                    delivery += "\n\n本轮分析检查点：\n" + analysis.summary()
+                    # 失败交付不复读源码或等待审批，续接时再复核原检查点。
+                    delivery += "\n\n本轮分析检查点：\n" + analysis.summary(pending_review=True)
                 history_text = (f"模型中断前的未完成输出：\n{text}\n\n" if text else "") + delivery
                 messages.append({"role": "assistant", "content": [{"type": "text", "text": history_text}]})
                 yield LoopEvent(type="error", text=delivery, data={
