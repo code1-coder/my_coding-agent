@@ -32,6 +32,7 @@ Token 计数优先使用 ``tiktoken``（``cl100k_base``）；
 
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import re
@@ -480,12 +481,27 @@ async def compact_history(
     返回一个 **新** 列表（调用方应重新绑定，如
     ``messages = await compact_history(...)``）。
     """
+    compacted = await _compact_history(
+        messages, conversation=_select_summary_input(messages), summarize=summarize,
+        workdir=workdir, persist=persist,
+    )
+    return _clone_messages(messages) if compacted is None else compacted
+
+
+async def _compact_history(
+    messages: list[dict[str, Any]],
+    *,
+    conversation: str,
+    summarize: SummarizeFn,
+    workdir: Path | str | None,
+    persist: bool,
+) -> list[dict[str, Any]] | None:
+    """摘要请求失败或没有正文时返回 None，由调用方决定如何保留原历史。"""
     if persist:
         wd = Path(workdir) if workdir else Path.cwd()
         transcript_path = _write_transcript(messages, wd)
         logger.info("Transcript saved: %s", transcript_path)
 
-    conversation = _select_summary_input(messages)
     latest_request_index = _latest_request_index(messages)
     latest_request = messages[latest_request_index] if latest_request_index is not None else None
 
@@ -500,11 +516,11 @@ async def compact_history(
 
     try:
         summary = await summarize(prompt)
-        if not summary:
-            return _clone_messages(messages)
     except Exception:
         logger.exception("compact_history 摘要生成失败")
-        return _clone_messages(messages)
+        return None
+    if not summary or not summary.strip():
+        return None
 
     excerpt = _recovery_excerpt(
         messages,
@@ -634,6 +650,7 @@ class CompactionPipeline:
         self.max_messages = max_messages
         self.max_reactive_retries = max_reactive_retries
         self.persist = persist
+        self._failed_proactive_input: bytes | None = None
 
     # ── LLM 调用前管道（除非 L4 触发，否则不调 API）──────
 
@@ -643,8 +660,9 @@ class CompactionPipeline:
         原地修改 *messages*。返回 messages 以便链式调用。
 
         前三层优先通过持久化和裁剪减少上下文；只有仍超出预算且提供
-        summarize 回调时才调用模型生成完整摘要。大型工具输出及
-        摘要前的对话记录可能写入工作目录下的持久化文件。
+        summarize 回调时才调用模型生成完整摘要。同一轮摘要失败后，
+        等实际摘要输入变化再尝试。大型工具输出及摘要前的对话记录
+        可能写入工作目录下的持久化文件。
         """
         # L3 → 将大工具输出持久化到磁盘
         if self.persist:
@@ -667,15 +685,27 @@ class CompactionPipeline:
                     estimate_tokens(messages),
                 )
             else:
-                logger.info("上下文超出限制 —— 触发 L4 compact_history")
                 # 静态分析的最新工具批次尚未交给模型。整批保留，并保护调用与结果配对。
                 split = len(messages) - 2 if latest_tool_count else len(messages)
-                new_msgs = await compact_history(
-                    messages[:split],
+                history = messages[:split]
+                conversation = _select_summary_input(history)
+                # 只比较发送给摘要模型的内容。保留的工具批次变化不应触发同一摘要请求。
+                input_digest = hashlib.sha256(conversation.encode("utf-8")).digest()
+                if input_digest == self._failed_proactive_input:
+                    return messages
+
+                logger.info("上下文超出限制 —— 触发 L4 compact_history")
+                new_msgs = await _compact_history(
+                    history,
+                    conversation=conversation,
                     summarize=self.summarize,
                     workdir=self.workdir,
                     persist=self.persist,
                 )
+                if new_msgs is None:
+                    self._failed_proactive_input = input_digest
+                    return messages
+                self._failed_proactive_input = None
                 messages[:] = [*new_msgs, *messages[split:]]
 
         return messages

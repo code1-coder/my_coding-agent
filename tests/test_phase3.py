@@ -361,6 +361,70 @@ class TestCompactionPipeline:
         assert "[Compacted]" in msgs[0]["content"]
 
     @pytest.mark.asyncio
+    @pytest.mark.parametrize("failure", [TimeoutError("摘要超时"), "", "  \n"], ids=["timeout", "empty", "blank"])
+    async def test_failed_proactive_summary_is_skipped_until_input_changes(self, tmp_path, failure):
+        summarize = AsyncMock(return_value=failure) if isinstance(failure, str) else AsyncMock(side_effect=failure)
+        pipe = CompactionPipeline(workdir=tmp_path, summarize=summarize, context_limit=10)
+        original = {"role": "user", "content": "旧目标 " * 100}
+        messages = [original.copy()]
+
+        await pipe.run(messages)
+        await pipe.run(messages)
+        await pipe.run(messages)
+
+        summarize.assert_awaited_once()
+        assert messages == [original]
+        assert len(list((tmp_path / ".transcripts").glob("*.jsonl"))) == 1
+
+        summarize.side_effect = None
+        summarize.return_value = "新摘要"
+        updated = {"role": "user", "content": "新目标 " * 100}
+        messages[0]["content"] = updated["content"]
+        await pipe.run(messages)
+
+        assert summarize.await_count == 2
+        assert "新目标" in summarize.await_args.args[0]
+        assert "新摘要" in messages[0]["content"]
+        assert messages[-1] == updated
+
+    @pytest.mark.asyncio
+    async def test_proactive_summary_uses_only_input_sent_to_summarizer(self, tmp_path):
+        summarize = AsyncMock(side_effect=["", "紧急摘要"])
+        pipe = CompactionPipeline(workdir=tmp_path, summarize=summarize, context_limit=10, persist=False)
+        request = {"role": "user", "content": "目标 " * 100}
+        call = {"role": "assistant", "content": [{"type": "tool_use", "id": "read-1", "name": "read_file",
+                                                    "input": {"path": "entry.py"}}]}
+        result = {"role": "user", "content": [{"type": "tool_result", "tool_use_id": "read-1", "content": "初始"}]}
+        messages = [request, call, result]
+
+        await pipe.run(messages)
+        messages[-1]["content"][0]["content"] = "更新的读取结果"
+        await pipe.run(messages)
+
+        summarize.assert_awaited_once()
+        assert "初始" not in summarize.await_args.args[0]
+        assert messages[-1]["content"][0]["content"] == "更新的读取结果"
+
+        recovered = await pipe.reactive(messages[:1])
+        assert summarize.await_count == 2
+        assert "紧急摘要" in recovered[0]["content"]
+
+    @pytest.mark.asyncio
+    async def test_cancelled_proactive_summary_can_be_attempted_again(self, tmp_path):
+        summarize = AsyncMock(side_effect=[asyncio.CancelledError, "重试摘要"])
+        pipe = CompactionPipeline(workdir=tmp_path, summarize=summarize, context_limit=10, persist=False)
+        request = {"role": "user", "content": "目标 " * 100}
+        messages = [request.copy()]
+
+        with pytest.raises(asyncio.CancelledError):
+            await pipe.run(messages)
+        assert messages == [request]
+
+        await pipe.run(messages)
+        assert "重试摘要" in messages[0]["content"]
+        assert messages[-1] == request
+
+    @pytest.mark.asyncio
     async def test_skips_l4_when_no_summarize(self, tmp_path):
         pipe = CompactionPipeline(
             workdir=tmp_path,
