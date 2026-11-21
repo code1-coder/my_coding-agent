@@ -34,6 +34,7 @@ import json
 import logging
 import os
 import uuid
+from collections.abc import Iterable
 from contextlib import aclosing
 from dataclasses import dataclass, field
 from typing import Any, AsyncIterator, Callable
@@ -64,6 +65,8 @@ _ANALYSIS_BATCHES = 8
 _ANALYSIS_BATCH_SIZE = 4
 _ANALYSIS_NO_PROGRESS = 2
 _ANALYSIS_MAX_RESULT_CHARS = 30_000
+_ToolCallKey = tuple[str, str]
+_ToolErrorKey = tuple[str, int | None] | str
 
 
 def _analysis_display(value: str, limit: int) -> str:
@@ -270,7 +273,7 @@ class TurnProgress:
     turn_id: str = field(default_factory=lambda: uuid.uuid4().hex)
     iteration: int = 0
     tool_outcomes: dict[tuple[str, str, bool], int] = field(default_factory=dict)
-    tool_failure_streaks: dict[str, int] = field(default_factory=dict)
+    tool_failure_streaks: dict[_ToolCallKey, dict[_ToolErrorKey, int]] = field(default_factory=dict)
     no_progress_read_rounds: int = 0
     uncertain_tools: bool = False
     analysis: AnalysisProgress | None = None
@@ -384,7 +387,6 @@ class AgentLoop:
                     yield event
         text = ""
         tool_outcomes = progress.tool_outcomes
-        tool_failure_streaks = progress.tool_failure_streaks
         for iteration in range(progress.iteration, self.max_iterations):
             progress.iteration = iteration
             if self.compaction is not None and resume is None:
@@ -486,9 +488,10 @@ class AgentLoop:
                 yield LoopEvent(type="tool_start", tool_name=block["name"],
                                 tool_id=block["id"], data={"input": block.get("input", {}),
                                 "execution_id": execution_id, "agent": self.agent_name})
-            round_results = []
-            round_failures: list[tuple[str, str, str]] = []
-            async with aclosing(self._tool_events(messages, blocks, execution_ids, rejected=rejected)) as events:
+            round_results: dict[str, tuple[LoopEvent, str | None]] = {}
+            async with aclosing(self._tool_events(
+                messages, blocks, execution_ids, round_results, rejected=rejected,
+            )) as events:
                 async for event in events:
                     if event.type == "tool_done":
                         execution = event.data.get("execution") or {}
@@ -501,10 +504,6 @@ class AgentLoop:
                         target = target if isinstance(target, str) else ""
                         outcome = (event.tool_name, target, bool(event.data.get("is_error")))
                         tool_outcomes[outcome] = tool_outcomes.get(outcome, 0) + 1
-                        if event.data.get("is_error"):
-                            round_failures.append((event.tool_name, target, event.tool_output))
-                        round_results.append((event.tool_name, event.data.get("metadata", {}),
-                                              bool(event.data.get("is_error"))))
                     yield event
             if analysis is not None:
                 results = messages[-1]["content"]
@@ -534,26 +533,21 @@ class AgentLoop:
                     return
                 # 静态分析按批次判断进展，同批多项失败不能抢先终止整轮。
                 continue
-            round_tool_names = {name for name, _metadata, _failed in round_results}
-            for tool_name in round_tool_names:
-                failures = [failure for failure in round_failures if failure[0] == tool_name]
-                if failures:
-                    tool_failure_streaks[tool_name] = tool_failure_streaks.get(tool_name, 0) + len(failures)
-                else:
-                    tool_failure_streaks.pop(tool_name, None)
-                if tool_failure_streaks.get(tool_name, 0) >= _MAX_REPEATED_TOOL_FAILURES:
-                    _failed_tool, target, error = next(
-                        failure for failure in reversed(round_failures) if failure[0] == tool_name
-                    )
-                    async for event in self._finish_without_answer(
-                        messages, text, "repeated_tool_failure",
-                        failure=(tool_name, target, error),
-                    ):
-                        yield event
-                    return
-            if (round_results and all(name == "read_file" and not failed
-                                      and metadata.get("reused_from")
-                                      for name, metadata, failed in round_results)):
+            failure = self._record_tool_failures(progress, (
+                round_results[execution_id] for execution_id in execution_ids
+            ))
+            if failure is not None:
+                arguments = failure.data["input"]
+                target = arguments.get("path") if isinstance(arguments, dict) else None
+                async for event in self._finish_without_answer(
+                    messages, text, "repeated_tool_failure",
+                    failure=(failure.tool_name, target if isinstance(target, str) else "", failure.tool_output),
+                ):
+                    yield event
+                return
+            if (round_results and all(result.tool_name == "read_file" and not result.data["is_error"]
+                                      and result.data["metadata"].get("reused_from")
+                                      for result, _ in round_results.values())):
                 progress.no_progress_read_rounds += 1
             else:
                 progress.no_progress_read_rounds = 0
@@ -564,6 +558,46 @@ class AgentLoop:
 
         async for event in self._finish_without_answer(messages, text, "max_iterations"):
             yield event
+
+    @staticmethod
+    def _record_tool_failures(
+        progress: TurnProgress, results: Iterable[tuple[LoopEvent, str | None]],
+    ) -> LoopEvent | None:
+        """按调用目标与错误类型累计；同批同目标成功优先，不依赖并发结束顺序。"""
+        successes: set[_ToolCallKey] = set()
+        failures: dict[_ToolCallKey, dict[_ToolErrorKey, tuple[int, LoopEvent]]] = {}
+        for event, repeat_key in results:
+            if repeat_key is None:
+                # 没有专用规范化时按完整参数区分目标，不重写命令或保留大段写入内容。
+                serialized = json.dumps(event.data["input"], sort_keys=True, separators=(",", ":"))
+                repeat_key = hashlib.sha256(serialized.encode("utf-8")).hexdigest()
+            key = (event.tool_name, repeat_key)
+            if not event.data["is_error"]:
+                successes.add(key)
+                continue
+            execution = event.data["execution"]
+            stage = execution.get("failure_stage")
+            exit_code = execution.get("exit_code")
+            error_key: _ToolErrorKey = event.tool_output
+            if isinstance(stage, str) and stage and (exit_code is None or type(exit_code) is int):
+                error_key = (stage, exit_code)
+            errors = failures.setdefault(key, {})
+            count = errors[error_key][0] if error_key in errors else 0
+            errors[error_key] = (count + 1, event)
+
+        streaks = progress.tool_failure_streaks
+        for key in successes:
+            streaks.pop(key, None)
+        for key, errors in failures.items():
+            if key in successes:
+                continue
+            previous = streaks.get(key, {})
+            current = {error: previous.get(error, 0) + count for error, (count, _) in errors.items()}
+            streaks[key] = current
+            for error, count in current.items():
+                if count >= _MAX_REPEATED_TOOL_FAILURES:
+                    return errors[error][1]
+        return None
 
     def _analysis_batch(self, blocks: list[dict], analysis: AnalysisProgress) -> tuple[dict[int, str], bool]:
         controls = [index for index, block in enumerate(blocks) if block["name"] == _ANALYSIS_CHECKPOINT]
@@ -776,7 +810,10 @@ class AgentLoop:
                 task.cancel()
             await asyncio.gather(task, return_exceptions=True)
 
-    async def _tool_events(self, messages, blocks, execution_ids, *, rejected: dict[int, str]) -> AsyncIterator[LoopEvent]:
+    async def _tool_events(
+        self, messages, blocks, execution_ids, round_results: dict[str, tuple[LoopEvent, str | None]],
+        *, rejected: dict[int, str],
+    ) -> AsyncIterator[LoopEvent]:
         tasks = [asyncio.create_task(self._execute_one(block, messages, execution_id=execution_id,
                                                       rejection=rejected.get(index)))
                  for index, (block, execution_id) in enumerate(zip(blocks, execution_ids))]
@@ -798,8 +835,9 @@ class AgentLoop:
                                     data={"phase": "tools", "pending_tools": waiting, "agent": self.agent_name})
                 for task in sorted(completed, key=indexes.__getitem__):
                     index = indexes[task]
-                    block, result = blocks[index], task.result()
-                    yield LoopEvent(type="tool_done", tool_name=block["name"],
+                    block = blocks[index]
+                    result, repeat_key = task.result()
+                    event = LoopEvent(type="tool_done", tool_name=block["name"],
                                     tool_id=block["id"], tool_output=result.error or result.content,
                                     data={"input": block.get("input", {}), "is_error": bool(result.error),
                                           "execution": result.execution,
@@ -807,12 +845,14 @@ class AgentLoop:
                                                        for key in ("reused_from", "repeat_count")
                                                        if key in result.metadata},
                                           "execution_id": execution_ids[index], "agent": self.agent_name})
+                    round_results[execution_ids[index]] = (event, repeat_key)
+                    yield event
         finally:
             for task in tasks:
                 if not task.done():
                     task.cancel()
             outcomes = await asyncio.gather(*tasks, return_exceptions=True)
-            results = [outcome.to_dict() if isinstance(outcome, ToolResult) else
+            results = [outcome[0].to_dict() if isinstance(outcome, tuple) else
                        tool_result(block["id"], error="本轮请求已中断，工具结果不可用。")
                        for block, outcome in zip(blocks, outcomes)]
             messages.append({"role": "user", "content": results})
@@ -1119,7 +1159,7 @@ class AgentLoop:
         messages.append({"role": "user", "content": view})
 
     async def _execute_one(self, block: dict[str, Any], messages: list[dict[str, Any]],
-                           *, execution_id: str = "", rejection: str | None = None) -> ToolResult:
+                           *, execution_id: str = "", rejection: str | None = None) -> tuple[ToolResult, str | None]:
         """执行单个 tool_use 块，保留执行信息与原调用 ID。
 
         未注册的工具和执行异常均转换为错误结果，交由模型在后续轮次
@@ -1129,12 +1169,13 @@ class AgentLoop:
         tool_id = block["id"]
         tool_input = block.get("input", {})
         if rejection is not None:
-            return ToolResult(tool_id, error=rejection)
+            return ToolResult(tool_id, error=rejection), None
 
         error = None
         output = ""
         execution = {}
         metadata: dict[str, Any] = {}
+        repeat_key = None
         cancellation = None
         try:
             blocked = await self.emit(EventType.PRE_TOOL_USE, tool_name=tool_name,
@@ -1142,16 +1183,12 @@ class AgentLoop:
             if blocked is not None:
                 raise PermissionError(f"工具被 Hook 阻止：{blocked}")
             if self.permissions is None:
-                result = await self._reuse_read_result(messages, block, tool_id)
-                if result is None:
-                    result = await self.registry.dispatch(tool_name, tool_input, tool_use_id=tool_id)
+                result, repeat_key = await self._dispatch_authorized_tool(messages, block)
             else:
                 async with self.permissions.authorize(tool_name, tool_input) as (verdict, reason):
                     if verdict != Verdict.ALLOW:
                         raise PermissionError(reason)
-                    result = await self._reuse_read_result(messages, block, tool_id)
-                    if result is None:
-                        result = await self.registry.dispatch(tool_name, tool_input, tool_use_id=tool_id)
+                    result, repeat_key = await self._dispatch_authorized_tool(messages, block)
             output, error = result.content, result.error
             execution = result.execution
             metadata = result.metadata
@@ -1181,25 +1218,37 @@ class AgentLoop:
             raise cancellation
         return ToolResult(tool_id, content=str(event.data["output"]),
                           error=str(event.data["output"]) if error else None, execution=execution,
-                          metadata=metadata)
+                          metadata=metadata), repeat_key
+
+    async def _dispatch_authorized_tool(
+        self, messages: list[dict[str, Any]], block: dict[str, Any],
+    ) -> tuple[ToolResult, str | None]:
+        cached, repeat_key = await self._reuse_read_result(messages, block, block["id"])
+        if cached is not None:
+            return cached, repeat_key
+        result = await self.registry.dispatch(block["name"], block.get("input", {}), tool_use_id=block["id"])
+        # 成功时以实际读取的范围为准。失败时使用授权范围内已解析的键，不写入会话历史。
+        actual_key = result.metadata.get("repeat_key")
+        return result, actual_key if isinstance(actual_key, str) else repeat_key
 
     async def _reuse_read_result(self, messages: list[dict[str, Any]], block: dict[str, Any],
-                                 tool_id: str) -> ToolResult | None:
-        """只复用当前会话中仍完整且文件内容未变的 read_file 结果。"""
+                                 tool_id: str) -> tuple[ToolResult | None, str | None]:
+        """复用仍有效的读取结果，并保留已有的规范化参数用于失败计数。"""
         entry = self.registry.get(block.get("name", ""))
         if (entry is None or entry.repeat_policy != "fresh_read"
                 or entry.repeat_key is None or entry.freshness_token is None):
-            return None
+            return None, None
         arguments = block.get("input", {})
         if not isinstance(arguments, dict):
-            return None
+            return None, None
+        repeat_key = None
         try:
             repeat_key = entry.repeat_key(arguments)
             if repeat_key is None:
-                return None
+                return None, None
             freshness = await asyncio.to_thread(entry.freshness_token, arguments)
         except (OSError, ValueError, KeyError, TypeError):
-            return None
+            return None, repeat_key
 
         results: dict[str, dict[str, Any]] = {}
         analysis = getattr(getattr(self, "progress", None), "analysis", None)
@@ -1243,5 +1292,5 @@ class AgentLoop:
                     content=(f"已复用同一会话中工具调用 {source_id} 的文件读取结果；"
                              "该结果与当前文件内容一致。若需要不同范围，请明确新的读取范围。"),
                     metadata={**metadata, "reused_from": source_id, "repeat_count": repeat_count},
-                )
-        return None
+                ), repeat_key
+        return None, repeat_key

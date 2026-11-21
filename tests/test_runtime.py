@@ -847,31 +847,121 @@ async def test_runtime_finishes_external_read_when_approval_is_rejected(tmp_path
 
 
 @pytest.mark.asyncio
-async def test_runtime_stops_after_repeated_shell_failures(tmp_path):
-    def handle(messages, tools, system):
-        if tools == []:
-            return text_response("无法访问用户指定的文件路径。")
-        calls = [block for message in messages if message.get("role") == "assistant"
-                 for block in message.get("content", [])
-                 if isinstance(block, dict) and block.get("type") == "tool_use"]
-        return tool_response("bash", {"command": f"unsupported-command-{len(calls)}"},
-                             f"shell-{len(calls)}")
+async def test_runtime_continues_after_mixed_reads_fail_on_different_targets(tmp_path):
+    batches = []
+    for index in range(3):
+        name = f"available-{index}.txt"
+        (tmp_path / name).write_text(f"内容 {index}", encoding="utf-8")
+        read = tool_response("read_file", {"path": name}, f"read-{index}")
+        missing = tool_response("read_file", {"path": f"missing-{index}.txt"}, f"missing-{index}")
+        read.content.extend(missing.content)
+        batches.append(read)
+    (tmp_path / "followup.txt").write_text("后续步骤的结果", encoding="utf-8")
+    provider = ScriptedProvider([
+        *batches, tool_response("read_file", {"path": "followup.txt"}, "followup"),
+        text_response("已完成后续检查"),
+    ])
 
-    provider = ScriptedProvider(handler=handle)
+    async with AgentRuntime(Config(workdir=str(tmp_path)), provider=provider) as runtime:
+        events = await collect(runtime)
+
+    completed = {event.tool_id: event for event in events if event.type == "tool_done"}
+    for index in range(3):
+        assert completed[f"read-{index}"].tool_output == f"内容 {index}"
+        assert completed[f"missing-{index}"].data["is_error"]
+    assert events[-1].data["stop_reason"] == "end_turn"
+    assert completed["followup"].tool_output == "后续步骤的结果"
+
+
+@pytest.mark.asyncio
+async def test_runtime_stops_after_equivalent_read_failures_even_with_other_successes(tmp_path):
+    missing = tmp_path / "missing.txt"
+    batches = []
+    for index, path in enumerate((missing.name, "./missing.txt", str(missing))):
+        name = f"available-{index}.txt"
+        (tmp_path / name).write_text("其他目标的内容", encoding="utf-8")
+        failed = tool_response("read_file", {"path": path}, f"missing-{index}")
+        failed.content.extend(tool_response("read_file", {"path": name}, f"read-{index}").content)
+        batches.append(failed)
+    provider = ScriptedProvider(batches)
+
+    async with AgentRuntime(Config(workdir=str(tmp_path)), provider=provider) as runtime:
+        events = await collect(runtime)
+
+    assert sum(event.type == "tool_done" and event.data["is_error"] for event in events) == 3
+    assert sum(event.type == "tool_done" and not event.data["is_error"] for event in events) == 3
+    assert events[-1].data["stop_reason"] == "repeated_tool_failure"
+    assert "missing.txt" in events[-1].text
+
+
+@pytest.mark.asyncio
+async def test_runtime_clears_read_failure_streak_after_same_target_recovers(tmp_path):
+    source = tmp_path / "changing.txt"
+    other = tool_response("read_file", {"path": "unrelated.txt"}, "unrelated")
+    recovered = tool_response("read_file", {"path": str(source)}, "recovered")
+    recovered.content.extend(other.content)
+    provider = ScriptedProvider([
+        tool_response("read_file", {"path": source.name}, "before-1"),
+        tool_response("read_file", {"path": source.name}, "before-2"),
+        recovered,
+        tool_response("read_file", {"path": source.name}, "after-1"),
+        tool_response("read_file", {"path": source.name}, "after-2"),
+        text_response("已记录恢复和后续读取错误"),
+    ])
+    seen = {}
+    events = []
+    async with AgentRuntime(Config(workdir=str(tmp_path)), provider=provider) as runtime:
+        async for event in runtime.run_turn("检查变化中的文件"):
+            events.append(event)
+            if event.type != "tool_done":
+                continue
+            seen[event.tool_id] = event
+            if event.tool_id == "before-2":
+                source.write_text("文件已恢复", encoding="utf-8")
+            if event.tool_id == "recovered":
+                source.unlink()
+
+    assert events[-1].data["stop_reason"] == "end_turn"
+    assert seen["recovered"].tool_output == "文件已恢复"
+    assert seen["unrelated"].data["is_error"]
+    assert all(seen[call_id].data["is_error"] for call_id in ("before-1", "before-2", "after-1", "after-2"))
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(("commands", "exit_codes", "stop_reason"), [
+    (["demo"] * 3, [1, 1, 1], "repeated_tool_failure"),
+    (["demo-a", "demo-b", "demo-c"], [1, 1, 1], "end_turn"),
+    (["demo"] * 3, [1, 2, 1], "end_turn"),
+])
+async def test_runtime_distinguishes_shell_targets_and_structured_failures(tmp_path, commands, exit_codes, stop_reason):
+    provider = ScriptedProvider([
+        *(tool_response("bash", {"command": command}, f"shell-{index}")
+          for index, command in enumerate(commands)),
+        text_response("已记录各次命令失败"),
+    ])
     async with AgentRuntime(Config(workdir=str(tmp_path)), provider=provider) as runtime:
         from coding_agent.tools.base import ToolResult
 
+        attempts = []
+
+        def fail(command):
+            attempts.append(command)
+            index = len(attempts) - 1
+            return ToolResult("", error=f"Error: demo command failed (attempt {index + 1})",
+                              execution={"failure_stage": "nonzero_exit", "exit_code": exit_codes[index]})
+
         runtime.registry.register_handler(
             {"name": "bash", "description": "", "input_schema": {"type": "object"}},
-            lambda command: ToolResult("", error=f"Error: unsupported shell command: {command}"),
+            fail,
         )
         events = await asyncio.wait_for(collect(runtime), timeout=2)
-        model_calls = [call for call in provider.calls if call["tools"] is not None]
-        assert len(model_calls) == 3
-        assert events[-1].type == "done"
-        assert events[-1].data["stop_reason"] == "repeated_tool_failure"
+    assert attempts == commands
+    assert sum(event.type == "tool_done" and event.data["is_error"] for event in events) == 3
+    assert events[-1].type == "done"
+    assert events[-1].data["stop_reason"] == stop_reason
+    if stop_reason == "repeated_tool_failure":
         assert "bash" in events[-1].text
-        assert "unsupported shell command" in events[-1].text
+        assert "attempt 3" in events[-1].text
         assert "停止重复调用" in events[-1].text
 
 
