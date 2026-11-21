@@ -206,6 +206,75 @@ async def test_analysis_checks_cited_source_without_model_reread(tmp_path, phase
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("change_during", ["never", "pre_hook", "approval", "post_hook", "stop_hook"])
+async def test_analysis_revalidates_multifile_findings_as_a_set(tmp_path, change_during):
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    first = workspace / "entry.py"
+    first.write_text("def old_entry(): pass\n", encoding="utf-8")
+    second = tmp_path / "caller.py"
+    second.write_text("def caller(): pass\n", encoding="utf-8")
+    findings = {"role": "入口为 old_entry。", "flow": "定义 caller。"}
+    approvals = []
+
+    def change_first():
+        first.write_text("def new_entry(): pass\n", encoding="utf-8")
+
+    async def approve(name, params, reason):
+        approvals.append((name, params))
+        if change_during == "approval" and len(approvals) == 2:
+            change_first()
+        return True
+
+    async def on_pre_tool(event):
+        if (change_during == "pre_hook" and event.data.get("purpose") == "analysis_revalidation"
+                and event.data["params"]["path"] == str(second)):
+            change_first()
+
+    async def on_post_tool(event):
+        if change_during == "post_hook" and event.data.get("purpose") == "analysis_revalidation":
+            change_first()
+
+    async def on_stop(event):
+        if change_during == "stop_hook":
+            change_first()
+
+    def respond(messages, tools, system):
+        step = len(provider.calls)
+        if step == 1:
+            reads = [tool_response("read_file", {"path": str(path)}, f"read-{i}").content[0]
+                     for i, path in enumerate((first, second))]
+            return ProviderResponse(content=reads, stop_reason="tool_use")
+        if step in (2, 3):
+            dimension, source = ("role", first) if step == 2 else ("flow", second)
+            state = json.loads(messages[-1]["content"][-1]["content"].rsplit("\n", 1)[1])
+            ref = next(ref for ref, label in state["evidence"].items() if source.name in label)
+            return tool_response("analysis_checkpoint", {"action": "record", "dimension": dimension,
+                                 "finding": findings[dimension], "evidence_ids": [ref]}, f"record-{dimension}")
+        if step == 4:
+            return tool_response("analysis_checkpoint", {"action": "finish"}, "finish")
+        pytest.fail("收尾不应再次请求模型。")
+
+    provider = ScriptedProvider(handler=respond)
+    async with AgentRuntime(Config(workdir=str(workspace)), provider=provider, approval_handler=approve) as runtime:
+        runtime.bus.subscribe(EventType.PRE_TOOL_USE, on_pre_tool)
+        runtime.bus.subscribe(EventType.POST_TOOL_USE, on_post_tool)
+        runtime.bus.subscribe(EventType.STOP, on_stop)
+        events = await collect(runtime, "检查入口职责和调用关系", analysis=True, analysis_dimensions=["role", "flow"])
+
+    assert approvals == [("read_file", {"path": str(second)})] * 2
+    assert events[-1].type == "done"
+    assert findings["flow"] in events[-1].text
+    if change_during == "never":
+        assert events[-1].data["analysis_status"] == "complete"
+        assert findings["role"] in events[-1].text
+    else:
+        assert events[-1].data["analysis_status"] == "partial"
+        assert "职责：待复核" in events[-1].text
+        assert findings["role"] not in events[-1].text
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("tool", ["search_code", "code_outline"])
 async def test_analysis_cannot_finish_on_unversioned_source_leads(tmp_path, tool):
     (tmp_path / "entry.py").write_text("def locate_entry(): pass\n", encoding="utf-8")

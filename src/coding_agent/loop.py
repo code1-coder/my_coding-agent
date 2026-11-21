@@ -621,52 +621,78 @@ class AgentLoop:
                   "分析批次不合法；每批最多四个只读工具，检查点须单独提交。")
         return dict.fromkeys(range(len(blocks)), reason), False
 
-    async def _revalidate_analysis(self, analysis: AnalysisProgress) -> None:
-        cited = dict.fromkeys(ref for _, _, refs in analysis.findings.values() for ref in refs)
+    async def _revalidate_analysis(self, analysis: AnalysisProgress, *, stop_reason: str | None = None) -> None:
+        cited = {ref: analysis.evidence[ref] for _, _, refs in analysis.findings.values() for ref in refs}
+        expected = {item.source_path: item.version for item in cited.values() if item.version}
         versions: dict[str, str | None] = {}
+        checks: dict[str, asyncio.Task[str | None]] = {}
+        ready = asyncio.Event()
+        async with asyncio.TaskGroup() as checks_group:
+            for path, expected_version in expected.items():
+                version, check = await self._prepare_analysis_source_check(path, expected_version, checks_group, ready)
+                versions[path] = version
+                if check is not None:
+                    checks[path] = check
+            if stop_reason is not None:
+                await self.emit(EventType.STOP, stop_reason=stop_reason)
+            # 所有文件的逐次审批及 Hook 都结束后，再校验通过初检的版本集合。
+            ready.set()
+        versions.update((path, check.result()) for path, check in checks.items())
+
         unavailable: dict[str, str] = {}
-        for ref in cited:
-            item = analysis.evidence[ref]
+        for ref, item in cited.items():
             if not item.version:
                 unavailable[ref] = "搜索或提纲缺少源码版本，请使用 read_file 读取对应行。"
                 continue
-            if item.source_path not in versions:
-                versions[item.source_path] = await self._analysis_source_version(item.source_path)
             current_version = versions[item.source_path]
             if current_version != item.version:
                 problem = "源码已变化" if current_version else "无法验证源码版本"
                 unavailable[ref] = f"{problem}［{item.label}］，请重新读取。"
         analysis.invalidate_evidence(unavailable)
 
-    async def _analysis_source_version(self, path: str) -> str | None:
+    async def _prepare_analysis_source_check(
+        self, path: str, expected_version: str, checks: asyncio.TaskGroup, ready: asyncio.Event,
+    ) -> tuple[str | None, asyncio.Task[str | None] | None]:
         entry = self.registry.get("read_file")
         if entry is None or entry.freshness_token is None or self.permissions is None:
-            return None
+            return None, None
+        fingerprint = entry.freshness_token
+
+        async def read_version() -> str | None:
+            try:
+                return await asyncio.to_thread(fingerprint, {"path": path, "_evidence_path": path})
+            except (OSError, ValueError, RuntimeError):
+                # 文件可能被删除、无法访问，或解析到循环链接。
+                return None
+
+        async def check_after_hooks() -> str | None:
+            await ready.wait()
+            return await read_version()
+
         params = {"path": path}
         check_id = uuid.uuid4().hex
         blocked = await self.emit(EventType.PRE_TOOL_USE, tool_name="read_file", params=params,
                                   tool_id=check_id, execution_id=check_id, purpose="analysis_revalidation")
         version = None
+        check = None
         if blocked is None:
-            # 复用逐次读取授权，只读取指纹。工作区外文件的原始授权不跨调用复用。
             async with self.permissions.authorize("read_file", params) as (verdict, _):
                 if verdict == Verdict.ALLOW:
-                    try:
-                        version = await asyncio.to_thread(entry.freshness_token, {
-                            "path": path, "_evidence_path": path,
-                        })
-                    except (OSError, ValueError, RuntimeError):
-                        # 文件可能被删除、无法访问，或解析到循环链接。
-                        version = None
+                    version = await read_version()
+                    if version == expected_version:
+                        # 子任务只继承本次、该路径的授权，后续 Hook 和审批在父任务中执行。
+                        check = checks.create_task(check_after_hooks())
         status = "已读取源码指纹。" if version else "无法校验源码版本。"
         await self.emit(EventType.POST_TOOL_USE, tool_name="read_file", tool_id=check_id,
                         execution_id=check_id, purpose="analysis_revalidation", output=status,
                         error=None if version else status)
-        return version
+        return version, check
 
     async def _finish_analysis(self, messages: list[dict[str, Any]], reason: str) -> AsyncIterator[LoopEvent]:
         analysis = self.progress.analysis
-        async with aclosing(self.wait_events(self._revalidate_analysis(analysis), "复核分析证据")) as events:
+        async with aclosing(self.wait_events(
+            self._revalidate_analysis(analysis, stop_reason=reason), "复核分析证据",
+        )) as events:
             async for event in events:
                 yield event
         complete = analysis.finished and all(
@@ -687,7 +713,6 @@ class AgentLoop:
         text = f"{'分析完成' if complete else '分析部分交付'}：{notice}\n\n{analysis.summary()}\n\n仅作静态检查，未运行项目代码。"
         messages.append({"role": "assistant", "content": [{"type": "text", "text": text}]})
         yield LoopEvent(type="text_delta", text=text)
-        await self.emit(EventType.STOP, stop_reason=reason)
         yield LoopEvent(type="done", text=text, data={"stop_reason": reason,
                                                         "analysis_status": "complete" if complete else "partial"})
 
