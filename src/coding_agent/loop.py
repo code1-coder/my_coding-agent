@@ -59,6 +59,7 @@ _MAX_REPEATED_TOOL_FAILURES = 3
 ANALYSIS_READ_TOOLS = frozenset({"read_file", "search_code", "code_outline"})
 _ANALYSIS_CHECKPOINT = "analysis_checkpoint"
 _ANALYSIS_DIMENSIONS = {"role": "职责", "flow": "调用关系", "usage": "入口与用法", "limits": "生命周期与边界"}
+ANALYSIS_DIMENSION_IDS = tuple(_ANALYSIS_DIMENSIONS)
 _ANALYSIS_BATCHES = 8
 _ANALYSIS_BATCH_SIZE = 4
 _ANALYSIS_NO_PROGRESS = 2
@@ -67,6 +68,19 @@ _ANALYSIS_MAX_RESULT_CHARS = 30_000
 
 def _analysis_display(value: str, limit: int) -> str:
     return "".join(char if char.isprintable() else " " for char in value[:limit]).strip()
+
+
+def resolve_analysis_dimensions(analysis: bool, dimensions: object = None) -> tuple[str, ...] | None:
+    """只校验用户入口提供的结构化范围，不从对话或工具调用推断范围。"""
+    if dimensions is None:
+        return ANALYSIS_DIMENSION_IDS if analysis else None
+    if not analysis:
+        raise ValueError("只有静态分析模式可以选择分析维度。")
+    if (not isinstance(dimensions, (list, tuple)) or not 1 <= len(dimensions) <= len(ANALYSIS_DIMENSION_IDS)
+            or any(not isinstance(item, str) or item not in _ANALYSIS_DIMENSIONS for item in dimensions)
+            or len(set(dimensions)) != len(dimensions)):
+        raise ValueError("请选择至少一个不重复的分析维度：" + "、".join(ANALYSIS_DIMENSION_IDS) + "。")
+    return tuple(dimensions)
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -107,10 +121,10 @@ class AnalysisEvidence:
 
 @dataclass
 class AnalysisProgress:
-    """只保存本轮已提交的证据引用和模型归纳，不复制源码或授权。"""
+    """保存本轮用户选定的必查维度、证据引用和阶段结论。"""
 
     goal: str
-    dimensions: tuple[str, ...] = tuple(_ANALYSIS_DIMENSIONS)
+    dimensions: tuple[str, ...] = ANALYSIS_DIMENSION_IDS
     evidence: dict[str, AnalysisEvidence] = field(default_factory=dict)
     findings: dict[str, tuple[str, str, tuple[str, ...]]] = field(default_factory=dict)
     review_gaps: dict[str, str] = field(default_factory=dict)
@@ -118,31 +132,19 @@ class AnalysisProgress:
     stalled: int = 0
     stalled_controls: int = 0
     revision: int = 0
-    planned: bool = False
     finished: bool = False
     versions: dict[str, str] = field(default_factory=dict)
 
     def register(self, registry: ToolRegistry) -> None:
         registry.register(
             name=_ANALYSIS_CHECKPOINT,
-            description=("提交本轮分析检查点。action=plan 时可用 dimensions 缩小明确指定的范围；"
+            description=("提交本轮分析检查点。必查维度由用户入口确定，工具不能更改；"
                          "record 记录一个 dimension、finding 及 read_file 的 evidence_ids，或用 blocked=true 记录缺口；"
                          "finish 仅在要求的维度都有记录后使用。每次单独调用。"),
         )(self.checkpoint)
 
-    async def checkpoint(self, action: str, dimensions: list[str] | None = None,
-                         dimension: str = "", finding: str = "", evidence_ids: list[str] | None = None,
+    async def checkpoint(self, action: str, dimension: str = "", finding: str = "", evidence_ids: list[str] | None = None,
                          blocked: bool = False) -> str:
-        if action == "plan":
-            if (self.planned or self.batches or self.findings or not isinstance(dimensions, list)
-                    or not 1 <= len(dimensions) <= len(_ANALYSIS_DIMENSIONS)
-                    or any(not isinstance(item, str) or item not in _ANALYSIS_DIMENSIONS for item in dimensions)
-                    or len(set(dimensions)) != len(dimensions)):
-                raise ValueError("只能在读取前设置一次分析维度。")
-            self.dimensions = tuple(dimensions)
-            self.planned = True
-            self.revision += 1
-            return "已设置本轮分析范围。"
         if action == "finish":
             if not all(item in self.findings for item in self.dimensions):
                 raise ValueError("还有未记录的分析维度；无证据时请说明具体阻塞。")
@@ -185,7 +187,7 @@ class AnalysisProgress:
         return "\n".join(f"- {self.describe(item)}" for item in self.dimensions)
 
     def view(self) -> str:
-        return json.dumps({"goal": self.goal, "checks": self.summary(),
+        return json.dumps({"goal": self.goal, "required_dimensions": self.dimensions, "checks": self.summary(),
                            "evidence": {ref: item.label for ref, item in self.evidence.items()},
                            "reading_batches_left": _ANALYSIS_BATCHES - self.batches}, ensure_ascii=False)
 
@@ -567,9 +569,13 @@ class AgentLoop:
         controls = [index for index, block in enumerate(blocks) if block["name"] == _ANALYSIS_CHECKPOINT]
         if len(controls) == 1:
             position = controls[0]
+            arguments = blocks[position].get("input")
+            if isinstance(arguments, dict) and arguments.get("action") == "plan":
+                rejected = dict.fromkeys(range(len(blocks)), "检查点须单独提交，本批未执行。")
+                rejected[position] = "模型不能更改必查维度，请按本轮分析状态记录结论或缺口。"
+                return rejected, False
             if len(blocks) == 1:
                 return {}, False
-            arguments = blocks[position].get("input")
             if isinstance(arguments, dict) and arguments.get("action") == "finish":
                 return {index: "收尾请求同批不执行其他工具。" for index in range(len(blocks))
                         if index != position}, False

@@ -496,12 +496,21 @@ async function send(recoveryId = null) {
   const prompt = $('prompt-input').value.trim();
   if ((!prompt && !recoveryId) || state.sending) return;
   const mode = $('analysis-mode').checked ? 'analysis' : 'default';
+  const payload = recoveryId ? { recovery_id: recoveryId } : { prompt, mode };
+  if (!recoveryId && mode === 'analysis') {
+    payload.analysis_dimensions = [...$('analysis-dimensions').querySelectorAll('input:checked')].map(input => input.value);
+    if (!payload.analysis_dimensions.length) {
+      toast('请选择至少一个必查维度。');
+      return;
+    }
+  }
   const readyButtons = document.querySelectorAll('.retry-request:not(:disabled)');
   readyButtons.forEach(button => { button.disabled = true; });
   state.sending = true;
   state.controller = new AbortController();
   $('send-btn').disabled = true;
   $('analysis-mode').disabled = true;
+  $('analysis-dimensions').disabled = true;
   $('stop-btn').hidden = false;
   if (!recoveryId) $('prompt-input').value = '';
   openAssistant();
@@ -523,7 +532,6 @@ async function send(recoveryId = null) {
     }
   };
   try {
-    const payload = recoveryId ? { recovery_id: recoveryId } : { prompt, mode };
     const response = await fetch(recoveryId ? '/chat/retry' : '/chat', {
       ...jsonOptions('POST', { ...payload, session_id: sessionId }), signal: state.controller.signal,
     });
@@ -532,6 +540,10 @@ async function send(recoveryId = null) {
       streamFailed = true;
       appendMessage('system', error?.detail || '聊天请求失败（' + response.status + '）', 'error');
       return;
+    }
+    // 选择只用于这次新请求；续接使用服务端的原检查点。
+    if (payload.analysis_dimensions) {
+      $('analysis-dimensions').querySelectorAll('input').forEach(input => { input.checked = true; });
     }
     document.querySelectorAll('.retry-request').forEach(button => button.remove());
     const reader = response.body.getReader();
@@ -558,6 +570,7 @@ async function send(recoveryId = null) {
     readyButtons.forEach(button => { button.disabled = false; });
     $('send-btn').disabled = false;
     $('analysis-mode').disabled = false;
+    $('analysis-dimensions').disabled = false;
     $('stop-btn').hidden = true;
     setAgentState(streamFailed ? '本轮已结束' : '准备就绪');
     await refreshWorkspace(true);
@@ -606,6 +619,10 @@ $('task-form').addEventListener('submit', createTask);
 $('task-search').addEventListener('input', renderTasks);
 $('memory-search').addEventListener('input', renderMemories);
 $('send-btn').addEventListener('click', () => send());
+$('analysis-dimensions').hidden = !$('analysis-mode').checked;
+$('analysis-mode').addEventListener('change', event => {
+  $('analysis-dimensions').hidden = !event.currentTarget.checked;
+});
 $('stop-btn').addEventListener('click', () => state.controller?.abort());
 $('prompt-input').addEventListener('keydown', event => {
   if (event.key === 'Enter' && !event.shiftKey && !event.isComposing) { event.preventDefault(); send(); }

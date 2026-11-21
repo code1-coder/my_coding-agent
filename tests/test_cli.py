@@ -203,13 +203,13 @@ def provider(monkeypatch, tmp_path):
 @pytest.mark.parametrize("args, commands", [(["chat"], "/analyze 只解释入口\nexit\n"),
                                            (["run", "--analysis", "只解释入口"], None)])
 def test_cli_static_analysis_uses_shared_checkpoints(tmp_path, monkeypatch, args, commands):
-    from test_runtime import ScriptedProvider, tool_response
+    from test_runtime import ScriptedProvider, text_response, tool_response
 
     provider = ScriptedProvider([
-        tool_response("analysis_checkpoint", {"action": "plan", "dimensions": ["usage"]}, "plan"),
         tool_response("analysis_checkpoint", {"action": "record", "dimension": "usage", "blocked": True,
                                              "finding": "没有找到入口。"}, "record"),
         tool_response("analysis_checkpoint", {"action": "finish"}, "finish"),
+        text_response(),
     ])
     monkeypatch.setattr(main, "load_config", lambda _: Config(workdir=str(tmp_path)))
     monkeypatch.setattr(main, "_build_provider", lambda _: provider)
@@ -218,6 +218,38 @@ def test_cli_static_analysis_uses_shared_checkpoints(tmp_path, monkeypatch, args
     assert "[分析检查点]" in result.output
     assert "分析部分交付" in result.output and "没有找到入口" in result.output
     assert not list((tmp_path / ".memory").iterdir())
+
+
+@pytest.mark.parametrize("args, commands", [
+    (["run", "--analysis", "检查职责、调用关系、入口用法和生命周期"], None),
+    (["chat"], "/analyze --dimensions role 检查职责\nexit\n"),
+    (["run", "--analysis", "--analysis-dimension", "role", "检查职责"], None),
+])
+def test_cli_analysis_scope_is_set_by_user(tmp_path, monkeypatch, args, commands):
+    from test_runtime import single_role_analysis_provider
+
+    (tmp_path / "entry.py").write_text("def start(): pass\n", encoding="utf-8")
+    monkeypatch.setattr(main, "load_config", lambda _: Config(workdir=str(tmp_path)))
+    monkeypatch.setattr(main, "_build_provider", lambda _: single_role_analysis_provider())
+    result = CliRunner().invoke(main.cli, args, input=commands)
+
+    assert result.exit_code == 0, result.exception
+    assert "模型不能更改必查维度" in result.output
+    explicit = commands is not None or "--analysis-dimension" in args
+    assert ("分析完成" if explicit else "分析部分交付") in result.output
+    assert "提供入口函数" in result.output
+    assert ("调用关系：未确认" in result.output) == (not explicit)
+
+
+def test_cli_rejects_invalid_dimensions_before_model_call(provider):
+    runner = CliRunner()
+    result = runner.invoke(main.cli, ["run", "--analysis-dimension", "role", "检查职责"])
+    assert result.exit_code == 2
+    assert "只有静态分析模式可以选择分析维度" in result.output
+    result = runner.invoke(main.cli, ["chat"], input="/analyze --dimensions role,role 检查职责\nexit\n")
+    assert result.exit_code == 0
+    assert "不重复的分析维度" in result.output
+    assert not provider.history
 
 
 def test_chat_preserves_loop_and_history_across_turns(provider):

@@ -71,7 +71,20 @@
       </div>
       <div class="activity-panel" id="activity-panel" role="tabpanel" aria-labelledby="activity-tab" hidden><div class="panel-caption"><span>工具执行时间线</span><span>当前页面</span></div><div id="activity-list"><div class="simple-empty" id="activity-empty"><i data-icon="workflow"></i><h3>每一步，都有迹可循</h3><p>助手调用工具后，执行过程会显示在这里。</p></div></div></div>
       <div class="approval-tray" id="approval-tray" aria-label="待审批操作" aria-live="polite" hidden></div>
-      <div class="composer-wrap"><div class="composer"><label class="sr-only" for="prompt-input">向 AI 描述你的任务</label><textarea id="prompt-input" rows="3" placeholder="描述任务，或问我任何项目问题…"></textarea><div class="composer-bottom"><label class="composer-context" title="只检查源码，不执行项目代码或修改文件"><input type="checkbox" id="analysis-mode">静态分析</label><div class="composer-buttons"><button class="icon-button stop-button" id="stop-btn" aria-label="停止生成" title="停止生成" hidden><i data-icon="square"></i></button><button id="send-btn" class="send-button" aria-label="发送" title="发送"><i data-icon="arrow-up"></i></button></div></div></div><div class="composer-hint"><span>Enter 发送 · Shift + Enter 换行</span><span id="usage-label" title="包含记忆提取与上下文摘要的用量">上下文就绪</span></div></div>
+      <div class="composer-wrap">
+        <div class="composer">
+          <label class="sr-only" for="prompt-input">向 AI 描述你的任务</label><textarea id="prompt-input" rows="3" placeholder="描述任务，或问我任何项目问题…"></textarea>
+          <fieldset id="analysis-dimensions" hidden>
+            <legend>必查维度</legend>
+            <label class="composer-context"><input type="checkbox" value="role" checked>职责</label>
+            <label class="composer-context"><input type="checkbox" value="flow" checked>调用关系</label>
+            <label class="composer-context"><input type="checkbox" value="usage" checked>入口与用法</label>
+            <label class="composer-context"><input type="checkbox" value="limits" checked>生命周期与边界</label>
+          </fieldset>
+          <div class="composer-bottom"><label class="composer-context" title="只检查源码，不执行项目代码或修改文件"><input type="checkbox" id="analysis-mode">静态分析</label><div class="composer-buttons"><button class="icon-button stop-button" id="stop-btn" aria-label="停止生成" title="停止生成" hidden><i data-icon="square"></i></button><button id="send-btn" class="send-button" aria-label="发送" title="发送"><i data-icon="arrow-up"></i></button></div></div>
+        </div>
+        <div class="composer-hint"><span>Enter 发送 · Shift + Enter 换行</span><span id="usage-label" title="包含记忆提取与上下文摘要的用量">上下文就绪</span></div>
+      </div>
       <div class="model-footer"><span class="status-dot purple"></span><span id="model-name">读取模型配置…</span><span class="model-local">本地工作空间</span></div>
     </aside>
   </div>

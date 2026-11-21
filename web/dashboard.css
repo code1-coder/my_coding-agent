@@ -256,6 +256,8 @@ input::placeholder, textarea::placeholder { color: #828599; }
 .composer textarea:focus-visible { border: 0; }
 .composer-bottom { display: flex; align-items: center; justify-content: space-between; padding-top: 4px; }
 .composer-context { display: flex; align-items: center; gap: 5px; color: var(--dim); font-size: 10px; }
+#analysis-dimensions { display: flex; flex-wrap: wrap; gap: 4px 10px; min-width: 0; margin: 4px 0; padding: 4px 6px; border: 1px solid var(--line); border-radius: 5px; }
+#analysis-dimensions legend { color: var(--muted); font-size: 10px; padding: 0 4px; }
 .composer-context svg { width: 12px; height: 12px; }
 .composer-buttons { display: flex; align-items: center; gap: 7px; }
 .send-button { display: grid; place-items: center; width: 31px; height: 31px; background: #b49df4; color: #28183d; border-radius: 7px; }

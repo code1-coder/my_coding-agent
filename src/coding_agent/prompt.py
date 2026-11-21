@@ -77,8 +77,9 @@ def assemble_system_prompt(context: dict[str, Any]) -> str:
     )
     if context.get("analysis"):
         sections.append(
-            "当前为静态分析模式。默认维度：role（职责）、flow（调用关系）、usage（入口与用法）、"
-            "limits（生命周期与边界）。只有用户明确缩小范围时才在读取前用 analysis_checkpoint(action=plan) 设置维度。"
+            "当前为静态分析模式。分析状态中的 required_dimensions 是本轮必查范围："
+            "role（职责）、flow（调用关系）、usage（入口与用法）、limits（生命周期与边界）中的选定项。"
+            "检查顺序和读取范围可自行安排，必查维度只能由用户入口设定。"
             "使用内置读取工具，每批最多四个，优先分段读源码。避免重复读取，禁止执行项目代码或修改文件。"
             "搜索和提纲用于定位，确认结论时请引用 read_file 返回的源码证据 ID。"
             "根据请求附带的证据 ID，单独调用 analysis_checkpoint(action=record, dimension, finding, evidence_ids) "

@@ -14,7 +14,7 @@ import httpx
 import openai
 
 from coding_agent.config import Config, load_config
-from coding_agent.loop import LoopEvent
+from coding_agent.loop import ANALYSIS_DIMENSION_IDS, LoopEvent, resolve_analysis_dimensions
 from coding_agent.providers.base import LLMProvider, ModelRequestError
 from coding_agent.runtime import AgentRuntime, RetryUnavailable, build_provider
 from coding_agent.security.permission import create_terminal_pipeline
@@ -196,13 +196,14 @@ def _print_event(event: LoopEvent, *, color: bool = True) -> None:
 
 
 async def _run_agent_loop(prompt: str, cfg: Config, *, stream: bool = True, color: bool = True,
-                          analysis: bool = False) -> str:
+                          analysis: bool = False, analysis_dimensions: tuple[str, ...] | None = None) -> str:
     """单次任务也经过完整运行流程，并在退出前释放队友和客户端。"""
     runtime, _ = _create_runtime(cfg)
     final = ""
     failure = None
     async with runtime:
-        async with aclosing(runtime.run_turn(prompt, stream=stream, analysis=analysis)) as events:
+        async with aclosing(runtime.run_turn(prompt, stream=stream, analysis=analysis,
+                                             analysis_dimensions=analysis_dimensions)) as events:
             async for event in events:
                 if event.type == "error":
                     failure = event.text
@@ -263,10 +264,23 @@ async def _chat_session(cfg: Config) -> None:
                 if query.strip() == "/retry":
                     operation = runtime.retry_turn()
                 elif words[0] == "/analyze":
-                    if len(words) == 1:
-                        click.echo("用法：/analyze <问题>", err=True)
+                    prompt = words[1] if len(words) == 2 else ""
+                    dimensions = None
+                    args = prompt.split(maxsplit=2)
+                    if args and args[0] == "--dimensions":
+                        if len(args) != 3:
+                            click.echo("用法：/analyze --dimensions role,flow <问题>", err=True)
+                            continue
+                        try:
+                            dimensions = resolve_analysis_dimensions(True, args[1].split(","))
+                        except ValueError as exc:
+                            click.echo(str(exc), err=True)
+                            continue
+                        prompt = args[2]
+                    if not prompt:
+                        click.echo("用法：/analyze [--dimensions role,flow] <问题>", err=True)
                         continue
-                    operation = runtime.run_turn(words[1], analysis=True)
+                    operation = runtime.run_turn(prompt, analysis=True, analysis_dimensions=dimensions)
                 else:
                     operation = runtime.run_turn(query)
                 async with aclosing(operation) as events:
@@ -282,11 +296,18 @@ async def _chat_session(cfg: Config) -> None:
 @cli.command()
 @click.argument("prompt")
 @click.option("--analysis", is_flag=True, help="只做静态源码分析，不执行项目代码或修改文件。")
+@click.option("--analysis-dimension", "dimensions", type=click.Choice(ANALYSIS_DIMENSION_IDS), multiple=True,
+              help="指定必查维度，可重复使用；省略时检查全部维度。")
 @click.pass_context
-def run(ctx, prompt, analysis):
+def run(ctx, prompt, analysis, dimensions):
     """执行单次提示词任务后退出。"""
     try:
-        final = asyncio.run(_run_agent_loop(prompt, ctx.obj["cfg"], stream=True, analysis=analysis))
+        scope = resolve_analysis_dimensions(analysis, dimensions or None)
+    except ValueError as exc:
+        raise click.BadParameter(str(exc), param_hint="--analysis-dimension") from exc
+    try:
+        final = asyncio.run(_run_agent_loop(prompt, ctx.obj["cfg"], stream=True, analysis=analysis,
+                                           analysis_dimensions=scope))
     except REQUEST_ERRORS as exc:
         raise click.ClickException(f"模型请求失败：{exc}") from exc
     if not final.endswith("\n"):

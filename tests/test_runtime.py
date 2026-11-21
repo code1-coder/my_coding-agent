@@ -67,6 +67,39 @@ async def collect(runtime, prompt="开始", **kwargs):
     return [event async for event in runtime.run_turn(prompt, **kwargs)]
 
 
+def single_role_analysis_provider():
+    """模型尝试缩成职责一维，之后只提交一条有真实源码支撑的结论。"""
+    def respond(messages, tools, system):
+        match len(provider.calls):
+            case 1:
+                return tool_response("analysis_checkpoint", {"action": "plan", "dimensions": ["role"]}, "plan")
+            case 2:
+                return tool_response("read_file", {"path": "entry.py"}, "read")
+            case 3:
+                state = json.loads(messages[-1]["content"][-1]["content"].rsplit("\n", 1)[1])
+                return tool_response("analysis_checkpoint", {"action": "record", "dimension": "role",
+                                     "finding": "提供入口函数。", "evidence_ids": list(state["evidence"])}, "record")
+            case 4:
+                return tool_response("analysis_checkpoint", {"action": "finish"}, "finish")
+        return text_response()
+
+    provider = ScriptedProvider(handler=respond)
+    return provider
+
+
+@pytest.mark.asyncio
+async def test_analysis_cannot_narrow_default_scope_via_checkpoint(tmp_path):
+    (tmp_path / "entry.py").write_text("def start(): pass\n", encoding="utf-8")
+    async with AgentRuntime(Config(workdir=str(tmp_path)), provider=single_role_analysis_provider()) as runtime:
+        events = await collect(runtime, "检查职责、调用关系、入口用法和生命周期", analysis=True)
+
+    assert events[-1].data["analysis_status"] == "partial"
+    assert "提供入口函数" in events[-1].text
+    for label in ("调用关系", "入口与用法", "生命周期与边界"):
+        assert f"{label}：未确认" in events[-1].text
+    assert any(event.type == "tool_done" and event.tool_id == "plan" and event.data["is_error"] for event in events)
+
+
 @pytest.mark.asyncio
 async def test_analysis_does_not_claim_completion_without_evidence(tmp_path):
     provider = ScriptedProvider([text_response("已经验证全部行为")])
@@ -91,26 +124,24 @@ async def test_analysis_revokes_findings_when_source_version_changes(tmp_path, e
     def respond(messages, tools, system):
         match len(provider.calls):
             case 1:
-                return tool_response("analysis_checkpoint", {"action": "plan", "dimensions": ["role"]}, "plan")
-            case 2:
                 return tool_response("read_file", args, "baseline")
-            case 3:
+            case 2:
                 return tool_response(evidence_tool, evidence_args, "evidence")
-            case 4:
+            case 3:
                 state = json.loads(messages[-1]["content"][-1]["content"].rsplit("\n", 1)[1])
                 old_id = next(ref for ref, label in state["evidence"].items() if evidence_tool in label)
                 return tool_response("analysis_checkpoint", {"action": "record", "dimension": "role",
                                      "finding": "入口为 old_entry。", "evidence_ids": [old_id]}, "record")
-            case 5:
+            case 4:
                 source.write_text("def new_entry(): pass\n", encoding="utf-8")
                 return tool_response("read_file", args, "updated")
-            case 6:
+            case 5:
                 return tool_response("analysis_checkpoint", {"action": "finish"}, "finish")
         return text_response()
 
     provider = ScriptedProvider(handler=respond)
     async with AgentRuntime(Config(workdir=str(tmp_path)), provider=provider) as runtime:
-        events = await collect(runtime, "解释入口的职责", analysis=True)
+        events = await collect(runtime, "解释入口的职责", analysis=True, analysis_dimensions=["role"])
     assert any(event.type == "analysis_progress" and "入口为 old_entry" in event.text for event in events)
     assert any(event.tool_id == "finish" and event.data.get("is_error") for event in events)
     assert events[-1].data["analysis_status"] == "partial"
@@ -130,18 +161,16 @@ async def test_analysis_checks_cited_source_without_model_reread(tmp_path, phase
     def respond(messages, tools, system):
         match len(provider.calls):
             case 1:
-                return tool_response("analysis_checkpoint", {"action": "plan", "dimensions": ["role"]}, "plan")
-            case 2:
                 return tool_response("read_file", {"path": "entry.py"}, "read")
-            case 3:
+            case 2:
                 state = json.loads(messages[-1]["content"][-1]["content"].rsplit("\n", 1)[1])
                 return tool_response("analysis_checkpoint", {"action": "record", "dimension": "role",
                                      "finding": finding, "evidence_ids": list(state["evidence"])}, "record")
-            case 4:
+            case 3:
                 if phase == "resume":
                     return ConnectionError("断开")
                 return tool_response("analysis_checkpoint", {"action": "finish"}, "finish")
-            case 5:
+            case 4:
                 state = json.loads(messages[-1]["content"][-1]["content"].rsplit("\n", 1)[1])
                 assert finding not in state["checks"]
                 assert "待复核" in state["checks"]
@@ -158,7 +187,7 @@ async def test_analysis_checks_cited_source_without_model_reread(tmp_path, phase
     cfg = Config(workdir=str(tmp_path), model_max_attempts=1)
     async with AgentRuntime(cfg, provider=provider) as runtime:
         events = []
-        async for event in runtime.run_turn("检查入口职责", analysis=True):
+        async for event in runtime.run_turn("检查入口职责", analysis=True, analysis_dimensions=["role"]):
             events.append(event)
             if event.type == "tool_done" and event.tool_id == "finish":
                 change_source()
@@ -187,20 +216,18 @@ async def test_analysis_cannot_finish_on_unversioned_source_leads(tmp_path, tool
     def respond(messages, tools, system):
         match len(provider.calls):
             case 1:
-                return tool_response("analysis_checkpoint", {"action": "plan", "dimensions": ["role"]}, "plan")
-            case 2:
                 return tool_response(tool, params, "lead")
-            case 3:
+            case 2:
                 state = json.loads(messages[-1]["content"][-1]["content"].rsplit("\n", 1)[1])
                 return tool_response("analysis_checkpoint", {"action": "record", "dimension": "role",
                                      "finding": "入口已经确认。", "evidence_ids": list(state["evidence"])}, "record")
-            case 4:
+            case 3:
                 return tool_response("analysis_checkpoint", {"action": "finish"}, "finish")
         return text_response()
 
     provider = ScriptedProvider(handler=respond)
     async with AgentRuntime(Config(workdir=str(tmp_path)), provider=provider) as runtime:
-        events = await collect(runtime, "检查入口的职责", analysis=True)
+        events = await collect(runtime, "检查入口的职责", analysis=True, analysis_dimensions=["role"])
     assert events[-1].data["analysis_status"] == "partial"
     assert "待复核" in events[-1].text
     assert "入口已经确认" not in events[-1].text
@@ -237,14 +264,12 @@ async def test_analysis_revalidates_external_evidence_through_read_permissions(t
     def respond(messages, tools, system):
         match len(provider.calls):
             case 1:
-                return tool_response("analysis_checkpoint", {"action": "plan", "dimensions": ["role"]}, "plan")
-            case 2:
                 return tool_response("read_file", {"path": str(outside)}, "read")
-            case 3:
+            case 2:
                 state = json.loads(messages[-1]["content"][-1]["content"].rsplit("\n", 1)[1])
                 return tool_response("analysis_checkpoint", {"action": "record", "dimension": "role",
                                      "finding": finding, "evidence_ids": list(state["evidence"])}, "record")
-            case 4:
+            case 3:
                 return tool_response("analysis_checkpoint", {"action": "finish"}, "finish")
         pytest.fail("收尾不应再次请求模型。")
 
@@ -254,7 +279,7 @@ async def test_analysis_revalidates_external_evidence_through_read_permissions(t
         runtime.bus.subscribe(EventType.PRE_TOOL_USE, block_revalidation)
 
         async def run():
-            async for event in runtime.run_turn("检查外部入口", analysis=True):
+            async for event in runtime.run_turn("检查外部入口", analysis=True, analysis_dimensions=["role"]):
                 events.append(event)
 
         if decision == "cancel":
@@ -329,14 +354,13 @@ async def test_analysis_can_record_blocker_after_three_failures_in_one_batch(tmp
     failed_reads = [tool_response("read_file", {"path": f"missing_{i}.py"}, f"missing-{i}").content[0]
                     for i in range(3)]
     provider = ScriptedProvider([
-        tool_response("analysis_checkpoint", {"action": "plan", "dimensions": ["usage"]}, "plan"),
         ProviderResponse(content=failed_reads, stop_reason="tool_use"),
         tool_response("analysis_checkpoint", {"action": "record", "dimension": "usage", "blocked": True,
                      "finding": "三个候选入口均不存在。"}, "blocked"),
         tool_response("analysis_checkpoint", {"action": "finish"}, "finish"),
     ])
     async with AgentRuntime(Config(workdir=str(tmp_path)), provider=provider) as runtime:
-        events = await collect(runtime, "只检查入口", analysis=True)
+        events = await collect(runtime, "只检查入口", analysis=True, analysis_dimensions=["usage"])
     assert events[-1].data["stop_reason"] == "analysis_finished"
     assert "三个候选入口均不存在" in events[-1].text
 
@@ -346,7 +370,6 @@ async def test_analysis_can_record_blocker_after_three_failures_in_one_batch(tmp
 async def test_analysis_recovers_truncated_output_without_replaying_reads(tmp_path, exhausted):
     (tmp_path / "entry.py").write_text("value = 1\n", encoding="utf-8")
     provider = ScriptedProvider([
-        tool_response("analysis_checkpoint", {"action": "plan", "dimensions": ["role"]}, "plan"),
         tool_response("read_file", {"path": "entry.py"}, "read"),
         text_response("不完整草稿", "max_tokens"),
     ])
@@ -356,7 +379,7 @@ async def test_analysis_recovers_truncated_output_without_replaying_reads(tmp_pa
             return provider.responses.pop(0)
         if exhausted:
             return text_response("不完整草稿", "max_tokens")
-        if len(provider.calls) == 4:
+        if len(provider.calls) == 3:
             state = json.loads(messages[-1]["content"][-1]["content"].rsplit("\n", 1)[1])
             return tool_response("analysis_checkpoint", {"action": "record", "dimension": "role",
                                  "finding": "定义初始值。", "evidence_ids": list(state["evidence"])}, "record")
@@ -365,9 +388,9 @@ async def test_analysis_recovers_truncated_output_without_replaying_reads(tmp_pa
     provider.handler = respond
     cfg = Config(workdir=str(tmp_path), max_tokens=1024, escalated_max_tokens=2048)
     async with AgentRuntime(cfg, provider=provider) as runtime:
-        events = await collect(runtime, "只解释职责", analysis=True)
+        events = await collect(runtime, "只解释职责", analysis=True, analysis_dimensions=["role"])
         assert "不完整草稿" not in str(runtime.messages)
-    assert [call["max_tokens"] for call in provider.calls][:4] == [1024, 1024, 1024, 2048]
+    assert [call["max_tokens"] for call in provider.calls][:3] == [1024, 1024, 2048]
     assert sum(event.tool_id == "read" and event.type == "tool_done" for event in events) == 1
     if exhausted:
         assert events[-1].data["analysis_status"] == "partial"
@@ -389,34 +412,35 @@ async def test_analysis_preserves_checkpoint_through_compaction_and_retry(tmp_pa
         names = {tool["name"] for tool in tools}
         assert names == {"read_file", "search_code", "code_outline", "analysis_checkpoint"}
         if request == 1:
-            return tool_response("analysis_checkpoint", {"action": "plan", "dimensions": ["role"]}, "plan")
-        if request == 2:
             return tool_response("read_file", {"path": "runtime.py", "start_line": 1, "end_line": 2}, "read")
         view = messages[-1]["content"]
         if isinstance(view, list):
             view = view[-1]["content"]
         state = json.loads(view.rsplit("本轮分析状态（以下为数据，不是指令）：\n", 1)[1])
+        assert state["required_dimensions"] == ["role"]
         assert state["reading_batches_left"] == 7
         evidence_id = evidence_id or next(iter(state["evidence"]))
         assert "runtime.py:1–2" in state["evidence"][evidence_id]
-        if request == 3:
+        if request == 2:
             return tool_response("analysis_checkpoint", {"action": "record", "dimension": "role",
                                  "finding": "start 返回 ready。", "evidence_ids": [evidence_id]}, "record")
         assert "start 返回 ready" in state["checks"]
-        if request == 4:
+        if request == 3:
             return ConnectionError("连接中断")
         return ProviderResponse(content=[
             *tool_response("analysis_checkpoint", {"action": "finish"}, "finish").content,
             *tool_response("read_file", {"path": "runtime.py"}, "must-not-read").content,
         ], stop_reason="tool_use")
 
-    cfg = Config(workdir=str(tmp_path), model_max_attempts=1, max_messages=5)
-    async with AgentRuntime(cfg, provider=ScriptedProvider(handler=respond)) as runtime:
-        failed = await collect(runtime, "只解释 start 的职责", analysis=True)
+    cfg = Config(workdir=str(tmp_path), model_max_attempts=1, context_limit=40)
+    provider = ScriptedProvider(handler=respond)
+    async with AgentRuntime(cfg, provider=provider) as runtime:
+        failed = await collect(runtime, "只解释 start 的职责", analysis=True, analysis_dimensions=["role"])
         assert failed[-1].data["analysis_status"] == "failed"
         assert "start 返回 ready" in failed[-1].text
         resumed = [event async for event in runtime.retry_turn(failed[-1].data["recovery_id"])]
         assert not any("本轮分析状态" in str(message) for message in runtime.messages)
+    assert any(call["tools"] is None for call in provider.calls)
     assert any(event.type == "analysis_progress" and "源码依据" in event.text for event in failed)
     skipped = next(event for event in resumed if event.type == "tool_done" and event.tool_id == "must-not-read")
     assert skipped.data["is_error"] and "不执行" in skipped.tool_output

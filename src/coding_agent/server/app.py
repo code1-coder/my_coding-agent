@@ -19,6 +19,7 @@ from pydantic import BaseModel, ConfigDict, Field, StrictStr
 from coding_agent.agents.tasks import TaskBoard
 from coding_agent.config import load_config
 from coding_agent.hooks.bus import EventType
+from coding_agent.loop import resolve_analysis_dimensions
 from coding_agent.memory import MemoryStore
 from coding_agent.runtime import AgentRuntime, RetryUnavailable, build_provider
 
@@ -289,7 +290,15 @@ async def chat(request: Request):
     mode = body.get("mode", "default")
     if mode not in ("default", "analysis"):
         raise HTTPException(422, "mode 必须是 default 或 analysis")
-    return _chat_response(session_id, prompt=prompt, analysis=mode == "analysis")
+    analysis = mode == "analysis"
+    dimensions = body.get("analysis_dimensions")
+    if "analysis_dimensions" in body and not isinstance(dimensions, list):
+        raise HTTPException(422, "analysis_dimensions 必须是数组")
+    try:
+        scope = resolve_analysis_dimensions(analysis, dimensions)
+    except ValueError as exc:
+        raise HTTPException(422, str(exc)) from exc
+    return _chat_response(session_id, prompt=prompt, analysis=analysis, analysis_dimensions=scope)
 
 
 @app.post("/chat/retry")
@@ -314,6 +323,7 @@ async def retry_chat(request: Request):
 
 
 def _chat_response(session_id: str, *, prompt: str = "", analysis: bool = False,
+                   analysis_dimensions: tuple[str, ...] | None = None,
                    retry: tuple[AgentRuntime, str] | None = None):
     async def event_stream() -> AsyncIterator[str]:
         queue: asyncio.Queue = asyncio.Queue()
@@ -325,7 +335,7 @@ def _chat_response(session_id: str, *, prompt: str = "", analysis: bool = False,
             try:
                 if retry is None:
                     runtime = await _get_runtime(session_id)
-                    operation = runtime.run_turn(prompt, analysis=analysis)
+                    operation = runtime.run_turn(prompt, analysis=analysis, analysis_dimensions=analysis_dimensions)
                 else:
                     runtime, recovery_id = retry
                     operation = runtime.retry_turn(recovery_id)

@@ -19,7 +19,9 @@ from coding_agent.config import Config, validate_config
 from coding_agent.context.compaction import CompactionPipeline, internal_context_message
 from coding_agent.context.recovery import RecoveryManager, RecoveryState, RetryBudget, with_retry
 from coding_agent.hooks.bus import Event, EventBus, EventType, OutputTruncateHook, TokenUsageHook
-from coding_agent.loop import ANALYSIS_READ_TOOLS, AgentLoop, AnalysisProgress, LoopEvent, TurnProgress
+from coding_agent.loop import (
+    ANALYSIS_READ_TOOLS, AgentLoop, AnalysisProgress, LoopEvent, TurnProgress, resolve_analysis_dimensions,
+)
 from coding_agent.memory import MemoryStore
 from coding_agent.prompt import get_system_prompt
 from coding_agent.providers import AnthropicProvider, OpenAICompatProvider
@@ -263,8 +265,10 @@ class AgentRuntime:
             )},
         })
 
-    async def run_turn(self, prompt: str, *, stream: bool = True, analysis: bool = False) -> AsyncIterator[LoopEvent]:
+    async def run_turn(self, prompt: str, *, stream: bool = True, analysis: bool = False,
+                       analysis_dimensions: list[str] | tuple[str, ...] | None = None) -> AsyncIterator[LoopEvent]:
         """处理一轮输入；记忆在压缩前保留用户原文，完成保存后才报告 done。"""
+        dimensions = resolve_analysis_dimensions(analysis, analysis_dimensions)
         await self.start()
         async with self.turn_lock:
             blocked = await self.emit(EventType.USER_PROMPT_SUBMIT, prompt=prompt)
@@ -272,8 +276,9 @@ class AgentRuntime:
                 raise PermissionError(f"用户输入被 Hook 阻止：{blocked}")
             self._checkpoint = None
             self.messages.append({"role": "user", "content": prompt})
-            async with aclosing(self._execute_turn(prompt, stream=stream,
-                                                   analysis=AnalysisProgress(prompt[:1200]) if analysis else None)) as events:
+            # 续接直接复用本轮检查点中的必查范围，不再解释历史消息或模型输出。
+            progress = AnalysisProgress(prompt[:1200], dimensions=dimensions) if dimensions is not None else None
+            async with aclosing(self._execute_turn(prompt, stream=stream, analysis=progress)) as events:
                 async for event in events:
                     yield event
 

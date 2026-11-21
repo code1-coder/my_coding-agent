@@ -12,7 +12,7 @@ import coding_agent.server.app as server
 from coding_agent.config import Config
 from coding_agent.memory import MemoryStore
 from coding_agent.providers.base import ModelRequestError
-from test_runtime import ScriptedProvider, text_response, tool_response
+from test_runtime import ScriptedProvider, single_role_analysis_provider, text_response, tool_response
 
 
 def decode_events(response):
@@ -110,10 +110,10 @@ def test_web_reports_model_errors_and_cleans_up(configured_server, monkeypatch, 
 
 def test_web_analysis_emits_checkpoints_and_partial_terminal(configured_server, monkeypatch):
     provider = ScriptedProvider([
-        tool_response("analysis_checkpoint", {"action": "plan", "dimensions": ["usage"]}, "plan"),
         tool_response("analysis_checkpoint", {"action": "record", "dimension": "usage", "blocked": True,
                                              "finding": "没有读到入口文件。"}, "blocked"),
         tool_response("analysis_checkpoint", {"action": "finish"}, "finish"),
+        text_response(),
     ])
     monkeypatch.setattr(server, "_get_provider", lambda _: provider)
     with TestClient(server.app) as client:
@@ -122,6 +122,31 @@ def test_web_analysis_emits_checkpoints_and_partial_terminal(configured_server, 
     assert any(event["type"] == "analysis_progress" and "没有读到入口文件" in event["text"] for event in events)
     assert events[-1]["type"] == "done"
     assert events[-1]["analysis_status"] == "partial"
+
+
+@pytest.mark.parametrize("scope, status", [({}, "partial"), ({"analysis_dimensions": ["role"]}, "complete")])
+def test_web_analysis_scope_is_set_by_request(configured_server, tmp_path, monkeypatch, scope, status):
+    (tmp_path / "entry.py").write_text("def start(): pass\n", encoding="utf-8")
+    monkeypatch.setattr(server, "_get_provider", lambda _: single_role_analysis_provider())
+    prompt = "检查职责" if scope else "检查职责、调用关系、入口用法和生命周期"
+    with TestClient(server.app) as client:
+        response = client.post("/chat", json={"prompt": prompt, "mode": "analysis", **scope})
+        assert response.status_code == 200
+        events = decode_events(response)
+    assert any(event["type"] == "tool_done" and event["tool_id"] == "plan" and event["is_error"] for event in events)
+    assert events[-1]["type"] == "done" and events[-1]["analysis_status"] == status
+    assert "提供入口函数" in events[-1]["text"]
+    assert ("调用关系：未确认" in events[-1]["text"]) == (status == "partial")
+
+
+def test_web_rejects_invalid_analysis_scope_before_creating_runtime(configured_server):
+    _, providers = configured_server
+    with TestClient(server.app) as client:
+        for invalid in ([], ["role", "role"], ["unknown"], [True], "role", None):
+            assert client.post("/chat", json={"prompt": "检查", "mode": "analysis",
+                                             "analysis_dimensions": invalid}).status_code == 422
+        assert client.post("/chat", json={"prompt": "检查", "analysis_dimensions": ["role"]}).status_code == 422
+    assert not providers
 
 
 def test_web_resume_rejects_other_sessions_and_consumed_ids(configured_server, monkeypatch):
