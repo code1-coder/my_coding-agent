@@ -141,6 +141,66 @@ async def test_bash_stops_real_process_tree(tmp_path, mode):
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("cancel_during_cleanup, confirm", [(True, True), (True, False), (False, False)])
+async def test_bash_preserves_cancellation_during_timeout_cleanup(tmp_path, monkeypatch, cancel_during_cleanup, confirm):
+    waiting = asyncio.Event()
+    release = asyncio.Event()
+    wait = asyncio.subprocess.Process.wait
+
+    async def delayed_wait(process):
+        exit_code = await wait(process)
+        waiting.set()
+        await release.wait()
+        if not confirm:
+            raise OSError("Process wait confirmation unavailable")
+        return exit_code
+
+    monkeypatch.setattr(asyncio.subprocess.Process, "wait", delayed_wait)
+    script = tmp_path / "long_running.py"
+    script.write_text(
+        "import os, pathlib, time\n"
+        "pathlib.Path('command.pid').write_text(str(os.getpid()))\n"
+        "print('command started', flush=True)\n"
+        "time.sleep(30)\n", encoding="utf-8",
+    )
+    registry = ToolRegistry()
+    registry.register_tool(BashTool(tmp_path, timeout_seconds=2))
+    task = asyncio.create_task(registry.dispatch("bash", {"command": f'"{sys.executable}" "{script}"'}))
+    try:
+        # 命令只会在超时终止后进入回收等待。暂停确认，稳定地在该窗口取消。
+        await asyncio.wait_for(waiting.wait(), 10)
+        pid = int((tmp_path / "command.pid").read_text())
+        if cancel_during_cleanup:
+            assert task.cancel()
+            await asyncio.sleep(0)
+            assert task.cancel()
+            await asyncio.sleep(0)
+            assert not task.done()
+            release.set()
+            with pytest.raises(asyncio.CancelledError) as cancelled:
+                await asyncio.wait_for(task, 10)
+            assert task.cancelled()
+            result = cancelled.value.result
+        else:
+            release.set()
+            result = await asyncio.wait_for(task, 10)
+
+        assert result.execution["timed_out"] is True
+        assert result.execution["cancelled"] is confirm
+        assert result.execution["termination_confirmed"] is confirm
+        assert result.execution["failure_stage"] == ("cancelled" if confirm else "cleanup")
+        assert result.execution["stdout"].strip() == "command started"
+        assert not _process_running(pid)
+        if not confirm:
+            assert "Process wait confirmation unavailable" in result.error
+    finally:
+        release.set()
+        if not task.done():
+            task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+
+
+@pytest.mark.asyncio
 async def test_bash_cancel_during_process_creation(tmp_path, monkeypatch):
     factory_name = "create_subprocess_exec"
     original = getattr(asyncio, factory_name)

@@ -66,7 +66,7 @@ requirements.txt 与 pyproject.toml 同时声明 ripgrep-bin；前者包含 UTF-
 
 验证时既运行相关回归，也在临时 Git 仓库中通过真实 PATH 隐藏 rg，直接调用 SearchCodeTool，核对路径、行号、忽略规则和 backend，再恢复 PATH 检查 rg 恢复。临时探针和生成内容不要加入仓库。
 
-BashTool 的异步入口直接管理子进程。取消时先终止进程树、回收输出和进程，再传播取消异常；工具结束事件中的 cancelled=true、termination_confirmed=true 表示终止已确认，failure_stage=cancelled。超时也使用相同清理流程。清理失败时 termination_confirmed=false、cancelled=false，failure_stage 为 cleanup 或 supervision，不将取消请求已收到当作进程已停止；启动前失败时 termination_confirmed=null。同步 execute 复用相同执行逻辑，异步调用方应使用 aexecute，避免阻塞事件循环。
+BashTool 的异步入口直接管理子进程。取消时先终止进程树、回收输出和进程，再传播取消异常。工具结束事件中的 cancelled=true、termination_confirmed=true 表示终止已确认，failure_stage=cancelled。超时也使用相同清理流程。超时清理期间收到取消请求时，清理结束后仍传播取消异常，并在结果中保留 timed_out=true。清理失败时 termination_confirmed=false、cancelled=false，failure_stage 为 cleanup 或 supervision，已收到的取消请求仍以取消异常向上传递。启动前失败时 termination_confirmed=null。同步 execute 复用相同执行逻辑，异步调用方应使用 aexecute，避免阻塞事件循环。
 
 网页停止当前对话时保留 SSE 连接。界面先显示「正在停止」，再用同一 execution_id 的工具结束事件显示「已确认终止」或「终止未确认」。一次对话结束也可能包含终止未确认的工具。HTTP 客户端可在 /chat 或 /chat/retry 的请求体传入 stop_confirmation=true，从首个 chat_started 事件取得本次请求专用的 stop_id，再向 /chat/{stop_id}/stop 提交原 session_id。HTTP 202 只表示停止请求已接收，实际结果由原流中的 tool_done 和 chat_stopped 事件送达。
 

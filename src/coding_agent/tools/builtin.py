@@ -185,6 +185,9 @@ class BashTool(Tool):
         stderr = bytearray()
         output_size = 0
         cancellation_requested = False
+        timed_out = False
+        cleanup_error: OSError | RuntimeError | None = None
+        failure: ToolResult | None = None
 
         async def drain(stream, target):
             nonlocal output_size
@@ -249,8 +252,8 @@ class BashTool(Tool):
             if job is not None:
                 await asyncio.wait_for(job.wait(), timeout=5)
 
-        async def finish_cleanup():
-            cleaning = asyncio.create_task(cleanup())
+        async def finish_cleanup(cleaning: asyncio.Task[None]) -> None:
+            nonlocal cancellation_requested
             while True:
                 try:
                     await asyncio.shield(cleaning)
@@ -258,7 +261,19 @@ class BashTool(Tool):
                 except asyncio.CancelledError:
                     if cleaning.cancelled():
                         raise
-                    continue
+                    # 清理期间可能收到新的停止请求，回收完成后仍需向调用方传播。
+                    cancellation_requested = True
+
+        async def release_resources() -> None:
+            if reading is not None and not reading.done():
+                reading.cancel()
+                await asyncio.gather(reading, return_exceptions=True)
+            if job is not None:
+                try:
+                    job.stop()
+                    await asyncio.wait_for(job.wait(), timeout=5)
+                finally:
+                    job.close()
 
         def result(**status):
             return self._result(started, stdout.decode("utf-8", errors="replace").replace("\r\n", "\n").replace("\r", "\n"),
@@ -269,65 +284,43 @@ class BashTool(Tool):
             process = await asyncio.shield(spawning)
             reading = asyncio.create_task(collect())
             await asyncio.wait_for(asyncio.shield(reading), timeout=self._timeout_seconds)
-        except asyncio.CancelledError:
-            cancellation_requested = True
+        except (asyncio.CancelledError, TimeoutError) as exc:
+            timed_out = isinstance(exc, TimeoutError)
+            cancellation_requested = isinstance(exc, asyncio.CancelledError)
             try:
-                await finish_cleanup()
-            except Exception as exc:
-                raise ToolCancelledError(result(
-                    error=f"Error: Command cancellation cleanup unconfirmed: {exc}",
-                    failure_stage="cleanup", termination_confirmed=False)) from None
-            raise ToolCancelledError(result(error="Error: Command cancelled; process tree stopped",
-                                            cancelled=True, failure_stage="cancelled",
-                                            termination_confirmed=True)) from None
-        except TimeoutError:
-            try:
-                await finish_cleanup()
-            except Exception as exc:
-                return result(error=f"Error: Command timeout cleanup unconfirmed: {exc}",
-                              timed_out=True, failure_stage="cleanup", termination_confirmed=False)
-            return result(error=f"Error: Timeout ({self._timeout_seconds:g}s)",
-                          timed_out=True, failure_stage="timeout", termination_confirmed=True)
+                await finish_cleanup(asyncio.create_task(cleanup()))
+            except (OSError, RuntimeError) as exc:
+                cleanup_error = exc
         except RuntimeError as exc:
-            return result(error=f"Error: {exc}", failure_stage="supervision", termination_confirmed=False)
-        except (FileNotFoundError, OSError) as exc:
-            return result(error=f"Error: {exc}", failure_stage="supervision" if process else "startup",
-                          termination_confirmed=False if process else None)
+            failure = result(error=f"Error: {exc}", failure_stage="supervision", termination_confirmed=False)
+        except OSError as exc:
+            failure = result(error=f"Error: {exc}", failure_stage="supervision" if process else "startup",
+                             termination_confirmed=False if process else None)
         finally:
             if control is not None:
                 control.close()
-            if reading is not None and not reading.done():
-                reading.cancel()
-                await asyncio.gather(reading, return_exceptions=True)
-            if job is not None:
-                async def close_job():
-                    try:
-                        job.stop()
-                        await asyncio.wait_for(job.wait(), timeout=5)
-                    finally:
-                        job.close()
+            if job is not None or (reading is not None and not reading.done()):
+                try:
+                    await finish_cleanup(asyncio.create_task(release_resources()))
+                except (OSError, RuntimeError) as exc:
+                    cleanup_error = exc
 
-                closing = asyncio.create_task(close_job())
-                cancelled_during_close = False
-                while True:
-                    try:
-                        await asyncio.shield(closing)
-                        break
-                    except asyncio.CancelledError:
-                        cancelled_during_close = True
-                        if closing.cancelled():
-                            raise
-                        continue
-                    except Exception as exc:
-                        failure = result(error=f"Error: Command cleanup unconfirmed: {exc}",
-                                         failure_stage="cleanup", termination_confirmed=False)
-                        if cancelled_during_close or cancellation_requested:
-                            raise ToolCancelledError(failure) from None
-                        return failure
-                if cancelled_during_close:
-                    raise ToolCancelledError(result(error="Error: Command cancelled; process tree stopped",
-                                                    cancelled=True, failure_stage="cancelled",
-                                                    termination_confirmed=True)) from None
+        if cleanup_error is not None:
+            trigger = "cancellation " if cancellation_requested else "timeout " if timed_out else ""
+            failure = result(error=f"Error: Command {trigger}cleanup unconfirmed: {cleanup_error}",
+                             timed_out=timed_out, failure_stage="cleanup", termination_confirmed=False)
+        elif cancellation_requested:
+            failure = result(error="Error: Command cancelled; process tree stopped",
+                             timed_out=timed_out, cancelled=True, failure_stage="cancelled",
+                             termination_confirmed=True)
+
+        if failure is not None:
+            if cancellation_requested:
+                raise ToolCancelledError(failure) from cleanup_error
+            return failure
+        if timed_out:
+            return result(error=f"Error: Timeout ({self._timeout_seconds:g}s)",
+                          timed_out=True, failure_stage="timeout", termination_confirmed=True)
 
         exit_code = tree_status["exit_code"] if tree_status else process.returncode
         error = f"Error: Command exited with code {exit_code}" if exit_code != 0 else None
