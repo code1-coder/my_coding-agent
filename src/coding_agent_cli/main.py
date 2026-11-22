@@ -141,7 +141,10 @@ def _print_event(event: LoopEvent, *, color: bool = True) -> None:
                 click.echo("  " + detail)
         else:
             click.echo("\n" + heading + (" " + details[0] if details else ""))
-    elif event.type == "tool_done" and (event.data.get("is_error") or event.tool_output.startswith("Error:")):
+    elif event.type == "tool_done" and (
+        event.data.get("is_error") is True
+        or ("is_error" not in event.data and event.tool_output.startswith("Error:"))
+    ):
         label = f"[工具失败] {_terminal_text(event.tool_name)}"
         details = _tool_summary(event.tool_name, event.data.get("input"))
         if details:

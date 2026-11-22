@@ -76,18 +76,19 @@ def test_tool_display_escapes_control_characters_and_preserves_path(capsys):
     assert "\x1b" not in output
 
 
-@pytest.mark.parametrize("is_error", [True, False])
-def test_tool_failure_shows_path_and_escapes_error(capsys, is_error):
-    main._print_event(main.LoopEvent(type="tool_done", tool_name="read_file", tool_output="Error: missing\nfile",
-                                   data={"input": {"path": "missing.py"}, "is_error": is_error}))
-    assert capsys.readouterr().err == "[工具失败] read_file missing.py: Error: missing\\nfile\n"
+@pytest.mark.parametrize("status, message", [({"is_error": True}, "missing"), ({}, "Error: missing")],
+                         ids=["structured", "legacy"])
+def test_tool_failure_shows_path_and_escapes_error(capsys, status, message):
+    main._print_event(main.LoopEvent(type="tool_done", tool_name="read_file", tool_output=f"{message}\nfile",
+                                   data={"input": {"path": "missing.py"}, **status}))
+    assert capsys.readouterr().err == f"[工具失败] read_file missing.py: {message}\\nfile\n"
 
 
-@pytest.mark.parametrize("is_error", [True, False])
-def test_bash_failure_shows_command_and_escapes_error(capsys, is_error):
+@pytest.mark.parametrize("status", [{"is_error": True}, {}], ids=["structured", "legacy"])
+def test_bash_failure_shows_command_and_escapes_error(capsys, status):
     command = 'python "中文 空格/script.py"'
     main._print_event(main.LoopEvent(type="tool_done", tool_name="bash", tool_output="Error: failed\ncommand",
-                                   data={"input": {"command": command}, "is_error": is_error}), color=False)
+                                   data={"input": {"command": command}, **status}), color=False)
     assert capsys.readouterr().err == f"[工具失败] bash {command}: Error: failed\\ncommand\n"
 
 
@@ -381,6 +382,35 @@ def test_chat_searches_external_directory_after_terminal_confirmation(tmp_path, 
     assert observed_results[0]["results"][0]["path"] == source.as_posix()
     assert observed_results[0]["results"][0]["line"] == 2
     assert provider.closed
+
+
+@pytest.mark.parametrize("exit_code", [0, 7])
+def test_cli_uses_real_shell_exit_status_for_error_prefixed_output(tmp_path, monkeypatch, exit_code):
+    from test_runtime import ScriptedProvider, text_response, tool_response
+
+    command = f'"{sys.executable}" -c "import sys; print(\'Error: diagnostic\'); sys.exit({exit_code})"'
+    provider = ScriptedProvider([
+        tool_response("bash", {"command": command}),
+        text_response("命令已执行。"),
+    ])
+    monkeypatch.setattr(main, "load_config", lambda _: Config(workdir=str(tmp_path)))
+    monkeypatch.setattr(main, "_build_provider", lambda _: provider)
+
+    result = CliRunner().invoke(main.cli, ["run", "执行命令并报告结果"])
+
+    assert result.exit_code == 0, result.exception
+    tool_result = provider.calls[1]["messages"][-1]["content"][0]
+    execution = json.loads(tool_result["content"])
+    assert execution["exit_code"] == exit_code
+    assert execution["stdout"].strip() == "Error: diagnostic"
+    assert tool_result.get("is_error", False) is (exit_code != 0)
+    if exit_code == 0:
+        assert "[bash 完成] 退出码: 0" in result.stdout
+        assert "[工具失败]" not in result.stderr
+    else:
+        assert "[工具失败] bash" in result.stderr
+        assert "[退出码: 7]" in result.stderr
+        assert "[bash 完成]" not in result.stdout
 
 
 @pytest.mark.parametrize("mode", ["run", "chat", "limit"])
