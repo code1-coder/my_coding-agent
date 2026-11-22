@@ -72,6 +72,34 @@ def test_web_delivers_result_after_real_file_write(configured_server, tmp_path, 
         assert server.sessions["delivery"][-1]["content"][0]["text"] == visible
 
 
+@pytest.mark.skipif(sys.platform != "win32", reason="Windows Selector 事件循环不支持子进程")
+def test_web_reports_shell_startup_failure_with_windows_selector_loop(configured_server, monkeypatch):
+    provider = ScriptedProvider([
+        tool_response("bash", {"command": "echo bash-ok"}), text_response("完成"),
+    ])
+    monkeypatch.setattr(server, "_get_provider", lambda _: provider)
+
+    async def request_chat():
+        async with server.lifespan(server.app):
+            async with httpx.AsyncClient(
+                transport=httpx.ASGITransport(app=server.app), base_url="http://test",
+            ) as client:
+                return await client.post("/chat", json={"prompt": "检查 Shell", "session_id": "selector"})
+
+    with asyncio.Runner(loop_factory=asyncio.SelectorEventLoop) as runner:
+        response = runner.run(request_chat())
+
+    assert response.status_code == 200
+    result = next(event for event in decode_events(response) if event["type"] == "tool_done")
+    assert result["is_error"] is True
+    assert result["execution"]["failure_stage"] == "startup"
+    assert result["execution"]["termination_confirmed"] is None
+    assert result["execution"]["exit_code"] is None
+    assert result["execution"]["stdout"] == ""
+    assert "SelectorEventLoop" in result["output"]
+    assert "--reload" in result["output"]
+
+
 def test_web_uses_skills_memory_context_hooks_and_task_board(configured_server, tmp_path, monkeypatch):
     cfg, providers = configured_server
     cfg.context_limit = 50

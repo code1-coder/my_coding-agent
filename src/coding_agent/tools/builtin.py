@@ -148,6 +148,12 @@ class BashTool(Tool):
         if os.name != "nt" and sys.platform != "linux":
             return self._result(started, error="Error: Verified Shell process-tree cleanup requires Linux or Windows",
                                 failure_stage="startup")
+        if os.name == "nt" and isinstance(asyncio.get_running_loop(), asyncio.SelectorEventLoop):
+            # Windows 的 Selector 循环无法创建 asyncio 子进程，命令在此处尚未启动。
+            return self._result(started, failure_stage="startup", error=(
+                "Error: Windows SelectorEventLoop cannot launch Shell subprocesses. "
+                "Restart Uvicorn with --loop asyncio --workers 1 and omit --reload."
+            ))
 
         options = ({"creationflags": subprocess.CREATE_NEW_PROCESS_GROUP} if os.name == "nt"
                    else {"start_new_session": True})
