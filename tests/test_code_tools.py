@@ -393,6 +393,24 @@ def test_bash_preserves_exit_code_and_output(tmp_path):
     assert result.to_dict()["is_error"] is True
 
 
+@pytest.mark.skipif(os.name != "nt", reason="Windows native exit codes")
+@pytest.mark.parametrize("exit_code", [0x80000000, 0xC0000005, 0xFFFFFFFF], ids=lambda code: f"{code:#010x}")
+def test_bash_preserves_windows_native_exit_code(tmp_path, exit_code):
+    script = f"import ctypes; ctypes.windll.kernel32.ExitProcess(ctypes.c_uint32({exit_code}))"
+    command = f'"{sys.executable}" -c "{script}"'
+    direct = subprocess.run(command, shell=True, cwd=tmp_path, timeout=10)
+    assert direct.returncode == exit_code
+
+    result = BashTool(tmp_path, timeout_seconds=10).execute(command)
+
+    assert result.execution["exit_code"] == direct.returncode
+    assert result.execution["failure_stage"] == "nonzero_exit"
+    assert result.execution["termination_confirmed"] is True
+    tool_result = result.to_dict()
+    assert tool_result["is_error"] is True
+    assert json.loads(tool_result["content"])["exit_code"] == exit_code
+
+
 def test_bash_success_has_zero_exit_code(tmp_path):
     result = BashTool(tmp_path).execute('python -c "print(42)"')
     assert result.error is None

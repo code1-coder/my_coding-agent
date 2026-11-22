@@ -148,10 +148,12 @@ class BashTool(Tool):
         async def spawn():
             nonlocal job, control
             if os.name == "nt":
+                # sys.exit 会把超出有符号 int 范围的退出码改写为 -1。
                 child = await asyncio.create_subprocess_exec(
                     sys.executable, "-c",
-                    "import subprocess,sys; sys.stdin.buffer.read(1); "
-                    "sys.exit(subprocess.call(sys.argv[1], shell=True))", command,
+                    "import ctypes,subprocess,sys; sys.stdin.buffer.read(1); "
+                    "exit_code = subprocess.call(sys.argv[1], shell=True); "
+                    "ctypes.windll.kernel32.ExitProcess(ctypes.c_uint32(exit_code))", command,
                     cwd=str(self._workdir), stdin=asyncio.subprocess.PIPE,
                     stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE, **options,
                 )

@@ -68,6 +68,8 @@ requirements.txt 与 pyproject.toml 同时声明 ripgrep-bin；前者包含 UTF-
 
 BashTool 的异步入口直接管理子进程。取消时先终止进程树、回收输出和进程，再传播取消异常。工具结束事件中的 cancelled=true、termination_confirmed=true 表示终止已确认，failure_stage=cancelled。超时也使用相同清理流程。超时清理期间收到取消请求时，清理结束后仍传播取消异常，并在结果中保留 timed_out=true。清理失败时 termination_confirmed=false、cancelled=false，failure_stage 为 cleanup 或 supervision，已收到的取消请求仍以取消异常向上传递。启动前失败时 termination_confirmed=null。同步 execute 复用相同执行逻辑，异步调用方应使用 aexecute，避免阻塞事件循环。
 
+Windows 的 exit_code 以无符号 32 位整数保留原生退出状态，例如 0xC0000005 对应 3221225477。非零退出码仍标记为工具失败。
+
 网页停止当前对话时保留 SSE 连接。界面先显示「正在停止」，再用同一 execution_id 的工具结束事件显示「已确认终止」或「终止未确认」。一次对话结束也可能包含终止未确认的工具。HTTP 客户端可在 /chat 或 /chat/retry 的请求体传入 stop_confirmation=true，从首个 chat_started 事件取得本次请求专用的 stop_id，再向 /chat/{stop_id}/stop 提交原 session_id。HTTP 202 只表示停止请求已接收，实际结果由原流中的 tool_done 和 chat_stopped 事件送达。
 
 Windows 将执行进程绑定到 Job Object 后才放行命令，并查询 Job 的 ActiveProcesses=0 确认退出。Linux 使用独立监督进程，在启动 Shell 前设置 child subreaper；取消时逐轮终止其直接子进程并接管、回收孤儿后代，包括 setsid 和双重 fork 后代。只有 waitpid 确认不存在任何待回收子进程，且监督进程退出，才通过独立控制通道确认终止；stdout/stderr EOF 和 Shell 主进程退出均不能作为进程树已退出的依据。正常运行时，Windows 和 Linux 均等待后代结束，因此关闭输出的后台任务仍受命令超时约束，并可继续取消。该机制用于管理普通命令后代，不构成对抗恶意命令或系统服务代启动的安全隔离。其他 Unix 平台当前缺少同等终止确认机制，会在启动前明确返回不支持，不能视为已经通过跨 Unix 验收。
