@@ -7,7 +7,7 @@ import json
 import logging
 import uuid
 from contextlib import aclosing, asynccontextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, AsyncIterator, Literal
 
@@ -39,7 +39,16 @@ class PendingApproval:
     future: asyncio.Future
 
 
+@dataclass
+class ActiveChat:
+    session_id: str
+    task: asyncio.Task
+    stopping: bool = False
+    pending_tools: dict[str, dict[str, Any] | None] = field(default_factory=dict)
+
+
 pending_approvals: dict[str, PendingApproval] = {}
+_active_chats: dict[str, ActiveChat] = {}
 
 
 @asynccontextmanager
@@ -55,6 +64,7 @@ async def lifespan(app: FastAPI):
         runtimes.clear()
         sessions.clear()
         pending_approvals.clear()
+        _active_chats.clear()
         _subscribers.clear()
         _session_locks.clear()
         _workspace_locks.clear()
@@ -134,7 +144,7 @@ async def _get_runtime(session_id: str) -> AgentRuntime:
         runtime.bus.subscribe(EventType.PRE_TOOL_USE, notify_tool, priority=90)
 
         async def notify_tool_done(event):
-            await _broadcast_ws({
+            payload = {
                 "session_id": session_id, "type": "tool_done",
                 "tool_id": event.data.get("tool_id", ""),
                 "execution_id": event.data.get("execution_id", ""),
@@ -143,7 +153,13 @@ async def _get_runtime(session_id: str) -> AgentRuntime:
                 "output": str(event.data.get("output", ""))[:4000],
                 "is_error": bool(event.data.get("error")),
                 "execution": event.data.get("execution", {}),
-            })
+            }
+            # 取消时 AgentLoop 会发布结果，但不会继续产出本轮的迭代事件。
+            # 只为认领了该 execution_id 的对话保留结果，避免混入后台队友的事件。
+            for active in _active_chats.values():
+                if active.session_id == session_id and payload["execution_id"] in active.pending_tools:
+                    active.pending_tools[payload["execution_id"]] = payload
+            await _broadcast_ws(payload)
 
         runtime.bus.subscribe(EventType.POST_TOOL_USE, notify_tool_done, priority=90)
         try:
@@ -298,7 +314,8 @@ async def chat(request: Request):
         scope = resolve_analysis_dimensions(analysis, dimensions)
     except ValueError as exc:
         raise HTTPException(422, str(exc)) from exc
-    return _chat_response(session_id, prompt=prompt, analysis=analysis, analysis_dimensions=scope)
+    return _chat_response(session_id, prompt=prompt, analysis=analysis, analysis_dimensions=scope,
+                          stop_confirmation=body.get("stop_confirmation") is True)
 
 
 @app.post("/chat/retry")
@@ -319,20 +336,42 @@ async def retry_chat(request: Request):
         runtime.check_retry(recovery_id)
     except RetryUnavailable as exc:
         raise HTTPException(409, str(exc)) from exc
-    return _chat_response(session_id, retry=(runtime, recovery_id))
+    return _chat_response(session_id, retry=(runtime, recovery_id),
+                          stop_confirmation=body.get("stop_confirmation") is True)
+
+
+class StopChatRequest(BaseModel):
+    session_id: StrictStr = Field(min_length=1, max_length=200)
+
+
+@app.post("/chat/{stop_id}/stop", status_code=202)
+async def stop_chat(stop_id: str, body: StopChatRequest):
+    active = _active_chats.get(stop_id)
+    if active is None or active.task.done():
+        raise HTTPException(404, "对话已结束或不存在")
+    if active.session_id != body.session_id:
+        raise HTTPException(403, "对话不属于当前会话")
+    if not active.stopping:
+        active.stopping = True
+        active.task.cancel()
+    return {"status": "stopping"}
 
 
 def _chat_response(session_id: str, *, prompt: str = "", analysis: bool = False,
                    analysis_dimensions: tuple[str, ...] | None = None,
-                   retry: tuple[AgentRuntime, str] | None = None):
+                   retry: tuple[AgentRuntime, str] | None = None, stop_confirmation: bool = False):
     async def event_stream() -> AsyncIterator[str]:
         queue: asyncio.Queue = asyncio.Queue()
         sentinel = object()
         subscribers = _subscribers.setdefault(session_id, set())
         subscribers.add(queue)
+        stop_id = uuid.uuid4().hex if stop_confirmation else None
+        active = None
 
         async def produce():
             try:
+                if stop_id is not None:
+                    queue.put_nowait({"type": "chat_started", "stop_id": stop_id})
                 if retry is None:
                     runtime = await _get_runtime(session_id)
                     operation = runtime.run_turn(prompt, analysis=analysis, analysis_dimensions=analysis_dimensions)
@@ -349,7 +388,22 @@ def _chat_response(session_id: str, *, prompt: str = "", analysis: bool = False,
                         if event.tool_name:
                             payload.update(tool_name=event.tool_name, tool_id=event.tool_id,
                                            output=event.tool_output[:4000])
+                        if active is not None:
+                            if event.type == "tool_start":
+                                active.pending_tools[event.data["execution_id"]] = None
+                            elif event.type == "tool_done":
+                                active.pending_tools.pop(event.data["execution_id"], None)
                         queue.put_nowait(payload)
+            except asyncio.CancelledError:
+                if active is not None and active.stopping:
+                    unconfirmed = []
+                    for execution_id, result in active.pending_tools.items():
+                        if result is not None:
+                            queue.put_nowait(result)
+                        if result is None or result["execution"].get("termination_confirmed") is False:
+                            unconfirmed.append(execution_id)
+                    queue.put_nowait({"type": "chat_stopped", "unconfirmed_execution_ids": unconfirmed})
+                raise
             except (RetryUnavailable, PermissionError) as exc:
                 queue.put_nowait({"type": "error", "message": str(exc)})
             except Exception:
@@ -359,6 +413,8 @@ def _chat_response(session_id: str, *, prompt: str = "", analysis: bool = False,
                 queue.put_nowait(sentinel)
 
         task = asyncio.create_task(produce())
+        if stop_id is not None:
+            active = _active_chats[stop_id] = ActiveChat(session_id, task)
         try:
             while True:
                 payload = await queue.get()
@@ -367,9 +423,15 @@ def _chat_response(session_id: str, *, prompt: str = "", analysis: bool = False,
                 yield _sse_event(payload)
         finally:
             subscribers.discard(queue)
-            if not task.done():
-                task.cancel()
-            await asyncio.gather(task, return_exceptions=True)
+            if stop_id is not None:
+                _active_chats.pop(stop_id, None)
+            if active is not None and active.stopping:
+                # 原流断线时也不能再次取消显式停止已启动的清理。
+                await asyncio.shield(asyncio.gather(task, return_exceptions=True))
+            else:
+                if not task.done():
+                    task.cancel()
+                await asyncio.gather(task, return_exceptions=True)
 
     return StreamingResponse(event_stream(), media_type="text/event-stream",
                              headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})

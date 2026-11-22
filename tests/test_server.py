@@ -2,6 +2,7 @@
 
 import asyncio
 import json
+import sys
 from unittest.mock import AsyncMock
 
 import httpx
@@ -12,6 +13,7 @@ import coding_agent.server.app as server
 from coding_agent.config import Config
 from coding_agent.memory import MemoryStore
 from coding_agent.providers.base import ModelRequestError
+from test_code_tools import _process_running
 from test_runtime import ScriptedProvider, single_role_analysis_provider, text_response, tool_response
 
 
@@ -322,12 +324,14 @@ async def test_websocket_tool_events_only_reach_their_session(configured_server)
 
 
 @pytest.mark.asyncio
-async def test_cancelled_approval_cleans_up_and_next_turn_can_continue(configured_server, monkeypatch):
+@pytest.mark.parametrize("explicit_stop", [False, True])
+async def test_cancelled_approval_cleans_up_and_next_turn_can_continue(configured_server, monkeypatch, explicit_stop):
     provider = ScriptedProvider([
         tool_response("bash", {"command": "rm example.txt"}), text_response("恢复后完成"),
     ])
     monkeypatch.setattr(server, "_get_provider", lambda _: provider)
     waiting = asyncio.Event()
+    started = asyncio.Future()
     original_publish = server._publish
 
     async def publish(session, payload):
@@ -336,14 +340,124 @@ async def test_cancelled_approval_cleans_up_and_next_turn_can_continue(configure
         await original_publish(session, payload)
 
     monkeypatch.setattr(server, "_publish", publish)
+
+    async def app_with_event_observer(scope, receive, send):
+        async def observe(message):
+            body = message.get("body", b"")
+            if body.startswith(b"data: ") and not started.done():
+                event = json.loads(body[6:])
+                if event["type"] == "chat_started":
+                    started.set_result(event["stop_id"])
+            await send(message)
+
+        await server.app(scope, receive, observe)
+
     async with server.lifespan(server.app):
-        async with httpx.AsyncClient(transport=httpx.ASGITransport(app=server.app), base_url="http://test") as client:
-            request = asyncio.create_task(client.post("/chat", json={"prompt": "取消审批", "session_id": "cancel-test"}))
+        async with httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=app_with_event_observer), base_url="http://test",
+        ) as client:
+            request = asyncio.create_task(client.post("/chat", json={
+                "prompt": "取消审批", "session_id": "cancel-test", "stop_confirmation": explicit_stop,
+            }))
             await asyncio.wait_for(waiting.wait(), 2)
-            request.cancel()
-            await asyncio.gather(request, return_exceptions=True)
+            if explicit_stop:
+                stop_id = await asyncio.wait_for(started, 2)
+                response = await client.post(f"/chat/{stop_id}/stop", json={"session_id": "cancel-test"})
+                assert response.status_code == 202
+                events = decode_events(await asyncio.wait_for(request, 2))
+                assert events[-1]["type"] == "chat_stopped"
+                assert any(event["type"] == "approval_finished" for event in events)
+            else:
+                request.cancel()
+                await asyncio.gather(request, return_exceptions=True)
             assert not server.pending_approvals
             assert not server._subscribers["cancel-test"]
             assert server.sessions["cancel-test"][-1]["content"][0]["is_error"]
             response = await client.post("/chat", json={"prompt": "继续", "session_id": "cancel-test"})
             assert decode_events(response)[-1]["type"] == "done"
+
+
+@pytest.mark.skipif(sys.platform not in ("win32", "linux"), reason="需要受支持的 Shell 进程树管理")
+@pytest.mark.parametrize("confirmed", [
+    True,
+    pytest.param(False, marks=pytest.mark.skipif(sys.platform != "win32", reason="Windows Job 查询失败路径")),
+])
+async def test_web_stop_reports_real_process_tree_status(configured_server, tmp_path, monkeypatch, confirmed):
+    if not confirmed:
+        from coding_agent.tools.builtin import _WindowsProcessJob
+
+        async def unavailable(_job):
+            raise OSError("Job accounting unavailable")
+
+        monkeypatch.setattr(_WindowsProcessJob, "wait", unavailable)
+
+    script = tmp_path / "heartbeat.py"
+    script.write_text(
+        "import os, pathlib, subprocess, sys, time\n"
+        "role = sys.argv[1]\n"
+        "if role == 'parent': subprocess.Popen([sys.executable, __file__, 'child'])\n"
+        "pathlib.Path(role + '.pid').write_text(str(os.getpid()))\n"
+        "while True:\n"
+        "    with open(role + '.log', 'a') as stream: stream.write('tick\\n')\n"
+        "    time.sleep(0.02)\n", encoding="utf-8",
+    )
+    command = f'"{sys.executable}" "{script}" parent'
+    provider = ScriptedProvider([tool_response("bash", {"command": command}), text_response("继续成功")])
+    monkeypatch.setattr(server, "_get_provider", lambda _: provider)
+    first_events = asyncio.Queue()
+
+    async def app_with_event_observer(scope, receive, send):
+        async def observe(message):
+            body = message.get("body", b"")
+            if scope["path"] == "/chat" and body.startswith(b"data: "):
+                first_events.put_nowait(json.loads(body[6:]))
+            await send(message)
+
+        await server.app(scope, receive, observe)
+
+    async with server.lifespan(server.app):
+        async with httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=app_with_event_observer), base_url="http://test",
+        ) as client:
+            request = asyncio.create_task(client.post("/chat", json={
+                "prompt": "运行测试心跳", "session_id": "owner", "stop_confirmation": True,
+            }))
+            try:
+                async with asyncio.timeout(8):
+                    started = await first_events.get()
+                    assert started["type"] == "chat_started"
+                    while (tool := await first_events.get())["type"] != "tool_start":
+                        pass
+                    logs = [tmp_path / f"{role}.log" for role in ("parent", "child")]
+                    while not all(log.exists() and log.stat().st_size for log in logs):
+                        await asyncio.sleep(0.02)
+                pids = [int(log.with_suffix(".pid").read_text()) for log in logs]
+                assert all(_process_running(pid) for pid in pids)
+                url = "/chat/" + started["stop_id"] + "/stop"
+                assert (await client.post(url, json={"session_id": "other"})).status_code == 403
+                assert all(_process_running(pid) for pid in pids)
+                response = await client.post(url, json={"session_id": "owner"})
+                assert response.status_code == 202
+                assert response.json() == {"status": "stopping"}
+                events = decode_events(await asyncio.wait_for(request, 8))
+                assert events[-1]["type"] == "chat_stopped"
+                ended = next(event for event in events if event["type"] == "tool_done")
+                assert ended["execution_id"] == tool["execution_id"]
+                assert ended["execution"]["cancelled"] is confirmed
+                assert ended["execution"]["termination_confirmed"] is confirmed
+                assert events[-1]["unconfirmed_execution_ids"] == ([] if confirmed else [ended["execution_id"]])
+                assert not any(_process_running(pid) for pid in pids)
+                snapshots = [log.read_bytes() for log in logs]
+                await asyncio.sleep(0.2)
+                assert snapshots == [log.read_bytes() for log in logs]
+                stored = server.sessions["owner"][-1]["content"][0]
+                assert stored["tool_use_id"] == tool["tool_id"]
+                assert stored["is_error"] is True
+                assert json.loads(stored["content"])["termination_confirmed"] is confirmed
+                assert (await client.post(url, json={"session_id": "owner"})).status_code == 404
+                response = await client.post("/chat", json={"prompt": "继续", "session_id": "owner"})
+                assert decode_events(response)[-1]["text"] == "继续成功"
+            finally:
+                if not request.done():
+                    request.cancel()
+                await asyncio.gather(request, return_exceptions=True)

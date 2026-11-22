@@ -843,8 +843,10 @@ class AgentLoop:
         self, messages, blocks, execution_ids, round_results: dict[str, tuple[LoopEvent, str | None]],
         *, rejected: dict[int, str],
     ) -> AsyncIterator[LoopEvent]:
+        cancelled_results: dict[str, ToolResult] = {}
         tasks = [asyncio.create_task(self._execute_one(block, messages, execution_id=execution_id,
-                                                      rejection=rejected.get(index)))
+                                                      rejection=rejected.get(index),
+                                                      cancelled_results=cancelled_results))
                  for index, (block, execution_id) in enumerate(zip(blocks, execution_ids))]
         indexes = {task: index for index, task in enumerate(tasks)}
         pending = set(tasks)
@@ -881,9 +883,11 @@ class AgentLoop:
                 if not task.done():
                     task.cancel()
             outcomes = await asyncio.gather(*tasks, return_exceptions=True)
-            results = [outcome[0].to_dict() if isinstance(outcome, tuple) else
-                       tool_result(block["id"], error="本轮请求已中断，工具结果不可用。")
-                       for block, outcome in zip(blocks, outcomes)]
+            results = []
+            for block, execution_id, outcome in zip(blocks, execution_ids, outcomes):
+                result = outcome[0] if isinstance(outcome, tuple) else cancelled_results.get(execution_id)
+                results.append(result.to_dict() if result is not None else
+                               tool_result(block["id"], error="本轮请求已中断，工具结果不可用。"))
             messages.append({"role": "user", "content": results})
 
     async def _model_events(self, messages: list[dict[str, Any]], stream: bool, *, final_only: bool = False):
@@ -1188,7 +1192,8 @@ class AgentLoop:
         messages.append({"role": "user", "content": view})
 
     async def _execute_one(self, block: dict[str, Any], messages: list[dict[str, Any]],
-                           *, execution_id: str = "", rejection: str | None = None) -> tuple[ToolResult, str | None]:
+                           *, execution_id: str, rejection: str | None,
+                           cancelled_results: dict[str, ToolResult]) -> tuple[ToolResult, str | None]:
         """执行单个 tool_use 块，保留执行信息与原调用 ID。
 
         未注册的工具和执行异常均转换为错误结果，交由模型在后续轮次
@@ -1225,6 +1230,8 @@ class AgentLoop:
             cancellation = exc
             output, error = exc.result.content, exc.result.error
             execution = exc.result.execution
+            # gather 收到的是普通取消异常，须先保留进程树清理结果以配对原调用。
+            cancelled_results[execution_id] = ToolResult(tool_id, content=output, error=error, execution=execution)
         except Exception as exc:
             error = str(exc)
         if (not error and tool_name in ANALYSIS_READ_TOOLS

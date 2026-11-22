@@ -8,7 +8,7 @@ const sessionId = sessionStorage.getItem('coding-agent-session') || crypto.rando
 sessionStorage.setItem('coding-agent-session', sessionId);
 
 const state = {
-  tasks: [], workspace: null, filter: 'all', sending: false, controller: null,
+  tasks: [], workspace: null, filter: 'all', sending: false, chat: null,
   assistant: null, tools: new Map(), approvals: new Map(), refreshing: null,
   tasksSignature: '', workspaceSignature: '', wsConnected: false, httpReady: false,
   closing: false, ws: null, reconnect: null, poll: null,
@@ -335,7 +335,10 @@ function finishAssistant(node) {
 }
 
 function setAgentState(label, working = false) {
-  if ([...state.approvals.values()].some(entry => entry.state === 'pending')) {
+  if (state.chat?.stopping) {
+    label = '正在停止';
+    working = true;
+  } else if ([...state.approvals.values()].some(entry => entry.state === 'pending')) {
     label = '等待你的审批';
     working = true;
   }
@@ -367,14 +370,26 @@ function updateTool(data, finished = false) {
     activityCount();
   }
   if (finished) {
-    card.classList.add(data.is_error ? 'failed' : 'done');
-    card.querySelector('.tool-state').textContent = data.is_error ? '执行失败' : '已完成';
+    const stopped = data.execution?.cancelled === true && data.execution?.termination_confirmed === true;
+    const unconfirmed = data.execution?.termination_confirmed === false;
+    card.dataset.finished = 'true';
+    card.classList.toggle('failed', !stopped && (unconfirmed || data.is_error === true));
+    card.classList.toggle('done', stopped || (!unconfirmed && !data.is_error));
+    card.querySelector('.tool-state').textContent = stopped ? '已确认终止'
+      : unconfirmed ? '终止未确认' : data.is_error ? '执行失败' : '已完成';
     if (data.execution?.exit_code != null) {
       card.querySelector('.tool-state').textContent += ' · 退出码 ' + data.execution.exit_code;
     }
     card.querySelector('.details').textContent = data.execution && Object.keys(data.execution).length
       ? JSON.stringify({ ...data.execution, output: data.output }, null, 2)
       : data.output || '工具执行结束。';
+  }
+}
+
+function showPendingStop(executionIds, label) {
+  for (const id of executionIds) {
+    const card = state.tools.get(id);
+    if (card && !card.dataset.finished) card.querySelector('.tool-state').textContent = label;
   }
 }
 
@@ -491,6 +506,32 @@ function handleEvent(data) {
   scrollChat();
 }
 
+async function requestStop(chat) {
+  try {
+    const response = await fetch('/chat/' + encodeURIComponent(chat.stopId) + '/stop',
+      jsonOptions('POST', { session_id: sessionId }));
+    // 对话可能刚正常结束，由原事件流给出最终状态。
+    if (!response.ok && response.status !== 404) throw new Error('停止请求失败');
+  } catch (error) {
+    if (state.chat !== chat) return;
+    chat.stopping = false;
+    $('stop-btn').disabled = false;
+    showPendingStop(chat.pending, '执行中');
+    setAgentState('等待本轮结束', true);
+    appendMessage('system', '无法确认停止请求是否送达，可以重试。', 'error');
+  }
+}
+
+function stopChat() {
+  const chat = state.chat;
+  if (!chat || chat.stopping) return;
+  chat.stopping = true;
+  $('stop-btn').disabled = true;
+  setAgentState('正在停止', true);
+  showPendingStop(chat.pending, '正在停止');
+  if (chat.stopId) void requestStop(chat);
+}
+
 // 按完整 SSE 数据帧解析，正确保留跨网络分片的中文字符和未结束的帧。
 async function send(recoveryId = null) {
   const prompt = $('prompt-input').value.trim();
@@ -507,7 +548,8 @@ async function send(recoveryId = null) {
   const readyButtons = document.querySelectorAll('.retry-request:not(:disabled)');
   readyButtons.forEach(button => { button.disabled = true; });
   state.sending = true;
-  state.controller = new AbortController();
+  const chat = { controller: new AbortController(), stopId: null, stopping: false, pending: new Set() };
+  state.chat = chat;
   $('send-btn').disabled = true;
   $('analysis-mode').disabled = true;
   $('analysis-dimensions').disabled = true;
@@ -527,13 +569,28 @@ async function send(recoveryId = null) {
     if (data) {
       const event = JSON.parse(data);
       if (event.type === 'error') streamFailed = true;
-      if (event.type === 'done') receivedDone = true;
+      if (event.type === 'chat_started') {
+        chat.stopId = event.stop_id;
+        if (chat.stopping) void requestStop(chat);
+      } else if (event.type === 'tool_start') {
+        chat.pending.add(event.execution_id);
+      } else if (event.type === 'tool_done') {
+        chat.pending.delete(event.execution_id);
+      } else if (event.type === 'chat_stopped') {
+        receivedDone = true;
+        const unconfirmed = event.unconfirmed_execution_ids;
+        showPendingStop(unconfirmed, '终止未确认');
+        appendMessage('system', unconfirmed.length ? '本轮已取消，部分工具终止未确认。' : '本轮已取消。',
+          unconfirmed.length ? 'error' : '');
+      } else if (event.type === 'done') receivedDone = true;
       handleEvent(event);
+      if (event.type === 'tool_start' && chat.stopping) showPendingStop([event.execution_id], '正在停止');
     }
   };
   try {
     const response = await fetch(recoveryId ? '/chat/retry' : '/chat', {
-      ...jsonOptions('POST', { ...payload, session_id: sessionId }), signal: state.controller.signal,
+      ...jsonOptions('POST', { ...payload, session_id: sessionId, stop_confirmation: true }),
+      signal: chat.controller.signal,
     });
     if (!response.ok) {
       const error = await response.json().catch(() => null);
@@ -560,18 +617,22 @@ async function send(recoveryId = null) {
     if (!receivedDone && !streamFailed) throw new Error('响应提前中断，请重试或检查连接。');
   } catch (error) {
     streamFailed = true;
-    appendMessage('system', error.name === 'AbortError' ? '已停止本轮生成。' : '连接出现问题：' + error.message, error.name === 'AbortError' ? '' : 'error');
+    if (!state.closing) {
+      showPendingStop(chat.pending, '终止未确认');
+      appendMessage('system', '连接出现问题：' + error.message, 'error');
+    }
   } finally {
     // 后端分别结束每项审批；主对话结束不能移除后台队友仍在等待的审批。
     finishAssistant(assistant);
     state.assistant = null;
     state.sending = false;
-    state.controller = null;
+    state.chat = null;
     readyButtons.forEach(button => { button.disabled = false; });
     $('send-btn').disabled = false;
     $('analysis-mode').disabled = false;
     $('analysis-dimensions').disabled = false;
     $('stop-btn').hidden = true;
+    $('stop-btn').disabled = false;
     setAgentState(streamFailed ? '本轮已结束' : '准备就绪');
     await refreshWorkspace(true);
     scrollChat();
@@ -623,7 +684,7 @@ $('analysis-dimensions').hidden = !$('analysis-mode').checked;
 $('analysis-mode').addEventListener('change', event => {
   $('analysis-dimensions').hidden = !event.currentTarget.checked;
 });
-$('stop-btn').addEventListener('click', () => state.controller?.abort());
+$('stop-btn').addEventListener('click', stopChat);
 $('prompt-input').addEventListener('keydown', event => {
   if (event.key === 'Enter' && !event.shiftKey && !event.isComposing) { event.preventDefault(); send(); }
 });
@@ -654,7 +715,7 @@ window.addEventListener('pagehide', () => {
   state.closing = true;
   clearTimeout(state.reconnect);
   clearTimeout(state.poll);
-  state.controller?.abort();
+  state.chat?.controller.abort();
   state.ws?.close();
 });
 

@@ -11,7 +11,7 @@ CLI、网页、worker 和后台队友通过相同的 ToolRegistry 使用代码�
 
 同批工具会并发执行。存在依赖的修改、读取和测试应分成不同批次。
 
-每个工具完成后立即发送 tool_done，不再等待同批最慢的工具；写回模型的工具结果仍按调用顺序排列。取消或关闭本轮时会取消并回收批次中的异步任务，保留已完成结果，为未完成调用补充中断结果。同步线程工具仍受其自身取消能力限制，不把取消等待当作线程已停止。
+每个工具完成后立即发送 tool_done，不再等待同批最慢的工具；写回模型的工具结果仍按调用顺序排列。取消或关闭本轮时会取消并回收批次中的异步任务，保留已完成结果及工具提供的终止证据，为其余调用补充中断结果。同步线程工具仍受其自身取消能力限制，不把取消等待当作线程已停止。
 
 等待工具、模型、上下文整理和记忆处理时，默认每 10 秒报告当前阶段；工具等待提示包含尚未完成的名称和调用 ID。config.yaml 可设置 progress_interval（秒）。model_timeout 默认 900 秒，限制一次模型请求及其重试、恢复的硬总预算；model_idle_timeout 默认 120 秒，限制单次模型尝试没有模型协议或 HTTP 响应活动的连续空闲时间；model_connect_timeout 默认 20 秒，限制连接建立时间。最终答复使用独立的 final_answer_timeout（默认 30 秒），不与主请求总预算混淆。Anthropic 和 OpenAI 兼容 Provider 关闭 SDK 内部重试，由 RecoveryManager 负责有限重试；HTTP 429/529 保留各自的限流和备用模型策略，连接中断及其他可重试服务端错误有次数上限。maintenance_timeout 默认 30 秒，限制单次内部摘要或记忆请求连同重试的等待时间。这些超时都必须是有限正数。等待提示区分无活动空闲期限与硬总预算；持续活动可以超过空闲期限，但不能突破总预算。取消会传播，不自动重放已经执行的工具。
 
@@ -67,6 +67,8 @@ requirements.txt 与 pyproject.toml 同时声明 ripgrep-bin；前者包含 UTF-
 验证时既运行相关回归，也在临时 Git 仓库中通过真实 PATH 隐藏 rg，直接调用 SearchCodeTool，核对路径、行号、忽略规则和 backend，再恢复 PATH 检查 rg 恢复。临时探针和生成内容不要加入仓库。
 
 BashTool 的异步入口直接管理子进程。取消时先终止进程树、回收输出和进程，再传播取消异常；工具结束事件中的 cancelled=true、termination_confirmed=true 表示终止已确认，failure_stage=cancelled。超时也使用相同清理流程。清理失败时 termination_confirmed=false、cancelled=false，failure_stage 为 cleanup 或 supervision，不将取消请求已收到当作进程已停止；启动前失败时 termination_confirmed=null。同步 execute 复用相同执行逻辑，异步调用方应使用 aexecute，避免阻塞事件循环。
+
+网页停止当前对话时保留 SSE 连接。界面先显示「正在停止」，再用同一 execution_id 的工具结束事件显示「已确认终止」或「终止未确认」。一次对话结束也可能包含终止未确认的工具。HTTP 客户端可在 /chat 或 /chat/retry 的请求体传入 stop_confirmation=true，从首个 chat_started 事件取得本次请求专用的 stop_id，再向 /chat/{stop_id}/stop 提交原 session_id。HTTP 202 只表示停止请求已接收，实际结果由原流中的 tool_done 和 chat_stopped 事件送达。
 
 Windows 将执行进程绑定到 Job Object 后才放行命令，并查询 Job 的 ActiveProcesses=0 确认退出。Linux 使用独立监督进程，在启动 Shell 前设置 child subreaper；取消时逐轮终止其直接子进程并接管、回收孤儿后代，包括 setsid 和双重 fork 后代。只有 waitpid 确认不存在任何待回收子进程，且监督进程退出，才通过独立控制通道确认终止；stdout/stderr EOF 和 Shell 主进程退出均不能作为进程树已退出的依据。正常运行时，Windows 和 Linux 均等待后代结束，因此关闭输出的后台任务仍受命令超时约束，并可继续取消。该机制用于管理普通命令后代，不构成对抗恶意命令或系统服务代启动的安全隔离。其他 Unix 平台当前缺少同等终止确认机制，会在启动前明确返回不支持，不能视为已经通过跨 Unix 验收。
 
