@@ -11,8 +11,10 @@
 from __future__ import annotations
 
 import asyncio
+import codecs
 import glob as _glob
 import hashlib
+import io
 import json
 import os
 import socket
@@ -20,10 +22,18 @@ import subprocess
 import sys
 import time
 from concurrent.futures import ThreadPoolExecutor
+from contextvars import ContextVar
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 from coding_agent.tools.base import Tool, ToolCancelledError, ToolResult
+
+
+_SHELL_PREVIEW_BYTES = 4000
+# 当前调用的预览回调随异步任务传递，工具参数只能来自既有输入 schema。
+_current_shell_output: ContextVar[Callable[[str, str], None] | None] = ContextVar(
+    "current_shell_output", default=None,
+)
 
 
 class _WindowsProcessJob:
@@ -191,11 +201,27 @@ class BashTool(Tool):
         cleanup_error: OSError | RuntimeError | None = None
         failure: ToolResult | None = None
 
-        async def drain(stream, target):
+        publish_output = _current_shell_output.get()
+
+        async def drain(stream: asyncio.StreamReader, target: bytearray, channel: str) -> None:
             nonlocal output_size
+            decoder = (io.IncrementalNewlineDecoder(codecs.getincrementaldecoder("utf-8")(errors="replace"), True)
+                       if publish_output is not None else None)
             while chunk := await stream.read(8192):
+                if decoder is not None and publish_output is not None:
+                    remaining = _SHELL_PREVIEW_BYTES - len(target)
+                    preview_ends = len(chunk) >= remaining
+                    text = decoder.decode(chunk[:remaining], final=preview_ends)
+                    if text:
+                        publish_output(channel, text)
+                    if preview_ends:
+                        decoder = None
                 output_size += len(chunk)
                 target.extend(chunk[:max(0, 200000 - len(target))])
+            if decoder is not None and publish_output is not None:
+                text = decoder.decode(b"", final=True)
+                if text:
+                    publish_output(channel, text)
 
         async def confirm_tree():
             nonlocal tree_status
@@ -220,7 +246,7 @@ class BashTool(Tool):
 
         async def collect():
             collectors = [asyncio.create_task(coroutine) for coroutine in (
-                drain(process.stdout, stdout), drain(process.stderr, stderr), confirm_tree())]
+                drain(process.stdout, stdout, "stdout"), drain(process.stderr, stderr, "stderr"), confirm_tree())]
             try:
                 await asyncio.gather(*collectors)
             finally:

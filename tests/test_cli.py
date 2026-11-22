@@ -413,6 +413,27 @@ def test_cli_uses_real_shell_exit_status_for_error_prefixed_output(tmp_path, mon
         assert "[bash 完成]" not in result.stdout
 
 
+@pytest.mark.parametrize("enabled", [False, True])
+def test_cli_shell_output_preview_is_opt_in_and_escapes_controls(tmp_path, monkeypatch, enabled):
+    from test_runtime import ScriptedProvider, text_response, tool_response
+
+    script = tmp_path / "preview.py"
+    script.write_text("import sys\nprint('sample\\x1b[31m', file=sys.stderr)\n", encoding="utf-8")
+    command = f'"{sys.executable}" "{script}"'
+    provider = ScriptedProvider([tool_response("bash", {"command": command}), text_response("完成")])
+    monkeypatch.setattr(main, "load_config", lambda _: Config(workdir=str(tmp_path)))
+    monkeypatch.setattr(main, "_build_provider", lambda _: provider)
+    args = ["--shell-output"] if enabled else []
+
+    result = CliRunner().invoke(main.cli, [*args, "run", "执行测试命令"])
+
+    assert result.exit_code == 0, result.exception
+    assert "[bash 完成] 退出码: 0" in result.stdout
+    assert "sample" not in result.stdout
+    assert (r"stderr] sample\u001b[31m\n" in result.stderr) is enabled
+    assert "\x1b" not in result.stderr
+
+
 @pytest.mark.parametrize("mode", ["run", "chat", "limit"])
 def test_cli_delivers_result_after_real_file_write(tmp_path, monkeypatch, mode):
     from test_runtime import ScriptedProvider, text_response, tool_response

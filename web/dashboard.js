@@ -380,6 +380,7 @@ function updateTool(data, finished = false) {
     if (data.execution?.exit_code != null) {
       card.querySelector('.tool-state').textContent += ' · 退出码 ' + data.execution.exit_code;
     }
+    card.querySelector('.shell-output')?.remove();
     card.querySelector('.details').textContent = data.execution && Object.keys(data.execution).length
       ? JSON.stringify({ ...data.execution, output: data.output }, null, 2)
       : data.output || '工具执行结束。';
@@ -391,6 +392,25 @@ function showPendingStop(executionIds, label) {
     const card = state.tools.get(id);
     if (card && !card.dataset.finished) card.querySelector('.tool-state').textContent = label;
   }
+}
+
+function appendShellOutput(data) {
+  const card = state.tools.get(data.execution_id);
+  if (!card || card.dataset.finished || (data.stream !== 'stdout' && data.stream !== 'stderr')) return;
+  let preview = card.querySelector('.shell-output');
+  if (!preview) {
+    preview = document.createElement('div');
+    preview.className = 'details shell-output';
+    card.append(preview);
+  }
+  let stream = preview.querySelector('.' + data.stream);
+  if (!stream) {
+    stream = document.createElement('div');
+    stream.className = data.stream;
+    stream.textContent = data.stream + '\n';
+    preview.append(stream);
+  }
+  stream.append(document.createTextNode(data.output));
 }
 
 function showApproval(data) {
@@ -487,6 +507,8 @@ function handleEvent(data) {
   else if (data.type === 'tool_start' || data.type === 'tool_use') {
     updateTool(data);
     if (state.sending) setAgentState('正在执行工具', true);
+  } else if (data.type === 'tool_output_delta') {
+    appendShellOutput(data);
   } else if (data.type === 'tool_done') {
     updateTool(data, true);
   } else if (data.type === 'analysis_progress') {
@@ -589,7 +611,7 @@ async function send(recoveryId = null) {
   };
   try {
     const response = await fetch(recoveryId ? '/chat/retry' : '/chat', {
-      ...jsonOptions('POST', { ...payload, session_id: sessionId, stop_confirmation: true }),
+      ...jsonOptions('POST', { ...payload, session_id: sessionId, stop_confirmation: true, shell_output: true }),
       signal: chat.controller.signal,
     });
     if (!response.ok) {

@@ -41,6 +41,7 @@ from typing import Any, AsyncIterator, Callable
 
 from coding_agent.providers.base import LLMProvider, ProviderResponse
 from coding_agent.tools.base import Tool, ToolCancelledError, ToolResult, tool_result
+from coding_agent.tools.builtin import _current_shell_output
 from coding_agent.tools.registry import ToolRegistry
 from coding_agent.hooks.bus import Event, EventBus, EventType
 from coding_agent.security.permission import PermissionPipeline, Verdict
@@ -309,6 +310,7 @@ class AgentLoop:
         final_answer_timeout: float = 30.0,
         progress_interval: float = 10.0,
         model_max_attempts: int = DEFAULT_MODEL_ATTEMPTS,
+        shell_output: bool = False,
     ) -> None:
         self.provider = provider
         self.system_prompt = system_prompt
@@ -331,6 +333,7 @@ class AgentLoop:
         self.final_answer_timeout = final_answer_timeout
         self.progress_interval = progress_interval
         self.model_max_attempts = model_max_attempts
+        self.shell_output = shell_output
 
     # ── 公共 API ──────────────────────────────────────────
 
@@ -844,20 +847,53 @@ class AgentLoop:
         *, rejected: dict[int, str],
     ) -> AsyncIterator[LoopEvent]:
         cancelled_results: dict[str, ToolResult] = {}
-        tasks = [asyncio.create_task(self._execute_one(block, messages, execution_id=execution_id,
-                                                      rejection=rejected.get(index),
-                                                      cancelled_results=cancelled_results))
+        output_ready = asyncio.Event()
+        output_chunks: dict[tuple[int, str], list[str]] = {}
+
+        async def execute(index: int, block: dict, execution_id: str):
+            def publish_output(channel: str, text: str) -> None:
+                output_chunks.setdefault((index, channel), []).append(text)
+                output_ready.set()
+
+            token = _current_shell_output.set(publish_output if self.shell_output and block["name"] == "bash" else None)
+            try:
+                return await self._execute_one(block, messages, execution_id=execution_id,
+                                               rejection=rejected.get(index), cancelled_results=cancelled_results)
+            finally:
+                _current_shell_output.reset(token)
+
+        tasks = [asyncio.create_task(execute(index, block, execution_id))
                  for index, (block, execution_id) in enumerate(zip(blocks, execution_ids))]
         indexes = {task: index for index, task in enumerate(tasks)}
         pending = set(tasks)
+        stream_shell = self.shell_output and any(block["name"] == "bash" for block in blocks)
+        output_wait = asyncio.create_task(output_ready.wait()) if stream_shell else None
         try:
             while pending:
-                completed, pending = await asyncio.wait(
-                    pending, timeout=self.progress_interval, return_when=asyncio.FIRST_COMPLETED,
+                completed, _ = await asyncio.wait(
+                    pending | {output_wait} if output_wait else pending,
+                    timeout=self.progress_interval, return_when=asyncio.FIRST_COMPLETED,
                 )
+                output_available = bool(output_chunks)
+                if output_available:
+                    # 先清空本批缓冲再 yield，避免消费者等待时阻塞子进程读管道。
+                    chunks = output_chunks
+                    output_chunks = {}
+                    output_ready.clear()
+                    for (index, channel), parts in chunks.items():
+                        block = blocks[index]
+                        yield LoopEvent(type="tool_output_delta", tool_name=block["name"], tool_id=block["id"],
+                                        tool_output="".join(parts), data={
+                                            "execution_id": execution_ids[index], "stream": channel,
+                                            "agent": self.agent_name,
+                                        })
+                if output_wait in completed:
+                    completed.remove(output_wait)
+                    output_wait = asyncio.create_task(output_ready.wait())
+                pending.difference_update(completed)
                 waiting_tasks = [task for task in pending if not (
                     self.permissions and self.permissions.is_waiting_for_approval(task))]
-                if not completed and waiting_tasks:
+                if not completed and not output_available and waiting_tasks:
                     waiting = [{"tool_name": blocks[indexes[task]]["name"],
                                 "tool_id": blocks[indexes[task]]["id"]} for task in tasks
                                if task in waiting_tasks]
@@ -879,10 +915,14 @@ class AgentLoop:
                     round_results[execution_ids[index]] = (event, repeat_key)
                     yield event
         finally:
+            if output_wait is not None:
+                output_wait.cancel()
             for task in tasks:
                 if not task.done():
                     task.cancel()
             outcomes = await asyncio.gather(*tasks, return_exceptions=True)
+            if output_wait is not None:
+                await asyncio.gather(output_wait, return_exceptions=True)
             results = []
             for block, execution_id, outcome in zip(blocks, execution_ids, outcomes):
                 result = outcome[0] if isinstance(outcome, tuple) else cancelled_results.get(execution_id)

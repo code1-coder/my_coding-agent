@@ -225,7 +225,7 @@ class AgentRuntime:
         return message
 
     def make_loop(self, registry: ToolRegistry, *, system: str, agent_name: str = "lead",
-                  max_iterations: int | None = None, analysis: bool = False) -> AgentLoop:
+                  max_iterations: int | None = None, analysis: bool = False, shell_output: bool = False) -> AgentLoop:
         pipeline = CompactionPipeline(
             summarize=self.summarize, workdir=self.workdir,
             context_limit=self.cfg.context_limit, max_messages=self.cfg.max_messages,
@@ -242,6 +242,7 @@ class AgentRuntime:
                                      fallback_model=self.cfg.fallback_model,
                                      escalated_max_tokens=max(self.cfg.max_tokens, self.cfg.escalated_max_tokens)),
             agent_name=agent_name,
+            shell_output=shell_output,
             provider_for_model=self.provider_for_model,
             model_timeout=self.cfg.model_timeout,
             model_max_attempts=self.cfg.model_max_attempts,
@@ -266,7 +267,8 @@ class AgentRuntime:
         })
 
     async def run_turn(self, prompt: str, *, stream: bool = True, analysis: bool = False,
-                       analysis_dimensions: list[str] | tuple[str, ...] | None = None) -> AsyncIterator[LoopEvent]:
+                       analysis_dimensions: list[str] | tuple[str, ...] | None = None,
+                       shell_output: bool = False) -> AsyncIterator[LoopEvent]:
         """处理一轮输入；记忆在压缩前保留用户原文，完成保存后才报告 done。"""
         dimensions = resolve_analysis_dimensions(analysis, analysis_dimensions)
         await self.start()
@@ -278,7 +280,8 @@ class AgentRuntime:
             self.messages.append({"role": "user", "content": prompt})
             # 续接直接复用本轮检查点中的必查范围，不再解释历史消息或模型输出。
             progress = AnalysisProgress(prompt[:1200], dimensions=dimensions) if dimensions is not None else None
-            async with aclosing(self._execute_turn(prompt, stream=stream, analysis=progress)) as events:
+            async with aclosing(self._execute_turn(prompt, stream=stream, analysis=progress,
+                                                   shell_output=shell_output)) as events:
                 async for event in events:
                     yield event
 
@@ -307,7 +310,8 @@ class AgentRuntime:
             raise RetryUnavailable(f"模型服务要求冷却，请至少等待 {math.ceil(remaining)} 秒。")
         return checkpoint
 
-    async def retry_turn(self, recovery_id: str | None = None, *, stream: bool = True) -> AsyncIterator[LoopEvent]:
+    async def retry_turn(self, recovery_id: str | None = None, *, stream: bool = True,
+                         shell_output: bool = False) -> AsyncIterator[LoopEvent]:
         """仅从最后一次已配对的模型请求续接，不重放旧工具。"""
         if self.turn_lock.locked():
             raise RetryUnavailable("当前会话仍在执行，请等待本轮结束。")
@@ -320,13 +324,15 @@ class AgentRuntime:
             self._checkpoint = None
             # 历史摘要已校验：只移除本地失败说明，不移除已配对的工具结果。
             self.messages.pop()
-            async with aclosing(self._execute_turn(checkpoint.prompt, stream=stream, checkpoint=checkpoint)) as events:
+            async with aclosing(self._execute_turn(checkpoint.prompt, stream=stream, checkpoint=checkpoint,
+                                                   shell_output=shell_output)) as events:
                 async for event in events:
                     yield event
 
     async def _execute_turn(self, prompt: str, *, stream: bool,
                             analysis: AnalysisProgress | None = None,
-                            checkpoint: _TurnCheckpoint | None = None) -> AsyncIterator[LoopEvent]:
+                            checkpoint: _TurnCheckpoint | None = None,
+                            shell_output: bool = False) -> AsyncIterator[LoopEvent]:
         if checkpoint is not None:
             analysis = checkpoint.progress.analysis
         registry = self.registry
@@ -335,7 +341,7 @@ class AgentRuntime:
             for tool in build_builtin_tools(self.workdir):
                 if tool.name in ANALYSIS_READ_TOOLS:
                     registry.register_tool(tool)
-        loop = self.make_loop(registry, system="", analysis=analysis is not None)
+        loop = self.make_loop(registry, system="", analysis=analysis is not None, shell_output=shell_output)
         relevant = ""
         configuration = self._retry_configuration()
 

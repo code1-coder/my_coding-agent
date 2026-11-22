@@ -141,6 +141,10 @@ def _print_event(event: LoopEvent, *, color: bool = True) -> None:
                 click.echo("  " + detail)
         else:
             click.echo("\n" + heading + (" " + details[0] if details else ""))
+    elif event.type == "tool_output_delta":
+        handle = event.data["execution_id"]
+        channel = event.data["stream"]
+        click.echo(f"[bash {handle} {channel}] {_terminal_text(event.tool_output)}", err=True)
     elif event.type == "tool_done" and (
         event.data.get("is_error") is True
         or ("is_error" not in event.data and event.tool_output.startswith("Error:"))
@@ -235,12 +239,13 @@ async def _render_turn(operation: AsyncGenerator[LoopEvent, None], *, show_text:
 
 
 async def _run_agent_loop(prompt: str, cfg: Config, *, stream: bool = True, color: bool = True,
-                          analysis: bool = False, analysis_dimensions: tuple[str, ...] | None = None) -> str:
+                          analysis: bool = False, analysis_dimensions: tuple[str, ...] | None = None,
+                          shell_output: bool = False) -> str:
     """单次任务也经过完整运行流程，并在退出前释放队友和客户端。"""
     runtime, _ = _create_runtime(cfg)
     async with runtime:
         return await _render_turn(runtime.run_turn(prompt, stream=stream, analysis=analysis,
-                                                   analysis_dimensions=analysis_dimensions),
+                                                   analysis_dimensions=analysis_dimensions, shell_output=shell_output),
                                   show_text=stream, color=color, fail_on_error=True)
 
 
@@ -249,8 +254,9 @@ async def _run_agent_loop(prompt: str, cfg: Config, *, stream: bool = True, colo
 @click.option("--provider", "provider_", default=None, type=click.Choice(["anthropic", "openai_compat"]))
 @click.option("--max-tokens", default=None, type=int, help="单次响应的最大令牌数。")
 @click.option("--config", "config_path", default="config.yaml", help="YAML 配置文件路径。")
+@click.option("--shell-output", is_flag=True, help="在标准错误流显示 Shell 命令的实时输出预览。")
 @click.pass_context
-def cli(ctx, model, provider_, max_tokens, config_path):
+def cli(ctx, model, provider_, max_tokens, config_path, shell_output):
     """coding-agent —— 模块化 AI 编码智能体。"""
     cfg = load_config(config_path)
     if model:
@@ -261,16 +267,17 @@ def cli(ctx, model, provider_, max_tokens, config_path):
         cfg.max_tokens = max_tokens
     ctx.ensure_object(dict)
     ctx.obj["cfg"] = cfg
+    ctx.obj["shell_output"] = shell_output
 
 
 @cli.command()
 @click.pass_context
 def chat(ctx):
     """启动交互式对话。"""
-    asyncio.run(_chat_session(ctx.obj["cfg"]))
+    asyncio.run(_chat_session(ctx.obj["cfg"], shell_output=ctx.obj["shell_output"]))
 
 
-async def _chat_session(cfg: Config) -> None:
+async def _chat_session(cfg: Config, *, shell_output: bool = False) -> None:
     """整个会话共用一个循环；等待终端输入时允许后台队友继续工作。"""
     runtime, read_lock = _create_runtime(cfg)
     async with runtime:
@@ -289,7 +296,7 @@ async def _chat_session(cfg: Config) -> None:
             try:
                 words = query.strip().split(maxsplit=1)
                 if query.strip() == "/retry":
-                    operation = runtime.retry_turn()
+                    operation = runtime.retry_turn(shell_output=shell_output)
                 elif words[0] == "/analyze":
                     prompt = words[1] if len(words) == 2 else ""
                     dimensions = None
@@ -309,7 +316,7 @@ async def _chat_session(cfg: Config) -> None:
                         continue
                     operation = runtime.run_turn(prompt, analysis=True, analysis_dimensions=dimensions)
                 else:
-                    operation = runtime.run_turn(query)
+                    operation = runtime.run_turn(query, shell_output=shell_output)
                 await _render_turn(operation)
             except (RetryUnavailable, PermissionError) as exc:
                 click.echo(f"\n[无法续接] {exc}", err=True)
@@ -332,7 +339,7 @@ def run(ctx, prompt, analysis, dimensions):
         raise click.BadParameter(str(exc), param_hint="--analysis-dimension") from exc
     try:
         final = asyncio.run(_run_agent_loop(prompt, ctx.obj["cfg"], stream=True, analysis=analysis,
-                                           analysis_dimensions=scope))
+                                           analysis_dimensions=scope, shell_output=ctx.obj["shell_output"]))
     except REQUEST_ERRORS as exc:
         raise click.ClickException(f"模型请求失败：{exc}") from exc
     if not final.endswith("\n"):

@@ -315,7 +315,8 @@ async def chat(request: Request):
     except ValueError as exc:
         raise HTTPException(422, str(exc)) from exc
     return _chat_response(session_id, prompt=prompt, analysis=analysis, analysis_dimensions=scope,
-                          stop_confirmation=body.get("stop_confirmation") is True)
+                          stop_confirmation=body.get("stop_confirmation") is True,
+                          shell_output=body.get("shell_output") is True)
 
 
 @app.post("/chat/retry")
@@ -337,7 +338,8 @@ async def retry_chat(request: Request):
     except RetryUnavailable as exc:
         raise HTTPException(409, str(exc)) from exc
     return _chat_response(session_id, retry=(runtime, recovery_id),
-                          stop_confirmation=body.get("stop_confirmation") is True)
+                          stop_confirmation=body.get("stop_confirmation") is True,
+                          shell_output=body.get("shell_output") is True)
 
 
 class StopChatRequest(BaseModel):
@@ -358,7 +360,7 @@ async def stop_chat(stop_id: str, body: StopChatRequest):
 
 
 def _chat_response(session_id: str, *, prompt: str = "", analysis: bool = False,
-                   analysis_dimensions: tuple[str, ...] | None = None,
+                   analysis_dimensions: tuple[str, ...] | None = None, shell_output: bool = False,
                    retry: tuple[AgentRuntime, str] | None = None, stop_confirmation: bool = False):
     async def event_stream() -> AsyncIterator[str]:
         queue: asyncio.Queue = asyncio.Queue()
@@ -374,10 +376,11 @@ def _chat_response(session_id: str, *, prompt: str = "", analysis: bool = False,
                     queue.put_nowait({"type": "chat_started", "stop_id": stop_id})
                 if retry is None:
                     runtime = await _get_runtime(session_id)
-                    operation = runtime.run_turn(prompt, analysis=analysis, analysis_dimensions=analysis_dimensions)
+                    operation = runtime.run_turn(prompt, analysis=analysis, analysis_dimensions=analysis_dimensions,
+                                                 shell_output=shell_output)
                 else:
                     runtime, recovery_id = retry
-                    operation = runtime.retry_turn(recovery_id)
+                    operation = runtime.retry_turn(recovery_id, shell_output=shell_output)
                 async with aclosing(operation) as events:
                     async for event in events:
                         payload = {"type": event.type, **event.data}

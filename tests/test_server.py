@@ -378,6 +378,70 @@ async def test_cancelled_approval_cleans_up_and_next_turn_can_continue(configure
 
 
 @pytest.mark.skipif(sys.platform not in ("win32", "linux"), reason="需要受支持的 Shell 进程树管理")
+async def test_web_streams_bounded_shell_output_before_completion(configured_server, tmp_path, monkeypatch):
+    script = tmp_path / "preview.py"
+    script.write_text(
+        "import pathlib, sys, time\n"
+        "sys.stdout.buffer.write(b'<preview>\\xe4'); sys.stdout.flush()\n"
+        "print('diagnostic', file=sys.stderr, flush=True)\n"
+        "while not pathlib.Path('release').exists(): time.sleep(0.01)\n"
+        "sys.stdout.buffer.write(b'\\xb8\\xad\\n' + b'x' * 6000); sys.stdout.flush()\n",
+        encoding="utf-8",
+    )
+    provider = ScriptedProvider([
+        tool_response("bash", {"command": f'"{sys.executable}" "{script}"'}, "preview"),
+        text_response("完成"),
+    ])
+    monkeypatch.setattr(server, "_get_provider", lambda _: provider)
+    streamed = asyncio.Queue()
+
+    async def app_with_event_observer(scope, receive, send):
+        async def observe(message):
+            body = message.get("body", b"")
+            if body.startswith(b"data: "):
+                streamed.put_nowait(json.loads(body[6:]))
+            await send(message)
+
+        await server.app(scope, receive, observe)
+
+    async with server.lifespan(server.app):
+        async with httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=app_with_event_observer), base_url="http://test",
+        ) as client:
+            request = asyncio.create_task(client.post("/chat", json={
+                "prompt": "运行测试命令", "session_id": "preview", "shell_output": True,
+            }))
+            try:
+                channels = {}
+                async with asyncio.timeout(10):
+                    while len(channels) < 2:
+                        event = await streamed.get()
+                        assert event["type"] not in ("tool_done", "error", "done")
+                        if event["type"] == "tool_start":
+                            handle = event["execution_id"]
+                        elif event["type"] == "tool_output_delta":
+                            assert event["execution_id"] == handle
+                            channels[event["stream"]] = event["output"]
+                assert channels == {"stdout": "<preview>", "stderr": "diagnostic\n"}
+                assert not request.done()
+                (tmp_path / "release").touch()
+                events = decode_events(await asyncio.wait_for(request, 10))
+            finally:
+                if not request.done():
+                    request.cancel()
+                await asyncio.gather(request, return_exceptions=True)
+
+    done_index = next(index for index, event in enumerate(events) if event["type"] == "tool_done")
+    chunks = [(index, event) for index, event in enumerate(events) if event["type"] == "tool_output_delta"]
+    assert all(index < done_index and event["execution_id"] == handle for index, event in chunks)
+    stdout = "".join(event["output"] for _, event in chunks if event["stream"] == "stdout")
+    expected = "<preview>中\n" + "x" * 6000
+    assert stdout == expected.encode()[:4000].decode()
+    assert events[done_index]["execution"]["stdout"] == expected
+    assert events[-1]["type"] == "done"
+
+
+@pytest.mark.skipif(sys.platform not in ("win32", "linux"), reason="需要受支持的 Shell 进程树管理")
 @pytest.mark.parametrize("confirmed", [
     True,
     pytest.param(False, marks=pytest.mark.skipif(sys.platform != "win32", reason="Windows Job 查询失败路径")),
