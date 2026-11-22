@@ -66,6 +66,10 @@ requirements.txt 与 pyproject.toml 同时声明 ripgrep-bin；前者包含 UTF-
 
 验证时既运行相关回归，也在临时 Git 仓库中通过真实 PATH 隐藏 rg，直接调用 SearchCodeTool，核对路径、行号、忽略规则和 backend，再恢复 PATH 检查 rg 恢复。临时探针和生成内容不要加入仓库。
 
+### Shell 进程树清理
+
+BashTool 支持 Windows 和 Linux。Linux 需要内核允许设置 child subreaper，并且监督进程能读取 `/proc/self/task/<pid>/children`。在 macOS 及其他平台上，BashTool 会在启动命令前返回平台不支持，结果包含 `failure_stage=startup` 和 `termination_confirmed=null`。
+
 BashTool 的异步入口直接管理子进程。取消时先终止进程树、回收输出和进程，再传播取消异常。工具结束事件中的 cancelled=true、termination_confirmed=true 表示终止已确认，failure_stage=cancelled。超时也使用相同清理流程。超时清理期间收到取消请求时，清理结束后仍传播取消异常，并在结果中保留 timed_out=true。清理失败时 termination_confirmed=false、cancelled=false，failure_stage 为 cleanup 或 supervision，已收到的取消请求仍以取消异常向上传递。启动前失败时 termination_confirmed=null。同步 execute 复用相同执行逻辑，异步调用方应使用 aexecute，避免阻塞事件循环。
 
 Windows 的 exit_code 以无符号 32 位整数保留原生退出状态，例如 0xC0000005 对应 3221225477。非零退出码仍标记为工具失败。

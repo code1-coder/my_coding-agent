@@ -10,6 +10,8 @@
 
 以下命令均在项目根目录执行，直接使用虚拟环境中的解释器，无需激活虚拟环境。
 
+CLI 和网页共用的 Shell 工具（bash）支持 Windows 和 Linux。macOS 可按下面的步骤安装并启动 CLI 或网页服务，适合静态分析等无需 Shell 的任务。在 macOS 上调用 bash 工具会在启动命令前返回平台不支持。参见[Shell 平台要求与进程树验收](docs/code-tools.md#shell-进程树清理)。
+
 ### 1. 获取项目并安装依赖
 
 如果已经下载项目，直接进入包含 `pyproject.toml` 的目录，跳过克隆步骤。
@@ -371,12 +373,14 @@ docker compose logs -f
 .\.venv\Scripts\python.exe -m pytest tests/ -v
 ```
 
-**macOS / Linux：**
+**Linux：**
 
 ```bash
 .venv/bin/python -m pip install -e ".[dev]"
 .venv/bin/python -m pytest tests/ -v
 ```
+
+全量测试的 CI 矩阵覆盖 Windows 和 Linux。包含真实 Shell 命令的用例需在这两个平台之一运行。
 
 如需覆盖率报告，在同一虚拟环境中安装 `pytest-cov`，再使用该解释器运行 `-m pytest --cov=src tests/`。
 
