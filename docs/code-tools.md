@@ -80,6 +80,8 @@ HTTP 客户端可在 `/chat` 或 `/chat/retry` 传入 `shell_output: true`。`to
 
 网页停止当前对话时保留 SSE 连接。界面先显示「正在停止」，再用同一 execution_id 的工具结束事件显示「已确认终止」或「终止未确认」。一次对话结束也可能包含终止未确认的工具。HTTP 客户端可在 /chat 或 /chat/retry 的请求体传入 stop_confirmation=true，从首个 chat_started 事件取得本次请求专用的 stop_id，再向 /chat/{stop_id}/stop 提交原 session_id。HTTP 202 只表示停止请求已接收，实际结果由原流中的 tool_done 和 chat_stopped 事件送达。
 
+支持单条停止的 Shell 命令在 `tool_start` 中带有 `stoppable: true`。网页可在对应执行卡片点击「停止命令」。HTTP 客户端向 `POST /chat/{stop_id}/tools/{execution_id}/stop` 提交原 `session_id`，收到 HTTP 202 后，从原事件流等待该 `execution_id` 的 `tool_done`。`execution.termination_confirmed` 为 `true` 表示已确认进程树终止，为 `false` 表示终止未确认。若取消时 Shell 尚未启动，`failure_stage` 为 `cancelled_before_start`，`termination_confirmed` 为 `null`。同批其他工具和原对话继续运行。
+
 Windows 将执行进程绑定到 Job Object 后才放行命令，并查询 Job 的 ActiveProcesses=0 确认退出。Linux 使用独立监督进程，在启动 Shell 前设置 child subreaper；取消时逐轮终止其直接子进程并接管、回收孤儿后代，包括 setsid 和双重 fork 后代。只有 waitpid 确认不存在任何待回收子进程，且监督进程退出，才通过独立控制通道确认终止；stdout/stderr EOF 和 Shell 主进程退出均不能作为进程树已退出的依据。正常运行时，Windows 和 Linux 均等待后代结束，因此关闭输出的后台任务仍受命令超时约束，并可继续取消。该机制用于管理普通命令后代，不构成对抗恶意命令或系统服务代启动的安全隔离。其他 Unix 平台当前缺少同等终止确认机制，会在启动前明确返回不支持，不能视为已经通过跨 Unix 验收。
 
 在仓库根目录运行进程树验收命令：Windows 使用 .venv/Scripts/python.exe -m pytest -q -s tests/test_code_tools.py -k 'stops_real_process_tree or stops_detached_descendants'；Linux 使用 .venv/bin/python -m pytest -q -s tests/test_code_tools.py -k 'stops_real_process_tree or stops_detached_descendants'。用例启动真实父子进程并持续写入各自日志，经注册表取消、AgentLoop 取消及超时后检查 PID 已停止、日志不再变化，且下一条命令可正常执行；附加用例检查输出重定向、父进程先退出的后代及停止后的延迟修改。无需模型 API；该检查不等同于浏览器点击停止的端到端验证。

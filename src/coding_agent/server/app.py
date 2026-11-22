@@ -19,7 +19,7 @@ from pydantic import BaseModel, ConfigDict, Field, StrictStr
 from coding_agent.agents.tasks import TaskBoard
 from coding_agent.config import load_config
 from coding_agent.hooks.bus import EventType
-from coding_agent.loop import resolve_analysis_dimensions
+from coding_agent.loop import ShellExecutions, resolve_analysis_dimensions
 from coding_agent.memory import MemoryStore
 from coding_agent.runtime import AgentRuntime, RetryUnavailable, build_provider
 
@@ -45,6 +45,7 @@ class ActiveChat:
     task: asyncio.Task
     stopping: bool = False
     pending_tools: dict[str, dict[str, Any] | None] = field(default_factory=dict)
+    shell_executions: ShellExecutions = field(default_factory=ShellExecutions)
 
 
 pending_approvals: dict[str, PendingApproval] = {}
@@ -346,17 +347,32 @@ class StopChatRequest(BaseModel):
     session_id: StrictStr = Field(min_length=1, max_length=200)
 
 
-@app.post("/chat/{stop_id}/stop", status_code=202)
-async def stop_chat(stop_id: str, body: StopChatRequest):
+def _get_active_chat(stop_id: str, session_id: str) -> ActiveChat:
     active = _active_chats.get(stop_id)
     if active is None or active.task.done():
         raise HTTPException(404, "对话已结束或不存在")
-    if active.session_id != body.session_id:
+    if active.session_id != session_id:
         raise HTTPException(403, "对话不属于当前会话")
+    return active
+
+
+@app.post("/chat/{stop_id}/stop", status_code=202)
+async def stop_chat(stop_id: str, body: StopChatRequest):
+    active = _get_active_chat(stop_id, body.session_id)
     if not active.stopping:
         active.stopping = True
         active.task.cancel()
     return {"status": "stopping"}
+
+
+@app.post("/chat/{stop_id}/tools/{execution_id}/stop", status_code=202)
+async def stop_shell(stop_id: str, execution_id: str, body: StopChatRequest):
+    active = _get_active_chat(stop_id, body.session_id)
+    if active.stopping:
+        raise HTTPException(409, "本轮对话正在停止")
+    if execution_id not in active.pending_tools or not active.shell_executions.request_stop(execution_id):
+        raise HTTPException(404, "可停止的 Shell 命令已结束或不存在")
+    return {"status": "stopping", "execution_id": execution_id}
 
 
 def _chat_response(session_id: str, *, prompt: str = "", analysis: bool = False,
@@ -374,13 +390,15 @@ def _chat_response(session_id: str, *, prompt: str = "", analysis: bool = False,
             try:
                 if stop_id is not None:
                     queue.put_nowait({"type": "chat_started", "stop_id": stop_id})
+                shell_executions = active.shell_executions if active is not None else None
                 if retry is None:
                     runtime = await _get_runtime(session_id)
                     operation = runtime.run_turn(prompt, analysis=analysis, analysis_dimensions=analysis_dimensions,
-                                                 shell_output=shell_output)
+                                                 shell_output=shell_output, shell_executions=shell_executions)
                 else:
                     runtime, recovery_id = retry
-                    operation = runtime.retry_turn(recovery_id, shell_output=shell_output)
+                    operation = runtime.retry_turn(recovery_id, shell_output=shell_output,
+                                                   shell_executions=shell_executions)
                 async with aclosing(operation) as events:
                     async for event in events:
                         payload = {"type": event.type, **event.data}

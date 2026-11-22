@@ -111,6 +111,30 @@ class LoopEvent:
         self.data = data or {}
 
 
+@dataclass
+class _ShellExecution:
+    task: asyncio.Task | None = None
+    stop_requested: bool = False
+    finished: bool = False
+
+
+class ShellExecutions:
+    """仅跟踪当前对话轮次的 Shell 执行，句柄不能跨轮次复用。"""
+
+    def __init__(self) -> None:
+        self._active: dict[str, _ShellExecution] = {}
+
+    def request_stop(self, execution_id: str) -> bool:
+        execution = self._active.get(execution_id)
+        if execution is None or execution.finished:
+            return False
+        if not execution.stop_requested:
+            execution.stop_requested = True
+            if execution.task is not None:
+                execution.task.cancel()
+        return True
+
+
 # ═══════════════════════════════════════════════════════════════
 
 @dataclass(frozen=True)
@@ -311,6 +335,7 @@ class AgentLoop:
         progress_interval: float = 10.0,
         model_max_attempts: int = DEFAULT_MODEL_ATTEMPTS,
         shell_output: bool = False,
+        shell_executions: ShellExecutions | None = None,
     ) -> None:
         self.provider = provider
         self.system_prompt = system_prompt
@@ -334,6 +359,7 @@ class AgentLoop:
         self.progress_interval = progress_interval
         self.model_max_attempts = model_max_attempts
         self.shell_output = shell_output
+        self.shell_executions = shell_executions
 
     # ── 公共 API ──────────────────────────────────────────
 
@@ -491,10 +517,6 @@ class AgentLoop:
                 if reads:
                     analysis.batches += 1
                 revision = analysis.revision
-            for block, execution_id in zip(blocks, execution_ids):
-                yield LoopEvent(type="tool_start", tool_name=block["name"],
-                                tool_id=block["id"], data={"input": block.get("input", {}),
-                                "execution_id": execution_id, "agent": self.agent_name})
             round_results: dict[str, tuple[LoopEvent, str | None]] = {}
             async with aclosing(self._tool_events(
                 messages, blocks, execution_ids, round_results, rejected=rejected,
@@ -849,26 +871,42 @@ class AgentLoop:
         cancelled_results: dict[str, ToolResult] = {}
         output_ready = asyncio.Event()
         output_chunks: dict[tuple[int, str], list[str]] = {}
+        shells = {execution_id: _ShellExecution()
+                  for index, (block, execution_id) in enumerate(zip(blocks, execution_ids))
+                  if self.shell_executions is not None and index not in rejected and block["name"] == "bash"}
 
         async def execute(index: int, block: dict, execution_id: str):
             def publish_output(channel: str, text: str) -> None:
                 output_chunks.setdefault((index, channel), []).append(text)
                 output_ready.set()
 
+            shell = shells.get(execution_id)
+            if shell is not None:
+                shell.task = asyncio.current_task()
             token = _current_shell_output.set(publish_output if self.shell_output and block["name"] == "bash" else None)
             try:
                 return await self._execute_one(block, messages, execution_id=execution_id,
-                                               rejection=rejected.get(index), cancelled_results=cancelled_results)
+                                               rejection=rejected.get(index), cancelled_results=cancelled_results,
+                                               shell=shell)
             finally:
                 _current_shell_output.reset(token)
 
-        tasks = [asyncio.create_task(execute(index, block, execution_id))
-                 for index, (block, execution_id) in enumerate(zip(blocks, execution_ids))]
-        indexes = {task: index for index, task in enumerate(tasks)}
-        pending = set(tasks)
-        stream_shell = self.shell_output and any(block["name"] == "bash" for block in blocks)
-        output_wait = asyncio.create_task(output_ready.wait()) if stream_shell else None
+        tasks: list[asyncio.Task] = []
+        output_wait = None
+        if self.shell_executions is not None:
+            self.shell_executions._active.update(shells)
         try:
+            for block, execution_id in zip(blocks, execution_ids):
+                yield LoopEvent(type="tool_start", tool_name=block["name"],
+                                tool_id=block["id"], data={"input": block.get("input", {}),
+                                "execution_id": execution_id, "agent": self.agent_name,
+                                **({"stoppable": True} if execution_id in shells else {})})
+            tasks = [asyncio.create_task(execute(index, block, execution_id))
+                     for index, (block, execution_id) in enumerate(zip(blocks, execution_ids))]
+            indexes = {task: index for index, task in enumerate(tasks)}
+            pending = set(tasks)
+            if self.shell_output and any(block["name"] == "bash" for block in blocks):
+                output_wait = asyncio.create_task(output_ready.wait())
             while pending:
                 completed, _ = await asyncio.wait(
                     pending | {output_wait} if output_wait else pending,
@@ -915,16 +953,22 @@ class AgentLoop:
                     round_results[execution_ids[index]] = (event, repeat_key)
                     yield event
         finally:
+            if self.shell_executions is not None:
+                for execution_id in shells:
+                    self.shell_executions._active.pop(execution_id, None)
             if output_wait is not None:
                 output_wait.cancel()
-            for task in tasks:
-                if not task.done():
+            for execution_id, task in zip(execution_ids, tasks):
+                shell = shells.get(execution_id)
+                # 单条停止已经触发清理时，整轮停止只等待其结果。
+                if not task.done() and not (shell is not None and shell.stop_requested and task.cancelling()):
                     task.cancel()
             outcomes = await asyncio.gather(*tasks, return_exceptions=True)
             if output_wait is not None:
                 await asyncio.gather(output_wait, return_exceptions=True)
             results = []
-            for block, execution_id, outcome in zip(blocks, execution_ids, outcomes):
+            for index, (block, execution_id) in enumerate(zip(blocks, execution_ids)):
+                outcome = outcomes[index] if index < len(outcomes) else None
                 result = outcome[0] if isinstance(outcome, tuple) else cancelled_results.get(execution_id)
                 results.append(result.to_dict() if result is not None else
                                tool_result(block["id"], error="本轮请求已中断，工具结果不可用。"))
@@ -1233,7 +1277,8 @@ class AgentLoop:
 
     async def _execute_one(self, block: dict[str, Any], messages: list[dict[str, Any]],
                            *, execution_id: str, rejection: str | None,
-                           cancelled_results: dict[str, ToolResult]) -> tuple[ToolResult, str | None]:
+                           cancelled_results: dict[str, ToolResult],
+                           shell: _ShellExecution | None) -> tuple[ToolResult, str | None]:
         """执行单个 tool_use 块，保留执行信息与原调用 ID。
 
         未注册的工具和执行异常均转换为错误结果，交由模型在后续轮次
@@ -1251,29 +1296,48 @@ class AgentLoop:
         metadata: dict[str, Any] = {}
         repeat_key = None
         cancellation = None
+        dispatching = False
         try:
+            if shell is not None and shell.stop_requested:
+                raise asyncio.CancelledError
             blocked = await self.emit(EventType.PRE_TOOL_USE, tool_name=tool_name,
                                       params=tool_input, tool_id=tool_id, execution_id=execution_id)
             if blocked is not None:
                 raise PermissionError(f"工具被 Hook 阻止：{blocked}")
             if self.permissions is None:
+                dispatching = True
                 result, repeat_key = await self._dispatch_authorized_tool(messages, block)
             else:
                 async with self.permissions.authorize(tool_name, tool_input) as (verdict, reason):
                     if verdict != Verdict.ALLOW:
                         raise PermissionError(reason)
+                    dispatching = True
                     result, repeat_key = await self._dispatch_authorized_tool(messages, block)
             output, error = result.content, result.error
             execution = result.execution
             metadata = result.metadata
-        except ToolCancelledError as exc:
-            cancellation = exc
-            output, error = exc.result.content, exc.result.error
-            execution = exc.result.execution
-            # gather 收到的是普通取消异常，须先保留进程树清理结果以配对原调用。
+        except asyncio.CancelledError as exc:
+            stopped_this_command = shell is not None and shell.stop_requested
+            if isinstance(exc, ToolCancelledError):
+                output, error = exc.result.content, exc.result.error
+                execution = exc.result.execution
+                if stopped_this_command:
+                    error = f"用户请求停止此命令。{error}"
+                else:
+                    cancellation = exc
+            elif stopped_this_command:
+                error = "用户请求停止此命令，进程树终止未确认。" if dispatching else "用户已取消命令，Shell 未启动。"
+                execution = (dict(cancelled=False, termination_confirmed=False, failure_stage="cleanup") if dispatching
+                             else dict(cancelled=True, termination_confirmed=None, failure_stage="cancelled_before_start"))
+            else:
+                raise
+            # 整轮同时停止时，仍须保留清理结果以配对原调用。
             cancelled_results[execution_id] = ToolResult(tool_id, content=output, error=error, execution=execution)
         except Exception as exc:
             error = str(exc)
+        finally:
+            if shell is not None:
+                shell.finished = True
         if (not error and tool_name in ANALYSIS_READ_TOOLS
                 and self.progress.analysis is not None and len(output) > _ANALYSIS_MAX_RESULT_CHARS):
             # 无磁盘回退时不把超大结果交给模型，也不将预览登记为完整证据。

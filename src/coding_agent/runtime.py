@@ -20,7 +20,8 @@ from coding_agent.context.compaction import CompactionPipeline, internal_context
 from coding_agent.context.recovery import RecoveryManager, RecoveryState, RetryBudget, with_retry
 from coding_agent.hooks.bus import Event, EventBus, EventType, OutputTruncateHook, TokenUsageHook
 from coding_agent.loop import (
-    ANALYSIS_READ_TOOLS, AgentLoop, AnalysisProgress, LoopEvent, TurnProgress, resolve_analysis_dimensions,
+    ANALYSIS_READ_TOOLS, AgentLoop, AnalysisProgress, LoopEvent, ShellExecutions, TurnProgress,
+    resolve_analysis_dimensions,
 )
 from coding_agent.memory import MemoryStore
 from coding_agent.prompt import get_system_prompt
@@ -225,7 +226,8 @@ class AgentRuntime:
         return message
 
     def make_loop(self, registry: ToolRegistry, *, system: str, agent_name: str = "lead",
-                  max_iterations: int | None = None, analysis: bool = False, shell_output: bool = False) -> AgentLoop:
+                  max_iterations: int | None = None, analysis: bool = False, shell_output: bool = False,
+                  shell_executions: ShellExecutions | None = None) -> AgentLoop:
         pipeline = CompactionPipeline(
             summarize=self.summarize, workdir=self.workdir,
             context_limit=self.cfg.context_limit, max_messages=self.cfg.max_messages,
@@ -243,6 +245,7 @@ class AgentRuntime:
                                      escalated_max_tokens=max(self.cfg.max_tokens, self.cfg.escalated_max_tokens)),
             agent_name=agent_name,
             shell_output=shell_output,
+            shell_executions=shell_executions,
             provider_for_model=self.provider_for_model,
             model_timeout=self.cfg.model_timeout,
             model_max_attempts=self.cfg.model_max_attempts,
@@ -268,7 +271,8 @@ class AgentRuntime:
 
     async def run_turn(self, prompt: str, *, stream: bool = True, analysis: bool = False,
                        analysis_dimensions: list[str] | tuple[str, ...] | None = None,
-                       shell_output: bool = False) -> AsyncIterator[LoopEvent]:
+                       shell_output: bool = False,
+                       shell_executions: ShellExecutions | None = None) -> AsyncIterator[LoopEvent]:
         """处理一轮输入；记忆在压缩前保留用户原文，完成保存后才报告 done。"""
         dimensions = resolve_analysis_dimensions(analysis, analysis_dimensions)
         await self.start()
@@ -281,7 +285,7 @@ class AgentRuntime:
             # 续接直接复用本轮检查点中的必查范围，不再解释历史消息或模型输出。
             progress = AnalysisProgress(prompt[:1200], dimensions=dimensions) if dimensions is not None else None
             async with aclosing(self._execute_turn(prompt, stream=stream, analysis=progress,
-                                                   shell_output=shell_output)) as events:
+                                                   shell_output=shell_output, shell_executions=shell_executions)) as events:
                 async for event in events:
                     yield event
 
@@ -311,7 +315,8 @@ class AgentRuntime:
         return checkpoint
 
     async def retry_turn(self, recovery_id: str | None = None, *, stream: bool = True,
-                         shell_output: bool = False) -> AsyncIterator[LoopEvent]:
+                         shell_output: bool = False,
+                         shell_executions: ShellExecutions | None = None) -> AsyncIterator[LoopEvent]:
         """仅从最后一次已配对的模型请求续接，不重放旧工具。"""
         if self.turn_lock.locked():
             raise RetryUnavailable("当前会话仍在执行，请等待本轮结束。")
@@ -325,14 +330,15 @@ class AgentRuntime:
             # 历史摘要已校验：只移除本地失败说明，不移除已配对的工具结果。
             self.messages.pop()
             async with aclosing(self._execute_turn(checkpoint.prompt, stream=stream, checkpoint=checkpoint,
-                                                   shell_output=shell_output)) as events:
+                                                   shell_output=shell_output, shell_executions=shell_executions)) as events:
                 async for event in events:
                     yield event
 
     async def _execute_turn(self, prompt: str, *, stream: bool,
                             analysis: AnalysisProgress | None = None,
                             checkpoint: _TurnCheckpoint | None = None,
-                            shell_output: bool = False) -> AsyncIterator[LoopEvent]:
+                            shell_output: bool = False,
+                            shell_executions: ShellExecutions | None = None) -> AsyncIterator[LoopEvent]:
         if checkpoint is not None:
             analysis = checkpoint.progress.analysis
         registry = self.registry
@@ -341,7 +347,8 @@ class AgentRuntime:
             for tool in build_builtin_tools(self.workdir):
                 if tool.name in ANALYSIS_READ_TOOLS:
                     registry.register_tool(tool)
-        loop = self.make_loop(registry, system="", analysis=analysis is not None, shell_output=shell_output)
+        loop = self.make_loop(registry, system="", analysis=analysis is not None,
+                              shell_output=shell_output, shell_executions=shell_executions)
         relevant = ""
         configuration = self._retry_configuration()
 

@@ -357,7 +357,7 @@ function updateTool(data, finished = false) {
     $('activity-empty')?.remove();
     card = document.createElement('div');
     card.className = 'tool-call';
-    card.innerHTML = `<button class="tool-summary" aria-expanded="false"><i data-icon="wrench"></i><span class="name"></span><span class="tool-state">执行中</span><i data-icon="chevron-right"></i></button><div class="details"></div>`;
+    card.innerHTML = `<div class="tool-header"><button class="tool-summary" aria-expanded="false"><i data-icon="wrench"></i><span class="name"></span><span class="tool-state">执行中</span><i data-icon="chevron-right"></i></button></div><div class="details"></div>`;
     card.querySelector('.name').textContent = data.tool_name || '工具调用';
     card.querySelector('.details').textContent = JSON.stringify(data.input || {}, null, 2);
     card.querySelector('button').onclick = () => {
@@ -372,19 +372,48 @@ function updateTool(data, finished = false) {
   if (finished) {
     const stopped = data.execution?.cancelled === true && data.execution?.termination_confirmed === true;
     const unconfirmed = data.execution?.termination_confirmed === false;
+    const beforeStart = data.execution?.failure_stage === 'cancelled_before_start';
     card.dataset.finished = 'true';
-    card.classList.toggle('failed', !stopped && (unconfirmed || data.is_error === true));
-    card.classList.toggle('done', stopped || (!unconfirmed && !data.is_error));
+    card.classList.toggle('failed', !stopped && !beforeStart && (unconfirmed || data.is_error === true));
+    card.classList.toggle('done', stopped || beforeStart || (!unconfirmed && !data.is_error));
     card.querySelector('.tool-state').textContent = stopped ? '已确认终止'
-      : unconfirmed ? '终止未确认' : data.is_error ? '执行失败' : '已完成';
+      : beforeStart ? '已取消，未启动' : unconfirmed ? '终止未确认' : data.is_error ? '执行失败' : '已完成';
     if (data.execution?.exit_code != null) {
       card.querySelector('.tool-state').textContent += ' · 退出码 ' + data.execution.exit_code;
     }
     card.querySelector('.shell-output')?.remove();
+    card.querySelector('.stop-shell')?.remove();
     card.querySelector('.details').textContent = data.execution && Object.keys(data.execution).length
       ? JSON.stringify({ ...data.execution, output: data.output }, null, 2)
       : data.output || '工具执行结束。';
   }
+}
+
+function addShellStop(chat, executionId) {
+  const card = state.tools.get(executionId);
+  if (!card || card.dataset.finished) return;
+  const button = document.createElement('button');
+  button.type = 'button';
+  button.className = 'stop-shell secondary';
+  button.textContent = '停止命令';
+  button.hidden = chat.stopping;
+  card.querySelector('.tool-header').append(button);
+  button.addEventListener('click', async () => {
+    if (state.chat !== chat || chat.stopping || !chat.pending.has(executionId)) return;
+    button.disabled = true;
+    showPendingStop([executionId], '正在停止');
+    try {
+      await api('/chat/' + encodeURIComponent(chat.stopId) + '/tools/' + encodeURIComponent(executionId) + '/stop',
+        jsonOptions('POST', { session_id: sessionId }));
+    } catch (error) {
+      if (state.chat !== chat || card.dataset.finished) return;
+      button.disabled = false;
+      if (!chat.stopping) {
+        showPendingStop([executionId], '执行中');
+        toast(error.message);
+      }
+    }
+  });
 }
 
 function showPendingStop(executionIds, label) {
@@ -538,7 +567,11 @@ async function requestStop(chat) {
     if (state.chat !== chat) return;
     chat.stopping = false;
     $('stop-btn').disabled = false;
-    showPendingStop(chat.pending, '执行中');
+    for (const id of chat.pending) {
+      const button = state.tools.get(id)?.querySelector('.stop-shell');
+      if (button) button.hidden = false;
+      if (!button?.disabled) showPendingStop([id], '执行中');
+    }
     setAgentState('等待本轮结束', true);
     appendMessage('system', '无法确认停止请求是否送达，可以重试。', 'error');
   }
@@ -551,6 +584,10 @@ function stopChat() {
   $('stop-btn').disabled = true;
   setAgentState('正在停止', true);
   showPendingStop(chat.pending, '正在停止');
+  for (const id of chat.pending) {
+    const button = state.tools.get(id)?.querySelector('.stop-shell');
+    if (button) button.hidden = true;
+  }
   if (chat.stopId) void requestStop(chat);
 }
 
@@ -606,7 +643,10 @@ async function send(recoveryId = null) {
           unconfirmed.length ? 'error' : '');
       } else if (event.type === 'done') receivedDone = true;
       handleEvent(event);
-      if (event.type === 'tool_start' && chat.stopping) showPendingStop([event.execution_id], '正在停止');
+      if (event.type === 'tool_start') {
+        if (chat.stopId && event.stoppable) addShellStop(chat, event.execution_id);
+        if (chat.stopping) showPendingStop([event.execution_id], '正在停止');
+      }
     }
   };
   try {
@@ -645,6 +685,7 @@ async function send(recoveryId = null) {
     }
   } finally {
     // 后端分别结束每项审批；主对话结束不能移除后台队友仍在等待的审批。
+    for (const id of chat.pending) state.tools.get(id)?.querySelector('.stop-shell')?.remove();
     finishAssistant(assistant);
     state.assistant = null;
     state.sending = false;

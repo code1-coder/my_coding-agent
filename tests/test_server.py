@@ -12,7 +12,7 @@ from fastapi.testclient import TestClient
 import coding_agent.server.app as server
 from coding_agent.config import Config
 from coding_agent.memory import MemoryStore
-from coding_agent.providers.base import ModelRequestError
+from coding_agent.providers.base import ModelRequestError, ProviderResponse
 from test_code_tools import _process_running
 from test_runtime import ScriptedProvider, single_role_analysis_provider, text_response, tool_response
 
@@ -324,18 +324,24 @@ async def test_websocket_tool_events_only_reach_their_session(configured_server)
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("explicit_stop", [False, True])
-async def test_cancelled_approval_cleans_up_and_next_turn_can_continue(configured_server, monkeypatch, explicit_stop):
+@pytest.mark.parametrize("stop_scope", ["disconnect", "chat", "shell"])
+async def test_cancelled_approval_cleans_up_and_next_turn_can_continue(configured_server, tmp_path, monkeypatch, stop_scope):
+    script = tmp_path / "approval.py"
+    script.write_text("from pathlib import Path\nPath('launched').touch()\n", encoding="utf-8")
+    command = f'"{sys.executable}" "{script}" "rm example.txt"'
     provider = ScriptedProvider([
-        tool_response("bash", {"command": "rm example.txt"}), text_response("恢复后完成"),
+        tool_response("bash", {"command": command}), text_response("恢复后完成"), text_response("下一轮完成"),
     ])
     monkeypatch.setattr(server, "_get_provider", lambda _: provider)
     waiting = asyncio.Event()
     started = asyncio.Future()
+    tool_started = asyncio.Future()
+    approval_ids = []
     original_publish = server._publish
 
     async def publish(session, payload):
         if payload["type"] == "approval_required":
+            approval_ids.append(payload["approval_id"])
             waiting.set()
         await original_publish(session, payload)
 
@@ -344,10 +350,12 @@ async def test_cancelled_approval_cleans_up_and_next_turn_can_continue(configure
     async def app_with_event_observer(scope, receive, send):
         async def observe(message):
             body = message.get("body", b"")
-            if body.startswith(b"data: ") and not started.done():
+            if body.startswith(b"data: "):
                 event = json.loads(body[6:])
                 if event["type"] == "chat_started":
                     started.set_result(event["stop_id"])
+                if event["type"] == "tool_start":
+                    tool_started.set_result(event["execution_id"])
             await send(message)
 
         await server.app(scope, receive, observe)
@@ -357,24 +365,45 @@ async def test_cancelled_approval_cleans_up_and_next_turn_can_continue(configure
             transport=httpx.ASGITransport(app=app_with_event_observer), base_url="http://test",
         ) as client:
             request = asyncio.create_task(client.post("/chat", json={
-                "prompt": "取消审批", "session_id": "cancel-test", "stop_confirmation": explicit_stop,
+                "prompt": "取消审批", "session_id": "cancel-test", "stop_confirmation": stop_scope != "disconnect",
             }))
-            await asyncio.wait_for(waiting.wait(), 2)
-            if explicit_stop:
-                stop_id = await asyncio.wait_for(started, 2)
-                response = await client.post(f"/chat/{stop_id}/stop", json={"session_id": "cancel-test"})
-                assert response.status_code == 202
-                events = decode_events(await asyncio.wait_for(request, 2))
-                assert events[-1]["type"] == "chat_stopped"
-                assert any(event["type"] == "approval_finished" for event in events)
-            else:
-                request.cancel()
+            try:
+                await asyncio.wait_for(waiting.wait(), 5)
+                if stop_scope == "disconnect":
+                    request.cancel()
+                    await asyncio.gather(request, return_exceptions=True)
+                else:
+                    stop_id = await asyncio.wait_for(started, 5)
+                    execution_id = await asyncio.wait_for(tool_started, 5)
+                    url = f"/chat/{stop_id}"
+                    if stop_scope == "shell":
+                        url += f"/tools/{execution_id}"
+                    response = await client.post(url + "/stop", json={"session_id": "cancel-test"})
+                    assert response.status_code == 202
+                    events = decode_events(await asyncio.wait_for(request, 5))
+                    assert events[-1]["type"] == ("done" if stop_scope == "shell" else "chat_stopped")
+                    assert any(event["type"] == "approval_finished" for event in events)
+                    if stop_scope == "shell":
+                        result = next(event for event in events if event["type"] == "tool_done")
+                        assert result["execution_id"] == execution_id
+                        assert result["execution"]["failure_stage"] == "cancelled_before_start"
+                        assert result["execution"]["termination_confirmed"] is None
+                        assert result["is_error"] is True
+                assert not (tmp_path / "launched").exists()
+                assert not server.pending_approvals
+                assert not server._subscribers["cancel-test"]
+                assert any(block.get("is_error") for message in server.sessions["cancel-test"]
+                           if isinstance(message["content"], list) for block in message["content"])
+                response = await client.post("/approvals/" + approval_ids[0], json={
+                    "session_id": "cancel-test", "approved": True,
+                })
+                assert response.status_code == 404
+                response = await client.post("/chat", json={"prompt": "继续", "session_id": "cancel-test"})
+                assert decode_events(response)[-1]["type"] == "done"
+            finally:
+                if not request.done():
+                    request.cancel()
                 await asyncio.gather(request, return_exceptions=True)
-            assert not server.pending_approvals
-            assert not server._subscribers["cancel-test"]
-            assert server.sessions["cancel-test"][-1]["content"][0]["is_error"]
-            response = await client.post("/chat", json={"prompt": "继续", "session_id": "cancel-test"})
-            assert decode_events(response)[-1]["type"] == "done"
 
 
 @pytest.mark.skipif(sys.platform not in ("win32", "linux"), reason="需要受支持的 Shell 进程树管理")
@@ -446,13 +475,31 @@ async def test_web_streams_bounded_shell_output_before_completion(configured_ser
     True,
     pytest.param(False, marks=pytest.mark.skipif(sys.platform != "win32", reason="Windows Job 查询失败路径")),
 ])
-async def test_web_stop_reports_real_process_tree_status(configured_server, tmp_path, monkeypatch, confirmed):
+@pytest.mark.parametrize("stop_scope", ["chat", "shell"])
+async def test_web_stop_reports_real_process_tree_status(configured_server, tmp_path, monkeypatch, confirmed, stop_scope):
     if not confirmed:
         from coding_agent.tools.builtin import _WindowsProcessJob
 
-        async def unavailable(_job):
-            raise OSError("Job accounting unavailable")
+        stopped_job = None
+        stop_sent = asyncio.Event()
+        finish_check = asyncio.Event()
+        original_stop = _WindowsProcessJob.stop
+        original_wait = _WindowsProcessJob.wait
 
+        def stop(job):
+            nonlocal stopped_job
+            original_stop(job)
+            if stopped_job is None:
+                stopped_job = job
+                stop_sent.set()
+
+        async def unavailable(job):
+            if job is stopped_job:
+                await finish_check.wait()
+                raise OSError("Job accounting unavailable")
+            return await original_wait(job)
+
+        monkeypatch.setattr(_WindowsProcessJob, "stop", stop)
         monkeypatch.setattr(_WindowsProcessJob, "wait", unavailable)
 
     script = tmp_path / "heartbeat.py"
@@ -461,12 +508,16 @@ async def test_web_stop_reports_real_process_tree_status(configured_server, tmp_
         "role = sys.argv[1]\n"
         "if role == 'parent': subprocess.Popen([sys.executable, __file__, 'child'])\n"
         "pathlib.Path(role + '.pid').write_text(str(os.getpid()))\n"
-        "while True:\n"
+        "while role != 'peer' or not pathlib.Path('release-peer').exists():\n"
         "    with open(role + '.log', 'a') as stream: stream.write('tick\\n')\n"
         "    time.sleep(0.02)\n", encoding="utf-8",
     )
     command = f'"{sys.executable}" "{script}" parent'
-    provider = ScriptedProvider([tool_response("bash", {"command": command}), text_response("继续成功")])
+    batch = tool_response("bash", {"command": command}, "target")
+    if stop_scope == "shell":
+        peer = tool_response("bash", {"command": f'"{sys.executable}" "{script}" peer'}, "peer")
+        batch = ProviderResponse(content=[*batch.content, *peer.content], stop_reason="tool_use")
+    provider = ScriptedProvider([batch, text_response("继续成功"), text_response("下一轮继续成功")])
     monkeypatch.setattr(server, "_get_provider", lambda _: provider)
     first_events = asyncio.Queue()
 
@@ -492,36 +543,76 @@ async def test_web_stop_reports_real_process_tree_status(configured_server, tmp_
                     assert started["type"] == "chat_started"
                     while (tool := await first_events.get())["type"] != "tool_start":
                         pass
+                    assert tool["tool_id"] == "target"
+                    if stop_scope == "shell":
+                        assert tool["stoppable"] is True
+                        peer_started = await first_events.get()
+                        assert peer_started["tool_id"] == "peer"
+                        peer_log = tmp_path / "peer.log"
+                        while not (peer_log.exists() and peer_log.stat().st_size):
+                            await asyncio.sleep(0.02)
                     logs = [tmp_path / f"{role}.log" for role in ("parent", "child")]
                     while not all(log.exists() and log.stat().st_size for log in logs):
                         await asyncio.sleep(0.02)
                 pids = [int(log.with_suffix(".pid").read_text()) for log in logs]
                 assert all(_process_running(pid) for pid in pids)
-                url = "/chat/" + started["stop_id"] + "/stop"
+                chat_url = "/chat/" + started["stop_id"]
+                url = chat_url + "/stop"
+                if stop_scope == "shell":
+                    url = f'{chat_url}/tools/{tool["execution_id"]}/stop'
+                    unknown = await client.post(f"{chat_url}/tools/unknown/stop", json={"session_id": "owner"})
+                    assert unknown.status_code == 404
                 assert (await client.post(url, json={"session_id": "other"})).status_code == 403
                 assert all(_process_running(pid) for pid in pids)
                 response = await client.post(url, json={"session_id": "owner"})
                 assert response.status_code == 202
-                assert response.json() == {"status": "stopping"}
-                events = decode_events(await asyncio.wait_for(request, 8))
-                assert events[-1]["type"] == "chat_stopped"
-                ended = next(event for event in events if event["type"] == "tool_done")
+                if stop_scope == "shell":
+                    assert response.json() == {"status": "stopping", "execution_id": tool["execution_id"]}
+                if not confirmed:
+                    await asyncio.wait_for(stop_sent.wait(), 5)
+                    repeated = await client.post(url, json={"session_id": "owner"})
+                    assert repeated.status_code == 202
+                    assert repeated.json() == response.json()
+                    finish_check.set()
+                if stop_scope == "shell":
+                    async with asyncio.timeout(8):
+                        while (ended := await first_events.get())["type"] != "tool_done":
+                            pass
+                    assert not request.done()
+                    assert _process_running(int(peer_log.with_suffix(".pid").read_text()))
+                else:
+                    assert response.json() == {"status": "stopping"}
+                    events = decode_events(await asyncio.wait_for(request, 8))
+                    assert events[-1]["type"] == "chat_stopped"
+                    ended = next(event for event in events if event["type"] == "tool_done")
+                    assert events[-1]["unconfirmed_execution_ids"] == ([] if confirmed else [ended["execution_id"]])
                 assert ended["execution_id"] == tool["execution_id"]
-                assert ended["execution"]["cancelled"] is confirmed
-                assert ended["execution"]["termination_confirmed"] is confirmed
-                assert events[-1]["unconfirmed_execution_ids"] == ([] if confirmed else [ended["execution_id"]])
+                assert ended["execution"]["cancelled"] is confirmed, ended
+                assert ended["execution"]["termination_confirmed"] is confirmed, ended
                 assert not any(_process_running(pid) for pid in pids)
                 snapshots = [log.read_bytes() for log in logs]
                 await asyncio.sleep(0.2)
                 assert snapshots == [log.read_bytes() for log in logs]
-                stored = server.sessions["owner"][-1]["content"][0]
+                assert (await client.post(url, json={"session_id": "owner"})).status_code == 404
+                if stop_scope == "shell":
+                    (tmp_path / "release-peer").touch()
+                    events = decode_events(await asyncio.wait_for(request, 8))
+                    done_tools = [event for event in events if event["type"] == "tool_done"]
+                    assert [event["tool_id"] for event in done_tools] == ["target", "peer"]
+                    assert done_tools[1]["execution_id"] == peer_started["execution_id"]
+                    assert done_tools[1]["execution"]["exit_code"] == 0
+                    assert events[-1]["type"] == "done"
+                    assert events[-1]["text"] == "继续成功"
+                stored = next(block for message in server.sessions["owner"] for block in message["content"]
+                              if isinstance(block, dict) and block.get("tool_use_id") == tool["tool_id"])
                 assert stored["tool_use_id"] == tool["tool_id"]
                 assert stored["is_error"] is True
                 assert json.loads(stored["content"])["termination_confirmed"] is confirmed
-                assert (await client.post(url, json={"session_id": "owner"})).status_code == 404
                 response = await client.post("/chat", json={"prompt": "继续", "session_id": "owner"})
-                assert decode_events(response)[-1]["text"] == "继续成功"
+                assert decode_events(response)[-1]["text"] == ("下一轮继续成功" if stop_scope == "shell" else "继续成功")
             finally:
+                if not confirmed:
+                    finish_check.set()
                 if not request.done():
                     request.cancel()
                 await asyncio.gather(request, return_exceptions=True)
